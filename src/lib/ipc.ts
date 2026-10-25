@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 export interface AppInfo {
   os: string;
@@ -9,7 +10,77 @@ export interface AppInfo {
   runtimeVersion: string | null;
 }
 
-/** 读取运行环境信息（平台、数据目录、运行时状态）。 */
-export function getAppInfo(): Promise<AppInfo> {
-  return invoke<AppInfo>("app_info");
+export interface RuntimeStatus {
+  installed: boolean;
+  version: string | null;
+  backend: string | null;
+  serverPath: string | null;
+  modelsDir: string;
 }
+
+export interface ServiceStatus {
+  running: boolean;
+  port: number | null;
+  loaded: string[];
+  modelsDir: string;
+}
+
+export interface RouterModel {
+  id: string;
+  state: string;
+}
+
+export interface RuntimeProgress {
+  stage: "downloading" | "verifying" | "extracting" | "checking" | "done";
+  downloaded: number;
+  total: number;
+  percent: number;
+}
+
+export interface TranslateRequest {
+  requestId: string;
+  model: string;
+  source: string;
+  target: string;
+  text: string;
+}
+
+export const getAppInfo = () => invoke<AppInfo>("app_info");
+export const getRuntimeStatus = () => invoke<RuntimeStatus>("runtime_status");
+export const installRuntime = (backend: string) =>
+  invoke<RuntimeStatus>("install_runtime", { backend });
+export const setManualRuntime = (serverPath: string) =>
+  invoke<RuntimeStatus>("set_manual_runtime", { serverPath });
+
+export const getServiceStatus = () => invoke<ServiceStatus>("service_status");
+export const startService = () => invoke<ServiceStatus>("start_service");
+export const stopService = () => invoke<void>("stop_service");
+export const listRouterModels = () => invoke<RouterModel[]>("list_router_models");
+export const openModelsDir = () => invoke<string>("open_models_dir");
+export const setModelsDir = (path: string) =>
+  invoke<string>("set_models_dir", { path });
+export const setTtl = (seconds: number) => invoke<void>("set_ttl", { seconds });
+export const setGpuLayers = (layers: number) =>
+  invoke<void>("set_gpu_layers", { layers });
+export const translate = (request: TranslateRequest) =>
+  invoke<string>("translate", { request });
+
+export interface TokenPayload {
+  requestId: string;
+  token: string;
+}
+
+export const onRuntimeProgress = (
+  cb: (p: RuntimeProgress) => void,
+): Promise<UnlistenFn> =>
+  listen<RuntimeProgress>("runtime://progress", (e) => cb(e.payload));
+
+export const onToken = (cb: (p: TokenPayload) => void): Promise<UnlistenFn> =>
+  listen<TokenPayload>("translate://token", (e) => cb(e.payload));
+
+export const onModelState = (
+  cb: (p: { model: string; state: string }) => void,
+): Promise<UnlistenFn> =>
+  listen<{ model: string; state: string }>("model://state-changed", (e) =>
+    cb(e.payload),
+  );

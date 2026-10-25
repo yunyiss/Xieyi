@@ -1,12 +1,24 @@
-import type { AppInfo } from "../lib/ipc";
+import type { AppInfo, RuntimeStatus, ServiceStatus } from "../lib/ipc";
 
 interface Props {
   info: AppInfo | null;
+  runtime: RuntimeStatus | null;
+  service: ServiceStatus | null;
 }
 
-/** 底部状态条：平台信息 / 运行时 / 驻留状态。 */
-export function StatusBar({ info }: Props) {
-  const ready = Boolean(info?.runtimeVersion);
+function Dot({ on }: { on: boolean }) {
+  return (
+    <i
+      className="inline-block size-2 rounded-full"
+      style={{ background: on ? "var(--brand)" : "var(--border-strong)" }}
+    />
+  );
+}
+
+/** 底部状态条：运行时 / 引擎 / 驻留状态。 */
+export function StatusBar({ info, runtime, service }: Props) {
+  const loaded = service?.loaded ?? [];
+  const running = Boolean(service?.running);
 
   return (
     <footer
@@ -14,19 +26,20 @@ export function StatusBar({ info }: Props) {
       style={{ borderColor: "var(--border)", color: "var(--text-muted)" }}
     >
       <span className="flex items-center gap-1.5">
-        <i
-          className="inline-block size-2 rounded-full"
-          style={{ background: ready ? "var(--brand)" : "var(--border-strong)" }}
-        />
-        {ready ? `推理运行时 ${info?.runtimeVersion}` : "推理运行时未安装"}
+        <Dot on={Boolean(runtime?.installed)} />
+        {runtime?.installed
+          ? `运行时 ${runtime.version} · ${runtime.backend}`
+          : "运行时未安装"}
       </span>
 
       <span className="flex items-center gap-1.5">
-        <i
-          className="inline-block size-2 rounded-full"
-          style={{ background: "var(--border-strong)" }}
-        />
-        模型未加载 · 显存 0
+        <Dot on={running} />
+        {running ? `引擎 ${service?.port ?? ""}` : "引擎未启动"}
+      </span>
+
+      <span className="flex items-center gap-1.5">
+        <Dot on={loaded.length > 0} />
+        {loaded.length > 0 ? `驻留 ${loaded.join(", ")}` : "模型未加载 · 显存 0"}
       </span>
 
       <span className="ml-auto">

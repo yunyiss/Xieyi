@@ -2,18 +2,51 @@ import { useEffect, useState } from "react";
 import { StatusBar } from "./components/StatusBar";
 import { Translate } from "./pages/Translate";
 import { Chat } from "./pages/Chat";
-import { getAppInfo, type AppInfo } from "./lib/ipc";
+import {
+  getAppInfo,
+  getRuntimeStatus,
+  getServiceStatus,
+  type AppInfo,
+  type RuntimeStatus,
+  type ServiceStatus,
+} from "./lib/ipc";
 
 type Tab = "translate" | "chat";
 
 function App() {
   const [tab, setTab] = useState<Tab>("translate");
   const [info, setInfo] = useState<AppInfo | null>(null);
+  const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
+  const [service, setService] = useState<ServiceStatus | null>(null);
 
   useEffect(() => {
     getAppInfo()
       .then(setInfo)
       .catch((err) => console.error("读取环境信息失败", err));
+  }, []);
+
+  useEffect(() => {
+    let alive = true;
+
+    const refresh = async () => {
+      try {
+        const rt = await getRuntimeStatus();
+        const sv = await getServiceStatus();
+        if (alive) {
+          setRuntime(rt);
+          setService(sv);
+        }
+      } catch {
+        // 引擎未启动时静默
+      }
+    };
+
+    refresh();
+    const timer = window.setInterval(refresh, 2500);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
   }, []);
 
   const tabs: { key: Tab; label: string }[] = [
@@ -54,7 +87,7 @@ function App() {
         {tab === "translate" ? <Translate /> : <Chat />}
       </main>
 
-      <StatusBar info={info} />
+      <StatusBar info={info} runtime={runtime} service={service} />
     </div>
   );
 }

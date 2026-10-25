@@ -1,3 +1,8 @@
+mod models;
+mod paths;
+mod runtime;
+mod service;
+
 use serde::Serialize;
 use tauri::Manager;
 
@@ -12,26 +17,11 @@ struct AppInfo {
     runtime_version: Option<String>,
 }
 
-/// 读取运行环境信息。
-/// 目前只做两件事：报告平台信息、检查运行时是否已就位。
-/// 后续的下载 / 自检逻辑会在此基础上扩展。
 #[tauri::command]
 fn app_info(app: tauri::AppHandle) -> Result<AppInfo, String> {
-    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    let models_dir = app
-        .path()
-        .document_dir()
-        .map(|d| d.join("LocalTranslate").join("models"))
-        .map_err(|e| e.to_string())?;
-
-    let runtime_version = std::fs::read_to_string(data_dir.join("runtime").join("runtime.json"))
-        .ok()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .and_then(|v| {
-            v.get("version")
-                .and_then(|x| x.as_str())
-                .map(|s| s.to_string())
-        });
+    let data_dir = paths::app_data(&app)?;
+    let models_dir = paths::models_dir(&app)?;
+    let status = runtime::status(&app);
 
     Ok(AppInfo {
         os: std::env::consts::OS.to_string(),
@@ -39,15 +29,65 @@ fn app_info(app: tauri::AppHandle) -> Result<AppInfo, String> {
         version: env!("CARGO_PKG_VERSION").to_string(),
         data_dir: data_dir.to_string_lossy().to_string(),
         models_dir: models_dir.to_string_lossy().to_string(),
-        runtime_version,
+        runtime_version: status.version,
     })
+}
+
+#[tauri::command]
+fn open_models_dir(app: tauri::AppHandle) -> Result<String, String> {
+    let dir = paths::models_dir(&app)?;
+    paths::ensure(&dir)?;
+    Ok(dir.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn set_models_dir(app: tauri::AppHandle, path: String) -> Result<String, String> {
+    let dir = std::path::PathBuf::from(&path);
+    if !dir.is_dir() {
+        return Err(format!("目录不存在: {path}"));
+    }
+    paths::set_models_dir(&app, &path)?;
+    Ok(path)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![app_info])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .manage(service::AppState::default())
+        .setup(|app| {
+            service::spawn_ttl_watcher(app.handle().clone());
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            app_info,
+            open_models_dir,
+            set_models_dir,
+            runtime::runtime_status,
+            runtime::install_runtime,
+            runtime::set_manual_runtime,
+            service::service_status,
+            service::start_service,
+            service::stop_service,
+            service::list_router_models,
+            service::load_model,
+            service::unload_model,
+            service::translate,
+            service::set_ttl,
+            service::set_gpu_layers,
+        ])
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                // 退出时确保推理进程树被回收，避免僵尸进程占着显存。
+                let state = app.state::<service::AppState>();
+                tauri::async_runtime::block_on(async {
+                    let mut guard = state.service.lock().await;
+                    if let Some(s) = guard.take() {
+                        s.kill();
+                    }
+                });
+            }
+        });
 }
