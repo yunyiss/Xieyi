@@ -1,5 +1,6 @@
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
@@ -62,6 +63,8 @@ pub struct AppState {
     pub last_used: tokio::sync::Mutex<Instant>,
     pub ttl_secs: AtomicU64,
     pub gpu_layers: AtomicU64,
+    /// 常驻（Pinned）模型：永不自动卸载。
+    pub pinned: tokio::sync::Mutex<HashSet<String>>,
 }
 
 impl Default for AppState {
@@ -71,6 +74,45 @@ impl Default for AppState {
             last_used: tokio::sync::Mutex::new(Instant::now()),
             ttl_secs: AtomicU64::new(120),
             gpu_layers: AtomicU64::new(999),
+            pinned: tokio::sync::Mutex::new(HashSet::new()),
+        }
+    }
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Settings {
+    pub ttl_secs: u64,
+    pub gpu_layers: u64,
+    pub pinned: Vec<String>,
+    pub models_dir: String,
+    pub running: bool,
+    pub port: Option<u16>,
+}
+
+/// 启动时把持久化设置装回内存。
+pub fn load_settings(app: &AppHandle) {
+    let state = app.state::<AppState>();
+
+    if let Some(ttl) = paths::config_value(app, "ttlSecs").and_then(|v| v.as_u64()) {
+        state.ttl_secs.store(ttl, Ordering::Relaxed);
+    }
+    if let Some(layers) = paths::config_value(app, "gpuLayers").and_then(|v| v.as_u64()) {
+        state.gpu_layers.store(layers, Ordering::Relaxed);
+    }
+    drop(state);
+
+    if let Some(list) = paths::config_value(app, "pinned").and_then(|v| v.as_array().cloned()) {
+        let set: HashSet<String> = list
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        if !set.is_empty() {
+            let handle = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let state = handle.state::<AppState>();
+                *state.pinned.lock().await = set;
+            });
         }
     }
 }
@@ -500,15 +542,103 @@ pub async fn translate(
 }
 
 #[tauri::command]
-pub async fn set_ttl(state: tauri::State<'_, AppState>, seconds: u64) -> Result<(), String> {
+pub async fn set_ttl(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    seconds: u64,
+) -> Result<(), String> {
     state.ttl_secs.store(seconds, Ordering::Relaxed);
+    paths::set_config_value(&app, "ttlSecs", serde_json::json!(seconds))?;
     *state.last_used.lock().await = Instant::now();
     Ok(())
 }
 
 #[tauri::command]
-pub fn set_gpu_layers(state: tauri::State<'_, AppState>, layers: u64) {
+pub fn set_gpu_layers(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    layers: u64,
+) -> Result<(), String> {
     state.gpu_layers.store(layers, Ordering::Relaxed);
+    paths::set_config_value(&app, "gpuLayers", serde_json::json!(layers))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn set_pinned(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    model: String,
+    pinned: bool,
+) -> Result<Vec<String>, String> {
+    let list = {
+        let mut set = state.pinned.lock().await;
+        if pinned {
+            set.insert(model);
+        } else {
+            set.remove(&model);
+        }
+        let mut list: Vec<String> = set.iter().cloned().collect();
+        list.sort();
+        list
+    };
+
+    paths::set_config_value(&app, "pinned", serde_json::json!(list))?;
+    *state.last_used.lock().await = Instant::now();
+    Ok(list)
+}
+
+#[tauri::command]
+pub async fn get_settings(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<Settings, String> {
+    let (running, port) = {
+        let guard = state.service.lock().await;
+        match guard.as_ref() {
+            Some(s) => (s.child.id().is_some(), Some(s.port)),
+            None => (false, None),
+        }
+    };
+
+    let pinned: Vec<String> = {
+        let set = state.pinned.lock().await;
+        let mut list: Vec<String> = set.iter().cloned().collect();
+        list.sort();
+        list
+    };
+
+    Ok(Settings {
+        ttl_secs: state.ttl_secs.load(Ordering::Relaxed),
+        gpu_layers: state.gpu_layers.load(Ordering::Relaxed),
+        pinned,
+        models_dir: paths::models_dir(&app)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default(),
+        running,
+        port,
+    })
+}
+
+#[tauri::command]
+pub fn list_local_models(app: AppHandle) -> Vec<models::ModelFile> {
+    models::scan(&app)
+}
+
+/// 改完 GPU 档位后重启引擎，让新参数生效。
+#[tauri::command]
+pub async fn restart_service(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<ServiceStatus, String> {
+    {
+        let mut guard = state.service.lock().await;
+        if let Some(s) = guard.take() {
+            s.kill();
+        }
+    }
+    ensure(&app, &state).await?;
+    service_status(app, state).await
 }
 
 /// 空闲 TTL 守护：停手若干秒后自动卸载，把显存还回去。
@@ -534,7 +664,19 @@ pub fn spawn_ttl_watcher(app: AppHandle) {
             if s.loaded.is_empty() {
                 continue;
             }
-            let pending = s.loaded.clone();
+
+            // 常驻模型永不自动卸载
+            let pinned = state.pinned.lock().await.clone();
+            let pending: Vec<String> = s
+                .loaded
+                .iter()
+                .filter(|id| !pinned.contains(*id))
+                .cloned()
+                .collect();
+            if pending.is_empty() {
+                continue;
+            }
+
             for id in pending {
                 let _ = s.unload(&app, &id).await;
             }

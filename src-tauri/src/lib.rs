@@ -56,6 +56,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(service::AppState::default())
         .setup(|app| {
+            service::load_settings(app.handle());
             service::spawn_ttl_watcher(app.handle().clone());
             Ok(())
         })
@@ -75,6 +76,10 @@ pub fn run() {
             service::translate,
             service::set_ttl,
             service::set_gpu_layers,
+            service::set_pinned,
+            service::get_settings,
+            service::list_local_models,
+            service::restart_service,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

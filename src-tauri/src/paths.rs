@@ -21,16 +21,40 @@ pub fn config_json(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(app_data(app)?.join("config.json"))
 }
 
-/// 模型目录：优先取用户配置，否则用文档目录下的默认位置。
-pub fn models_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    if let Some(dir) = std::fs::read_to_string(config_json(app)?)
+/// 读取配置项。
+pub fn config_value(app: &AppHandle, key: &str) -> Option<serde_json::Value> {
+    let raw = std::fs::read_to_string(config_json(app).ok()?).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    value.get(key).cloned()
+}
+
+/// 写入配置项。
+pub fn set_config_value(
+    app: &AppHandle,
+    key: &str,
+    value: serde_json::Value,
+) -> Result<(), String> {
+    let path = config_json(app)?;
+    if let Some(parent) = path.parent() {
+        ensure(parent)?;
+    }
+    let mut root = std::fs::read_to_string(&path)
         .ok()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .and_then(|v| v.get("modelsDir").and_then(|d| d.as_str()).map(String::from))
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    root[key] = value;
+    std::fs::write(&path, serde_json::to_string_pretty(&root).unwrap())
+        .map_err(|e| format!("写入配置失败: {e}"))
+}
+
+/// 模型目录：优先取用户配置，否则用文档目录下的默认位置。
+pub fn models_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    if let Some(dir) = config_value(app, "modelsDir")
+        .and_then(|v| v.as_str().map(String::from))
+        .filter(|s| !s.is_empty())
     {
-        if !dir.is_empty() {
-            return Ok(PathBuf::from(dir));
-        }
+        return Ok(PathBuf::from(dir));
     }
 
     app.path()
@@ -41,15 +65,7 @@ pub fn models_dir(app: &AppHandle) -> Result<PathBuf, String> {
 
 /// 记录用户指定的模型目录。
 pub fn set_models_dir(app: &AppHandle, dir: &str) -> Result<(), String> {
-    let path = config_json(app)?;
-    let mut value = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-
-    value["modelsDir"] = serde_json::Value::String(dir.to_string());
-    std::fs::write(&path, serde_json::to_string_pretty(&value).unwrap())
-        .map_err(|e| format!("写入配置失败: {e}"))
+    set_config_value(app, "modelsDir", serde_json::Value::String(dir.to_string()))
 }
 
 /// 确保目录存在。

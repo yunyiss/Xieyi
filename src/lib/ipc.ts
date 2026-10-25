@@ -37,6 +37,21 @@ export interface RuntimeProgress {
   percent: number;
 }
 
+export interface Settings {
+  ttlSecs: number;
+  gpuLayers: number;
+  pinned: string[];
+  modelsDir: string;
+  running: boolean;
+  port: number | null;
+}
+
+export interface LocalModel {
+  id: string;
+  path: string;
+  sizeMb: number;
+}
+
 export interface TranslateRequest {
   requestId: string;
   model: string;
@@ -62,6 +77,13 @@ export const setModelsDir = (path: string) =>
 export const setTtl = (seconds: number) => invoke<void>("set_ttl", { seconds });
 export const setGpuLayers = (layers: number) =>
   invoke<void>("set_gpu_layers", { layers });
+export const setPinned = (model: string, pinned: boolean) =>
+  invoke<string[]>("set_pinned", { model, pinned });
+export const getSettings = () => invoke<Settings>("get_settings");
+export const listLocalModels = () => invoke<LocalModel[]>("list_local_models");
+export const restartService = () => invoke<ServiceStatus>("restart_service");
+export const unloadModel = (model: string) =>
+  invoke<void>("unload_model", { model });
 export const translate = (request: TranslateRequest) =>
   invoke<string>("translate", { request });
 

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { UnlistenFn } from "@tauri-apps/api/event";
+import { ModelPanel } from "../components/ModelPanel";
 import {
   getRuntimeStatus,
   installRuntime,
@@ -74,6 +75,7 @@ export function Translate() {
   const [model, setModel] = useState("");
   const [progress, setProgress] = useState<RuntimeProgress | null>(null);
   const [engineError, setEngineError] = useState("");
+  const [panelOpen, setPanelOpen] = useState(false);
 
   const unlistenRef = useRef<UnlistenFn | null>(null);
 
@@ -346,9 +348,19 @@ export function Translate() {
         </select>
 
         <span className="ml-auto text-[12px]" style={{ color: "var(--text-muted)" }}>
-          按需加载 · 停手 120 秒后释放显存
+          按需加载 · 空闲自动释放显存
         </span>
+
+        <button
+          className="h-8 rounded-lg border px-2.5 text-[12px]"
+          style={selectStyle}
+          onClick={() => setPanelOpen((v) => !v)}
+        >
+          {panelOpen ? "收起设置" : "模型与设置"}
+        </button>
       </div>
+
+      {panelOpen && <ModelPanel onChanged={bootstrap} />}
 
       {/* 输入 / 输出 */}
       <div className="grid min-h-0 flex-1 grid-cols-1 gap-3 lg:grid-cols-2">
