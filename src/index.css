@@ -1,0 +1,74 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: light;
+  --canvas: #f6f7f9;
+  --surface: #ffffff;
+  --surface-muted: #eef0f3;
+  --border: #e2e5ea;
+  --border-strong: #d2d7de;
+  --text: #16181d;
+  --text-muted: #6b7280;
+  --brand: #0f9d58;
+  --brand-hover: #0b8047;
+  --brand-soft: #e6f6ec;
+  --brand-text: #075c34;
+  --danger: #d93a2b;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --canvas: #101215;
+    --surface: #171a1f;
+    --surface-muted: #1f232a;
+    --border: #2a2f37;
+    --border-strong: #3a404a;
+    --text: #e8eaed;
+    --text-muted: #9aa1ac;
+    --brand: #2fbf71;
+    --brand-hover: #3ed684;
+    --brand-soft: #143024;
+    --brand-text: #b6f3cf;
+    --danger: #f16b5e;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--canvas);
+  color: var(--text);
+  font-family:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+}
+
+textarea,
+input,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--brand) 26%, transparent);
+}
