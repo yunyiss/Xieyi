@@ -6,6 +6,7 @@ import {
   listLocalModels,
   listRouterModels,
   openModelsDir,
+  probeVram,
   restartService,
   setGlossary,
   setGpuLayers,
@@ -25,6 +26,7 @@ const TTL_OPTIONS = [
 ];
 
 const LAYER_OPTIONS = [
+  { value: 1001, label: "自动（按显存）" },
   { value: 999, label: "全 GPU" },
   { value: 16, label: "混合 16 层" },
   { value: 0, label: "纯 CPU" },
@@ -70,12 +72,14 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
   const [error, setError] = useState("");
   const [glossaryText, setGlossaryText] = useState("");
   const [glossarySaved, setGlossarySaved] = useState(false);
+  const [freeVram, setFreeVram] = useState<number | null>(null);
 
   const refresh = useCallback(async () => {
     try {
       const s = await getSettings();
       setSettings(s);
       setLocal(await listLocalModels());
+      setFreeVram(await probeVram());
 
       const terms = await getGlossary();
       setGlossaryText(
@@ -122,6 +126,21 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
     setBusy(id);
     try {
       await abort(id);
+      await refresh();
+      onChanged();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  /** 一键让位：卸载当前所有驻留模型，把显存还给前台程序。 */
+  const releaseAll = async () => {
+    setError("");
+    setBusy("release");
+    try {
+      await abort();
       await refresh();
       onChanged();
     } catch (e) {
@@ -272,7 +291,7 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
                 <select
                   className={fieldClass}
                   style={fieldStyle}
-                  value={settings?.gpuLayers ?? 999}
+                  value={settings?.gpuLayers ?? 1001}
                   onChange={(e) => changeLayers(Number(e.target.value))}
                 >
                   {LAYER_OPTIONS.map((o) => (
@@ -284,6 +303,13 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
               </label>
             </div>
 
+            <p className="m-0 mt-1 text-[11px]" style={{ color: "var(--text-muted)" }}>
+              {freeVram != null
+                ? `当前可用显存 ${freeVram} MB`
+                : "未检测到可用显存（非 NVIDIA 或无驱动）"}
+              {settings?.gpuLayers === 1001 ? " · 自动档按模型体积分配层数" : ""}
+            </p>
+
             <div className="mt-2 flex items-center gap-2">
               <button
                 className={btnClass}
@@ -292,6 +318,14 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
                 disabled={busy === "restart"}
               >
                 {busy === "restart" ? "重启中…" : "重启引擎"}
+              </button>
+              <button
+                className={btnClass}
+                style={btnStyle}
+                onClick={releaseAll}
+                disabled={busy === "release"}
+              >
+                {busy === "release" ? "处理中…" : "一键让位"}
               </button>
               <span className="text-[11px]" style={{ color: "var(--text-muted)" }}>
                 档位改动后需重启生效

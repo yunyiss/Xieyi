@@ -36,11 +36,13 @@ export function StatusBar({ info, runtime, service, settings }: Props) {
   const layersLabel =
     settings == null
       ? "—"
-      : settings.gpuLayers === 0
-        ? "纯 CPU"
-        : settings.gpuLayers >= 999
-          ? "全 GPU"
-          : `混合 ${settings.gpuLayers} 层`;
+      : settings.gpuLayers === 1001
+        ? "自动档"
+        : settings.gpuLayers === 0
+          ? "纯 CPU"
+          : settings.gpuLayers >= 999
+            ? "全 GPU"
+            : `混合 ${settings.gpuLayers} 层`;
 
   return (
     <footer

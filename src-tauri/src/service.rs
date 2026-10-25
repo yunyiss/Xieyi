@@ -97,7 +97,7 @@ impl Default for AppState {
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_used: tokio::sync::Mutex::new(Instant::now()),
             ttl_secs: AtomicU64::new(120),
-            gpu_layers: AtomicU64::new(999),
+            gpu_layers: AtomicU64::new(models::AUTO_LAYERS),
             pinned: tokio::sync::Mutex::new(HashSet::new()),
             cache: tokio::sync::Mutex::new(HashMap::new()),
         }
@@ -401,7 +401,7 @@ async fn spawn(app: &AppHandle, gpu_layers: u64) -> Result<Service, String> {
             models_dir.display()
         ));
     }
-    let preset = models::write_preset(app, &files, gpu_layers as u32)?;
+    let preset = models::write_preset(app, &files, gpu_layers)?;
 
     let port = free_port()?;
     let key = local_key();

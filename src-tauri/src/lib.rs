@@ -1,3 +1,4 @@
+mod hardware;
 mod models;
 mod paths;
 mod runtime;
@@ -51,6 +52,11 @@ fn set_models_dir(app: tauri::AppHandle, path: String) -> Result<String, String>
     Ok(path)
 }
 
+#[tauri::command]
+fn probe_vram() -> Option<u64> {
+    hardware::free_vram_mb()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -65,6 +71,7 @@ pub fn run() {
             app_info,
             open_models_dir,
             set_models_dir,
+            probe_vram,
             runtime::runtime_status,
             runtime::install_runtime,
             runtime::set_manual_runtime,

@@ -111,6 +111,7 @@ export const chat = (request: ChatRequest) =>
   invoke<string>("chat", { request });
 export const abort = (model?: string) =>
   invoke<void>("abort", { model: model ?? null });
+export const probeVram = () => invoke<number | null>("probe_vram");
 export const getGlossary = () => invoke<GlossaryEntry[]>("get_glossary");
 export const setGlossary = (entries: GlossaryEntry[]) =>
   invoke<void>("set_glossary", { entries });
