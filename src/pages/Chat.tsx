@@ -1,10 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { UnlistenFn } from "@tauri-apps/api/event";
+import { ModelStateBadge } from "../components/ModelStateBadge";
 import {
+  abort,
   chat,
   getSettings,
   listRouterModels,
   newRequestId,
+  onModelState,
   onToken,
   setPinned as setModelPinned,
   type ChatMessage,
@@ -53,6 +56,21 @@ export function Chat() {
   useEffect(() => {
     return () => {
       unlistenRef.current?.();
+    };
+  }, []);
+
+  // 模型状态实时同步
+  useEffect(() => {
+    let un: UnlistenFn | null = null;
+    onModelState((p) => {
+      const mapped =
+        p.state === "warm" ? "loaded" : p.state === "cold" ? "unloaded" : p.state;
+      setModels((prev) =>
+        prev.map((m) => (m.id === p.model ? { ...m, state: mapped } : m)),
+      );
+    }).then((fn) => (un = fn));
+    return () => {
+      un?.();
     };
   }, []);
 
@@ -135,6 +153,10 @@ export function Chat() {
             </option>
           ))}
         </select>
+
+        <ModelStateBadge
+          state={models.find((m) => m.id === model)?.state ?? "unloaded"}
+        />
 
         <label className="flex cursor-pointer items-center gap-1.5 text-[12px]">
           <input
@@ -224,6 +246,16 @@ export function Chat() {
         >
           {busy ? "生成中…" : "发送"}
         </button>
+
+        {busy && (
+          <button
+            className="h-10 rounded-lg border px-4 text-[13px]"
+            style={controlStyle}
+            onClick={() => abort(model)}
+          >
+            停止
+          </button>
+        )}
       </div>
 
       {error && (

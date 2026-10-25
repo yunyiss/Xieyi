@@ -75,6 +75,7 @@ pub fn run() {
             service::unload_model,
             service::translate,
             service::chat,
+            service::abort,
             service::set_ttl,
             service::set_gpu_layers,
             service::set_pinned,
@@ -91,7 +92,7 @@ pub fn run() {
                 tauri::async_runtime::block_on(async {
                     let mut guard = state.service.lock().await;
                     if let Some(s) = guard.take() {
-                        s.kill();
+                        s.kill().await;
                     }
                 });
             }

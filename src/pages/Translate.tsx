@@ -1,11 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { UnlistenFn } from "@tauri-apps/api/event";
-import { ModelPanel } from "../components/ModelPanel";
+import { ModelDrawer } from "../components/ModelDrawer";
+import { ModelStateBadge } from "../components/ModelStateBadge";
+import { QuickModelControls } from "../components/QuickModelControls";
 import {
+  abort,
   getRuntimeStatus,
   installRuntime,
   listRouterModels,
   newRequestId,
+  onModelState,
   onRuntimeProgress,
   onToken,
   openModelsDir,
@@ -70,7 +74,7 @@ export function Translate() {
   const [model, setModel] = useState("");
   const [progress, setProgress] = useState<RuntimeProgress | null>(null);
   const [engineError, setEngineError] = useState("");
-  const [panelOpen, setPanelOpen] = useState(false);
+  const [drawerOpen, setDrawerOpen] = useState(false);
 
   const unlistenRef = useRef<UnlistenFn | null>(null);
 
@@ -98,6 +102,21 @@ export function Translate() {
   useEffect(() => {
     let un: UnlistenFn | null = null;
     onRuntimeProgress(setProgress).then((fn) => (un = fn));
+    return () => {
+      un?.();
+    };
+  }, []);
+
+  // 模型状态实时同步（加载中 / 已加载 / 卸载中）
+  useEffect(() => {
+    let un: UnlistenFn | null = null;
+    onModelState((p) => {
+      const mapped =
+        p.state === "warm" ? "loaded" : p.state === "cold" ? "unloaded" : p.state;
+      setModels((prev) =>
+        prev.map((m) => (m.id === p.model ? { ...m, state: mapped } : m)),
+      );
+    }).then((fn) => (un = fn));
     return () => {
       un?.();
     };
@@ -175,6 +194,17 @@ export function Translate() {
   };
 
   const ready = runtime?.installed && models.length > 0;
+
+  const currentModelState =
+    models.find((m) => m.id === model)?.state ?? "unloaded";
+
+  const handleStop = async () => {
+    try {
+      await abort(model || undefined);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
 
   return (
     <div className="flex h-full flex-col gap-3 p-4">
@@ -342,20 +372,16 @@ export function Translate() {
           ))}
         </select>
 
-        <span className="ml-auto text-[12px]" style={{ color: "var(--text-muted)" }}>
-          按需加载 · 空闲自动释放显存
-        </span>
+        <ModelStateBadge state={currentModelState} />
 
-        <button
-          className="h-8 rounded-lg border px-2.5 text-[12px]"
-          style={selectStyle}
-          onClick={() => setPanelOpen((v) => !v)}
-        >
-          {panelOpen ? "收起设置" : "模型与设置"}
-        </button>
+        <div className="ml-auto">
+          <QuickModelControls
+            model={model}
+            onChanged={bootstrap}
+            onOpenDrawer={() => setDrawerOpen(true)}
+          />
+        </div>
       </div>
-
-      {panelOpen && <ModelPanel onChanged={bootstrap} />}
 
       {/* 输入 / 输出 */}
       <div className="grid min-h-0 flex-1 grid-cols-1 gap-3 lg:grid-cols-2">
@@ -422,6 +448,16 @@ export function Translate() {
           {busy ? "翻译中…" : "运行翻译"}
         </button>
 
+        {busy && (
+          <button
+            className="h-10 rounded-lg border px-4 text-[13px]"
+            style={selectStyle}
+            onClick={handleStop}
+          >
+            停止
+          </button>
+        )}
+
         {error && (
           <span className="text-[12px]" style={{ color: "var(--danger)" }}>
             {error}
@@ -445,6 +481,12 @@ export function Translate() {
           清空
         </button>
       </div>
+
+      <ModelDrawer
+        open={drawerOpen}
+        onClose={() => setDrawerOpen(false)}
+        onChanged={bootstrap}
+      />
     </div>
   );
 }

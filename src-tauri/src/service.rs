@@ -2,6 +2,7 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -10,10 +11,10 @@ use crate::paths;
 use crate::runtime;
 
 pub struct Service {
-    pub child: tokio::process::Child,
     pub port: u16,
     pub key: String,
-    pub loaded: Vec<String>,
+    child: tokio::sync::Mutex<tokio::process::Child>,
+    loaded: tokio::sync::Mutex<Vec<String>>,
     client: reqwest::Client,
 }
 
@@ -59,7 +60,11 @@ pub struct TranslateRequest {
 }
 
 pub struct AppState {
-    pub service: tokio::sync::Mutex<Option<Service>>,
+    pub service: tokio::sync::Mutex<Option<Arc<Service>>>,
+    /// 串行化推理请求，避免同时向单模型服务打并发；不阻塞状态查询。
+    pub infer_lock: tokio::sync::Mutex<()>,
+    /// 当前请求是否被用户取消。
+    pub cancel: Arc<std::sync::atomic::AtomicBool>,
     pub last_used: tokio::sync::Mutex<Instant>,
     pub ttl_secs: AtomicU64,
     pub gpu_layers: AtomicU64,
@@ -71,6 +76,8 @@ impl Default for AppState {
     fn default() -> Self {
         Self {
             service: tokio::sync::Mutex::new(None),
+            infer_lock: tokio::sync::Mutex::new(()),
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_used: tokio::sync::Mutex::new(Instant::now()),
             ttl_secs: AtomicU64::new(120),
             gpu_layers: AtomicU64::new(999),
@@ -137,6 +144,11 @@ impl Service {
         format!("http://127.0.0.1:{}{}", self.port, path)
     }
 
+    pub async fn is_alive(&self) -> bool {
+        let mut child = self.child.lock().await;
+        child.try_wait().ok().flatten().is_none()
+    }
+
     async fn get_models(&self) -> Result<Vec<RouterModel>, String> {
         let resp = self
             .client
@@ -178,7 +190,7 @@ impl Service {
         Ok(value)
     }
 
-    async fn state_of(&self, model: &str) -> Result<String, String> {
+    pub async fn state_of(&self, model: &str) -> Result<String, String> {
         Ok(self
             .get_models()
             .await?
@@ -188,10 +200,24 @@ impl Service {
             .unwrap_or_else(|| "missing".into()))
     }
 
+    pub async fn loaded_ids(&self) -> Vec<String> {
+        self.loaded.lock().await.clone()
+    }
+
     /// `/models/load` 是异步的：必须轮询到 loaded 才算就绪。
-    async fn wait_state(&self, model: &str, want: &str, timeout: Duration) -> Result<(), String> {
+    /// `cancel` 为真时立即中止等待，让调用方可以放弃一次慢加载。
+    async fn wait_state(
+        &self,
+        model: &str,
+        want: &str,
+        timeout: Duration,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), String> {
         let started = Instant::now();
         loop {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("已取消".into());
+            }
             let state = self.state_of(model).await?;
             if state == want {
                 return Ok(());
@@ -203,10 +229,51 @@ impl Service {
         }
     }
 
-    async fn load(&mut self, app: &AppHandle, model: &str) -> Result<(), String> {
+    /// 加载专用等待：除了等 loaded，还要识别"加载中途回到 unloaded"
+    /// —— 这通常意味着该 GGUF 不被当前 llama.cpp 构建支持，会立刻失败而不是干等超时。
+    async fn wait_loaded(
+        &self,
+        model: &str,
+        timeout: Duration,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), String> {
+        let started = Instant::now();
+        let mut seen_loading = false;
+
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("已取消".into());
+            }
+
+            let state = self.state_of(model).await?;
+            match state.as_str() {
+                "loaded" => return Ok(()),
+                "loading" => seen_loading = true,
+                "unloaded" | "failed" if seen_loading => {
+                    return Err(format!(
+                        "模型加载失败（{model}）。可能是该 GGUF 的量化格式不受当前 llama.cpp 版本支持，或显存不足。"
+                    ))
+                }
+                _ => {}
+            }
+
+            if started.elapsed() > timeout {
+                return Err(format!("模型加载超时（当前状态 {state}）"));
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    pub async fn load(
+        &self,
+        app: &AppHandle,
+        model: &str,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), String> {
         if self.state_of(model).await? == "loaded" {
-            if !self.loaded.contains(&model.to_string()) {
-                self.loaded.push(model.to_string());
+            let mut loaded = self.loaded.lock().await;
+            if !loaded.iter().any(|m| m == model) {
+                loaded.push(model.to_string());
             }
             return Ok(());
         }
@@ -220,12 +287,33 @@ impl Service {
         );
         self.post_json("/models/load", serde_json::json!({ "model": model }))
             .await?;
-        self.wait_state(model, "loaded", Duration::from_secs(180))
-            .await?;
 
-        if !self.loaded.contains(&model.to_string()) {
-            self.loaded.push(model.to_string());
+        let outcome = self
+            .wait_loaded(model, Duration::from_secs(180), cancel)
+            .await;
+
+        if outcome.is_err() {
+            // 取消或超时：把半加载的实例卸掉，避免显存被占住
+            let _ = self
+                .post_json("/models/unload", serde_json::json!({ "model": model }))
+                .await;
+            self.loaded.lock().await.retain(|m| m != model);
+            let _ = app.emit(
+                "model://state-changed",
+                ModelStatePayload {
+                    model: model.to_string(),
+                    state: "cold".into(),
+                },
+            );
+            return outcome;
         }
+
+        let mut loaded = self.loaded.lock().await;
+        if !loaded.iter().any(|m| m == model) {
+            loaded.push(model.to_string());
+        }
+        drop(loaded);
+
         let _ = app.emit(
             "model://state-changed",
             ModelStatePayload {
@@ -236,7 +324,7 @@ impl Service {
         Ok(())
     }
 
-    async fn unload(&mut self, app: &AppHandle, model: &str) -> Result<(), String> {
+    pub async fn unload(&self, app: &AppHandle, model: &str) -> Result<(), String> {
         let _ = app.emit(
             "model://state-changed",
             ModelStatePayload {
@@ -244,11 +332,13 @@ impl Service {
                 state: "unloading".into(),
             },
         );
+        let no_cancel = std::sync::atomic::AtomicBool::new(false);
         self.post_json("/models/unload", serde_json::json!({ "model": model }))
             .await?;
-        self.wait_state(model, "unloaded", Duration::from_secs(60))
-            .await?;
-        self.loaded.retain(|m| m != model);
+        let _ = self
+            .wait_state(model, "unloaded", Duration::from_secs(60), &no_cancel)
+            .await;
+        self.loaded.lock().await.retain(|m| m != model);
         let _ = app.emit(
             "model://state-changed",
             ModelStatePayload {
@@ -259,8 +349,9 @@ impl Service {
         Ok(())
     }
 
-    pub fn kill(mut self) {
-        if let Some(pid) = self.child.id() {
+    pub async fn kill(&self) {
+        let mut child = self.child.lock().await;
+        if let Some(pid) = child.id() {
             #[cfg(windows)]
             {
                 use std::os::windows::process::CommandExt;
@@ -276,7 +367,7 @@ impl Service {
                     .status();
             }
         }
-        let _ = self.child.start_kill();
+        let _ = child.start_kill();
     }
 }
 
@@ -328,10 +419,10 @@ async fn spawn(app: &AppHandle, gpu_layers: u64) -> Result<Service, String> {
     let child = cmd.spawn().map_err(|e| format!("启动推理引擎失败: {e}"))?;
 
     let service = Service {
-        child,
+        child: tokio::sync::Mutex::new(child),
         port,
         key,
-        loaded: Vec::new(),
+        loaded: tokio::sync::Mutex::new(Vec::new()),
         client: reqwest::Client::new(),
     };
 
@@ -351,7 +442,7 @@ async fn spawn(app: &AppHandle, gpu_layers: u64) -> Result<Service, String> {
             }
         }
         if started.elapsed() > Duration::from_secs(30) {
-            service.kill();
+            service.kill().await;
             return Err("推理引擎启动超时".into());
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -360,34 +451,42 @@ async fn spawn(app: &AppHandle, gpu_layers: u64) -> Result<Service, String> {
     Ok(service)
 }
 
-pub async fn ensure(app: &AppHandle, state: &AppState) -> Result<(), String> {
+/// 确保引擎在跑，并返回共享句柄。
+/// 只在启动时持锁，推理期间不再占着全局锁，状态查询不会被阻塞。
+pub async fn ensure(app: &AppHandle, state: &AppState) -> Result<Arc<Service>, String> {
     let mut guard = state.service.lock().await;
-    let alive = guard
-        .as_mut()
-        .map(|s| s.child.try_wait().ok().flatten().is_none())
-        .unwrap_or(false);
-    if alive {
-        return Ok(());
+
+    if let Some(existing) = guard.as_ref() {
+        if existing.is_alive().await {
+            return Ok(existing.clone());
+        }
     }
+
     if let Some(old) = guard.take() {
-        old.kill();
+        old.kill().await;
     }
     let layers = state.gpu_layers.load(Ordering::Relaxed);
-    *guard = Some(spawn(app, layers).await?);
-    Ok(())
+    let service = Arc::new(spawn(app, layers).await?);
+    *guard = Some(service.clone());
+    Ok(service)
+}
+
+/// 只读取当前服务句柄，不触发启动。
+pub async fn current(state: &AppState) -> Option<Arc<Service>> {
+    state.service.lock().await.clone()
 }
 
 #[tauri::command]
 pub async fn service_status(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<ServiceStatus, String> {
-    let guard = state.service.lock().await;
     let models_dir = paths::models_dir(&app)
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
-    match guard.as_ref() {
+
+    match current(&state).await {
         Some(s) => Ok(ServiceStatus {
-            running: s.child.id().is_some(),
+            running: s.is_alive().await,
             port: Some(s.port),
-            loaded: s.loaded.clone(),
+            loaded: s.loaded_ids().await,
             models_dir,
         }),
         None => Ok(ServiceStatus {
@@ -407,9 +506,13 @@ pub async fn start_service(app: AppHandle, state: tauri::State<'_, AppState>) ->
 
 #[tauri::command]
 pub async fn stop_service(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    let mut guard = state.service.lock().await;
-    if let Some(s) = guard.take() {
-        s.kill();
+    state.cancel.store(true, Ordering::Relaxed);
+    let existing = {
+        let mut guard = state.service.lock().await;
+        guard.take()
+    };
+    if let Some(s) = existing {
+        s.kill().await;
     }
     let _ = app.emit("service://state-changed", ());
     Ok(())
@@ -420,9 +523,7 @@ pub async fn list_router_models(
     app: AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<Vec<RouterModel>, String> {
-    ensure(&app, &state).await?;
-    let guard = state.service.lock().await;
-    let s = guard.as_ref().ok_or("服务未启动")?;
+    let s = ensure(&app, &state).await?;
     s.get_models().await
 }
 
@@ -432,10 +533,9 @@ pub async fn load_model(
     state: tauri::State<'_, AppState>,
     model: String,
 ) -> Result<(), String> {
-    ensure(&app, &state).await?;
-    let mut guard = state.service.lock().await;
-    let s = guard.as_mut().ok_or("服务未启动")?;
-    s.load(&app, &model).await?;
+    let s = ensure(&app, &state).await?;
+    state.cancel.store(false, Ordering::Relaxed);
+    s.load(&app, &model, &state.cancel).await?;
     *state.last_used.lock().await = Instant::now();
     Ok(())
 }
@@ -446,11 +546,38 @@ pub async fn unload_model(
     state: tauri::State<'_, AppState>,
     model: String,
 ) -> Result<(), String> {
-    let mut guard = state.service.lock().await;
-    let Some(s) = guard.as_mut() else {
+    let Some(s) = current(&state).await else {
         return Ok(());
     };
     s.unload(&app, &model).await
+}
+
+/// 用户主动中止：停止正在生成的请求，并把正在加载的模型卸掉。
+#[tauri::command]
+pub async fn abort(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    model: Option<String>,
+) -> Result<(), String> {
+    state.cancel.store(true, Ordering::Relaxed);
+
+    let Some(s) = current(&state).await else {
+        return Ok(());
+    };
+
+    let targets = match model {
+        Some(m) => vec![m],
+        None => s.loaded_ids().await,
+    };
+
+    for m in targets {
+        let state_now = s.state_of(&m).await.unwrap_or_default();
+        if state_now == "loading" || state_now == "loaded" {
+            let _ = s.unload(&app, &m).await;
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -471,13 +598,14 @@ pub struct ChatRequest {
 /// 通用的流式补全：负责加载模型、发请求、解析 SSE 并把 token 推给前端。
 async fn stream_completion(
     app: &AppHandle,
-    s: &mut Service,
+    s: &Service,
     request_id: &str,
     model: &str,
     messages: serde_json::Value,
     temperature: f64,
+    cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<String, String> {
-    s.load(app, model).await?;
+    s.load(app, model, cancel).await?;
 
     let body = serde_json::json!({
         "model": model,
@@ -506,6 +634,9 @@ async fn stream_completion(
     let mut full = String::new();
 
     while let Some(chunk) = stream.next().await {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
         let chunk = chunk.map_err(|e| format!("读取流失败: {e}"))?;
         buf.push_str(&String::from_utf8_lossy(&chunk));
 
@@ -557,20 +688,33 @@ pub async fn translate(
         return Err("请输入要翻译的内容".into());
     }
 
-    ensure(&app, &state).await?;
+    let s = ensure(&app, &state).await?;
+    let _infer = state.infer_lock.lock().await;
+    state.cancel.store(false, Ordering::Relaxed);
 
     let messages = serde_json::json!([
         { "role": "system", "content": system_prompt(&request.source, &request.target) },
         { "role": "user", "content": request.text }
     ]);
 
-    let mut guard = state.service.lock().await;
-    let s = guard.as_mut().ok_or("服务未启动")?;
-    let full = stream_completion(&app, s, &request.request_id, &request.model, messages, 0.2).await?;
-    drop(guard);
+    let result = stream_completion(
+        &app,
+        &s,
+        &request.request_id,
+        &request.model,
+        messages,
+        0.2,
+        &state.cancel,
+    )
+    .await;
 
     *state.last_used.lock().await = Instant::now();
-    Ok(full)
+
+    match result {
+        Ok(text) => Ok(text),
+        Err(_) if state.cancel.load(Ordering::Relaxed) => Err("已取消".into()),
+        Err(e) => Err(e),
+    }
 }
 
 #[tauri::command]
@@ -583,17 +727,30 @@ pub async fn chat(
         return Err("消息为空".into());
     }
 
-    ensure(&app, &state).await?;
+    let s = ensure(&app, &state).await?;
+    let _infer = state.infer_lock.lock().await;
+    state.cancel.store(false, Ordering::Relaxed);
 
     let messages = serde_json::to_value(&request.messages).map_err(|e| e.to_string())?;
 
-    let mut guard = state.service.lock().await;
-    let s = guard.as_mut().ok_or("服务未启动")?;
-    let full = stream_completion(&app, s, &request.request_id, &request.model, messages, 0.7).await?;
-    drop(guard);
+    let result = stream_completion(
+        &app,
+        &s,
+        &request.request_id,
+        &request.model,
+        messages,
+        0.7,
+        &state.cancel,
+    )
+    .await;
 
     *state.last_used.lock().await = Instant::now();
-    Ok(full)
+
+    match result {
+        Ok(text) => Ok(text),
+        Err(_) if state.cancel.load(Ordering::Relaxed) => Err("已取消".into()),
+        Err(e) => Err(e),
+    }
 }
 
 #[tauri::command]
@@ -648,12 +805,9 @@ pub async fn get_settings(
     app: AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<Settings, String> {
-    let (running, port) = {
-        let guard = state.service.lock().await;
-        match guard.as_ref() {
-            Some(s) => (s.child.id().is_some(), Some(s.port)),
-            None => (false, None),
-        }
+    let (running, port) = match current(&state).await {
+        Some(s) => (s.is_alive().await, Some(s.port)),
+        None => (false, None),
     };
 
     let pinned: Vec<String> = {
@@ -687,9 +841,12 @@ pub async fn restart_service(
     state: tauri::State<'_, AppState>,
 ) -> Result<ServiceStatus, String> {
     {
-        let mut guard = state.service.lock().await;
-        if let Some(s) = guard.take() {
-            s.kill();
+        let existing = {
+            let mut guard = state.service.lock().await;
+            guard.take()
+        };
+        if let Some(s) = existing {
+            s.kill().await;
         }
     }
     ensure(&app, &state).await?;
@@ -712,21 +869,19 @@ pub fn spawn_ttl_watcher(app: AppHandle) {
                 continue;
             }
 
-            let mut guard = state.service.lock().await;
-            let Some(s) = guard.as_mut() else {
+            let Some(s) = current(&state).await else {
                 continue;
             };
-            if s.loaded.is_empty() {
+            let loaded = s.loaded_ids().await;
+            if loaded.is_empty() {
                 continue;
             }
 
             // 常驻模型永不自动卸载
             let pinned = state.pinned.lock().await.clone();
-            let pending: Vec<String> = s
-                .loaded
-                .iter()
-                .filter(|id| !pinned.contains(*id))
-                .cloned()
+            let pending: Vec<String> = loaded
+                .into_iter()
+                .filter(|id| !pinned.contains(id))
                 .collect();
             if pending.is_empty() {
                 continue;

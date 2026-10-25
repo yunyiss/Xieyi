@@ -99,6 +99,8 @@ export const translate = (request: TranslateRequest) =>
   invoke<string>("translate", { request });
 export const chat = (request: ChatRequest) =>
   invoke<string>("chat", { request });
+export const abort = (model?: string) =>
+  invoke<void>("abort", { model: model ?? null });
 
 export interface TokenPayload {
   requestId: string;
