@@ -11,6 +11,7 @@ import {
   onModelState,
   onRuntimeProgress,
   onToken,
+  onTranslateProgress,
   openModelsDir,
   setManualRuntime,
   setModelsDir,
@@ -74,6 +75,10 @@ export function Translate() {
   const [progress, setProgress] = useState<RuntimeProgress | null>(null);
   const [engineError, setEngineError] = useState("");
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [segmentProgress, setSegmentProgress] = useState({
+    done: 0,
+    total: 0,
+  });
 
   const unlistenRef = useRef<UnlistenFn | null>(null);
 
@@ -101,6 +106,15 @@ export function Translate() {
   useEffect(() => {
     let un: UnlistenFn | null = null;
     onRuntimeProgress(setProgress).then((fn) => (un = fn));
+    return () => {
+      un?.();
+    };
+  }, []);
+
+  // 长文分段翻译的进度
+  useEffect(() => {
+    let un: UnlistenFn | null = null;
+    onTranslateProgress(setSegmentProgress).then((fn) => (un = fn));
     return () => {
       un?.();
     };
@@ -167,6 +181,7 @@ export function Translate() {
     setError("");
     setOutput("");
     setBusy(true);
+    setSegmentProgress({ done: 0, total: 0 });
 
     const id = newRequestId();
     unlistenRef.current?.();
@@ -443,7 +458,13 @@ export function Translate() {
             style={{ borderColor: "var(--border)", color: "var(--text-muted)" }}
           >
             <span>译文</span>
-            <span>{busy ? "翻译中…" : model || "—"}</span>
+            <span>
+              {busy
+                ? segmentProgress.total > 1
+                  ? `翻译中 ${segmentProgress.done}/${segmentProgress.total}`
+                  : "翻译中…"
+                : model || "—"}
+            </span>
           </header>
           <div className="min-h-0 flex-1 overflow-auto p-3">
             {engineError && !output ? (

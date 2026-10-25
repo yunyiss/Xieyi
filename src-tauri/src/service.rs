@@ -1,6 +1,6 @@
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -9,6 +9,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use crate::models;
 use crate::paths;
 use crate::runtime;
+use crate::translate as segmenter;
 
 pub struct Service {
     pub port: u16,
@@ -48,6 +49,20 @@ struct ModelStatePayload {
     state: String,
 }
 
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct GlossaryEntry {
+    pub from: String,
+    pub to: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct TranslateProgress {
+    done: usize,
+    total: usize,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TranslateRequest {
@@ -70,6 +85,8 @@ pub struct AppState {
     pub gpu_layers: AtomicU64,
     /// 常驻（Pinned）模型：永不自动卸载。
     pub pinned: tokio::sync::Mutex<HashSet<String>>,
+    /// 句子级翻译缓存：相同模型 / 语言对 / 术语表 / 原文直接命中。
+    pub cache: tokio::sync::Mutex<HashMap<String, String>>,
 }
 
 impl Default for AppState {
@@ -82,6 +99,7 @@ impl Default for AppState {
             ttl_secs: AtomicU64::new(120),
             gpu_layers: AtomicU64::new(999),
             pinned: tokio::sync::Mutex::new(HashSet::new()),
+            cache: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 }
@@ -670,14 +688,47 @@ async fn stream_completion(
     Ok(full)
 }
 
-fn system_prompt(source: &str, target: &str) -> String {
+fn load_glossary(app: &AppHandle) -> Vec<GlossaryEntry> {
+    paths::config_value(app, "glossary")
+        .and_then(|v| serde_json::from_value::<Vec<GlossaryEntry>>(v).ok())
+        .unwrap_or_default()
+}
+
+fn system_prompt(source: &str, target: &str, glossary: &[GlossaryEntry]) -> String {
     let src = if source == "auto" { "the source language" } else { source };
-    format!(
+    let mut prompt = format!(
         "You are a professional translator. Translate the user's text from {src} to {target}. \
 Output only the translation, without explanations, notes, or quotation marks."
+    );
+
+    if !glossary.is_empty() {
+        prompt.push_str("\nUse these term mappings when they appear:\n");
+        for entry in glossary {
+            prompt.push_str(&format!("- {} => {}\n", entry.from, entry.to));
+        }
+    }
+
+    prompt
+}
+
+fn cache_key(
+    model: &str,
+    source: &str,
+    target: &str,
+    glossary: &[GlossaryEntry],
+    text: &str,
+) -> String {
+    let terms: Vec<String> = glossary
+        .iter()
+        .map(|e| format!("{}={}", e.from, e.to))
+        .collect();
+    format!(
+        "{model}\u{1}{source}\u{1}{target}\u{1}{}\u{1}{text}",
+        terms.join("\u{1}")
     )
 }
 
+/// 长文本按段落/句子切分后逐段翻译，命中缓存时直接返回。
 #[tauri::command]
 pub async fn translate(
     app: AppHandle,
@@ -688,33 +739,115 @@ pub async fn translate(
         return Err("请输入要翻译的内容".into());
     }
 
-    let s = ensure(&app, &state).await?;
+    let service = ensure(&app, &state).await?;
     let _infer = state.infer_lock.lock().await;
     state.cancel.store(false, Ordering::Relaxed);
 
-    let messages = serde_json::json!([
-        { "role": "system", "content": system_prompt(&request.source, &request.target) },
-        { "role": "user", "content": request.text }
-    ]);
+    let glossary = load_glossary(&app);
+    let segments = segmenter::split_segments(&request.text, 1200);
+    let total = segments.len();
+    let _ = app.emit("translate://progress", TranslateProgress { done: 0, total });
 
-    let result = stream_completion(
-        &app,
-        &s,
-        &request.request_id,
-        &request.model,
-        messages,
-        0.2,
-        &state.cancel,
-    )
-    .await;
+    let mut output = String::new();
+
+    for (index, segment) in segments.iter().enumerate() {
+        if state.cancel.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let key = cache_key(
+            &request.model,
+            &request.source,
+            &request.target,
+            &glossary,
+            &segment.text,
+        );
+
+        let cached = {
+            let cache = state.cache.lock().await;
+            cache.get(&key).cloned()
+        };
+
+        let translated = match cached {
+            Some(text) => {
+                let _ = app.emit(
+                    "llm://token",
+                    TokenPayload {
+                        request_id: request.request_id.clone(),
+                        token: text.clone(),
+                    },
+                );
+                text
+            }
+            None => {
+                let messages = serde_json::json!([
+                    { "role": "system", "content": system_prompt(&request.source, &request.target, &glossary) },
+                    { "role": "user", "content": segment.text }
+                ]);
+
+                let text = stream_completion(
+                    &app,
+                    &service,
+                    &request.request_id,
+                    &request.model,
+                    messages,
+                    0.2,
+                    &state.cancel,
+                )
+                .await?;
+
+                let mut cache = state.cache.lock().await;
+                if cache.len() > 4000 {
+                    cache.clear();
+                }
+                cache.insert(key, text.clone());
+                text
+            }
+        };
+
+        output.push_str(&translated);
+
+        if index + 1 < total {
+            let joiner = segmenter::joiner(segment.paragraph, &request.target);
+            output.push_str(joiner);
+            let _ = app.emit(
+                "llm://token",
+                TokenPayload {
+                    request_id: request.request_id.clone(),
+                    token: joiner.to_string(),
+                },
+            );
+        }
+
+        let _ = app.emit(
+            "translate://progress",
+            TranslateProgress {
+                done: index + 1,
+                total,
+            },
+        );
+    }
 
     *state.last_used.lock().await = Instant::now();
 
-    match result {
-        Ok(text) => Ok(text),
-        Err(_) if state.cancel.load(Ordering::Relaxed) => Err("已取消".into()),
-        Err(e) => Err(e),
+    if state.cancel.load(Ordering::Relaxed) && output.is_empty() {
+        return Err("已取消".into());
     }
+
+    Ok(output)
+}
+
+#[tauri::command]
+pub fn get_glossary(app: AppHandle) -> Vec<GlossaryEntry> {
+    load_glossary(&app)
+}
+
+#[tauri::command]
+pub fn set_glossary(
+    app: AppHandle,
+    entries: Vec<GlossaryEntry>,
+) -> Result<(), String> {
+    paths::set_config_value(&app, "glossary", serde_json::json!(entries))
 }
 
 #[tauri::command]

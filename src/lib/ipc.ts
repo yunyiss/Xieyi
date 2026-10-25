@@ -52,6 +52,16 @@ export interface LocalModel {
   sizeMb: number;
 }
 
+export interface GlossaryEntry {
+  from: string;
+  to: string;
+}
+
+export interface TranslateProgress {
+  done: number;
+  total: number;
+}
+
 export interface TranslateRequest {
   requestId: string;
   model: string;
@@ -101,6 +111,9 @@ export const chat = (request: ChatRequest) =>
   invoke<string>("chat", { request });
 export const abort = (model?: string) =>
   invoke<void>("abort", { model: model ?? null });
+export const getGlossary = () => invoke<GlossaryEntry[]>("get_glossary");
+export const setGlossary = (entries: GlossaryEntry[]) =>
+  invoke<void>("set_glossary", { entries });
 
 export interface TokenPayload {
   requestId: string;
@@ -114,6 +127,11 @@ export const onRuntimeProgress = (
 
 export const onToken = (cb: (p: TokenPayload) => void): Promise<UnlistenFn> =>
   listen<TokenPayload>("llm://token", (e) => cb(e.payload));
+
+export const onTranslateProgress = (
+  cb: (p: TranslateProgress) => void,
+): Promise<UnlistenFn> =>
+  listen<TranslateProgress>("translate://progress", (e) => cb(e.payload));
 
 export const onModelState = (
   cb: (p: { model: string; state: string }) => void,

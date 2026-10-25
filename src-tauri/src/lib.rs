@@ -2,6 +2,7 @@ mod models;
 mod paths;
 mod runtime;
 mod service;
+mod translate;
 
 use serde::Serialize;
 use tauri::Manager;
@@ -74,6 +75,8 @@ pub fn run() {
             service::load_model,
             service::unload_model,
             service::translate,
+            service::get_glossary,
+            service::set_glossary,
             service::chat,
             service::abort,
             service::set_ttl,

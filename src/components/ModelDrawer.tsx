@@ -1,15 +1,18 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   abort,
+  getGlossary,
   getSettings,
   listLocalModels,
   listRouterModels,
   openModelsDir,
   restartService,
+  setGlossary,
   setGpuLayers,
   setModelsDir,
   setPinned,
   setTtl,
+  type GlossaryEntry,
   type LocalModel,
   type Settings,
 } from "../lib/ipc";
@@ -65,12 +68,19 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
   const [states, setStates] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
+  const [glossaryText, setGlossaryText] = useState("");
+  const [glossarySaved, setGlossarySaved] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
       const s = await getSettings();
       setSettings(s);
       setLocal(await listLocalModels());
+
+      const terms = await getGlossary();
+      setGlossaryText(
+        (prev) => prev || terms.map((t) => `${t.from}=${t.to}`).join("\n"),
+      );
 
       try {
         const router = await listRouterModels();
@@ -151,6 +161,31 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
     }
   };
 
+  const saveGlossary = async () => {
+    setError("");
+    const entries: GlossaryEntry[] = glossaryText
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => {
+        const at = line.indexOf("=");
+        if (at <= 0) return null;
+        return {
+          from: line.slice(0, at).trim(),
+          to: line.slice(at + 1).trim(),
+        };
+      })
+      .filter((e): e is GlossaryEntry => Boolean(e && e.from && e.to));
+
+    try {
+      await setGlossary(entries);
+      setGlossarySaved(true);
+      window.setTimeout(() => setGlossarySaved(false), 1500);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
   const changeTtl = async (value: number) => {
     setError("");
     try {
@@ -190,7 +225,7 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
           className="flex shrink-0 items-center gap-2 border-b px-4 py-3"
           style={{ borderColor: "var(--border)" }}
         >
-          <h2 className="m-0 text-[14px] font-medium">模型管理</h2>
+          <h2 className="m-0 text-[14px] font-medium">设置与模型</h2>
           <button
             className="ml-auto h-7 w-7 rounded-md border text-[13px]"
             style={btnStyle}
@@ -261,6 +296,43 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
               <span className="text-[11px]" style={{ color: "var(--text-muted)" }}>
                 档位改动后需重启生效
               </span>
+            </div>
+          </section>
+
+          {/* 术语表 */}
+          <section className="mb-4">
+            <div className="mb-1.5 flex items-baseline gap-2">
+              <span
+                className="text-[11px] font-medium"
+                style={{ color: "var(--text-muted)" }}
+              >
+                术语表
+              </span>
+              <span className="text-[10px]" style={{ color: "var(--text-muted)" }}>
+                每行一条：原文=译文
+              </span>
+            </div>
+
+            <textarea
+              className="h-24 w-full resize-none rounded-lg border p-2 text-[12px] outline-none focus:border-[var(--brand)]"
+              style={fieldStyle}
+              placeholder={"API=接口\nLLM=大语言模型"}
+              value={glossaryText}
+              onChange={(e) => {
+                setGlossaryText(e.target.value);
+                setGlossarySaved(false);
+              }}
+            />
+
+            <div className="mt-1.5 flex items-center gap-2">
+              <button className={btnClass} style={btnStyle} onClick={saveGlossary}>
+                保存术语表
+              </button>
+              {glossarySaved && (
+                <span className="text-[11px]" style={{ color: "var(--brand-text)" }}>
+                  已保存
+                </span>
+              )}
             </div>
           </section>
 
