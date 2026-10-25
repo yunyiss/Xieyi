@@ -13,6 +13,7 @@ dist-ssr
 *.local
 
 # 本地文档（需求 / 方案）与 IDE 产物，不入库
+docs/
 .trae/
 .trae-html-share-packages/
 
