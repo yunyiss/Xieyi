@@ -81,6 +81,14 @@ export interface ChatRequest {
   messages: ChatMessage[];
 }
 
+export interface Session {
+  id: string;
+  title: string;
+  model: string;
+  updatedAt: number;
+  messages: ChatMessage[];
+}
+
 export const getAppInfo = () => invoke<AppInfo>("app_info");
 export const getRuntimeStatus = () => invoke<RuntimeStatus>("runtime_status");
 export const installRuntime = (backend: string) =>
@@ -112,6 +120,11 @@ export const chat = (request: ChatRequest) =>
 export const abort = (model?: string) =>
   invoke<void>("abort", { model: model ?? null });
 export const probeVram = () => invoke<number | null>("probe_vram");
+export const listSessions = () => invoke<Session[]>("list_sessions");
+export const saveSession = (session: Session) =>
+  invoke<void>("save_session", { session });
+export const deleteSession = (id: string) =>
+  invoke<void>("delete_session", { id });
 export const getGlossary = () => invoke<GlossaryEntry[]>("get_glossary");
 export const setGlossary = (entries: GlossaryEntry[]) =>
   invoke<void>("set_glossary", { entries });

@@ -3,6 +3,7 @@ mod models;
 mod paths;
 mod runtime;
 mod service;
+mod sessions;
 mod translate;
 
 use serde::Serialize;
@@ -92,6 +93,9 @@ pub fn run() {
             service::get_settings,
             service::list_local_models,
             service::restart_service,
+            sessions::list_sessions,
+            sessions::save_session,
+            sessions::delete_session,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

@@ -621,6 +621,7 @@ async fn stream_completion(
     model: &str,
     messages: serde_json::Value,
     temperature: f64,
+    max_tokens: u32,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<String, String> {
     s.load(app, model, cancel).await?;
@@ -630,7 +631,7 @@ async fn stream_completion(
         "messages": messages,
         "stream": true,
         "temperature": temperature,
-        "max_tokens": 2048
+        "max_tokens": max_tokens
     });
 
     let resp = s
@@ -792,6 +793,7 @@ pub async fn translate(
                     &request.model,
                     messages,
                     0.2,
+                    1024,
                     &state.cancel,
                 )
                 .await?;
@@ -850,6 +852,27 @@ pub fn set_glossary(
     paths::set_config_value(&app, "glossary", serde_json::json!(entries))
 }
 
+/// 对话历史的字符预算（约 3000 tokens）。
+/// 超出时从最早的消息开始丢弃，避免把上下文窗口撑爆。
+const CHAT_HISTORY_CHARS: usize = 6000;
+
+fn trim_history(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    let mut total = 0usize;
+    let mut keep: Vec<ChatMessage> = Vec::new();
+
+    for message in messages.iter().rev() {
+        let len = message.content.chars().count();
+        if !keep.is_empty() && total + len > CHAT_HISTORY_CHARS {
+            break;
+        }
+        total += len;
+        keep.push(message.clone());
+    }
+
+    keep.reverse();
+    keep
+}
+
 #[tauri::command]
 pub async fn chat(
     app: AppHandle,
@@ -864,7 +887,8 @@ pub async fn chat(
     let _infer = state.infer_lock.lock().await;
     state.cancel.store(false, Ordering::Relaxed);
 
-    let messages = serde_json::to_value(&request.messages).map_err(|e| e.to_string())?;
+    let trimmed = trim_history(&request.messages);
+    let messages = serde_json::to_value(&trimmed).map_err(|e| e.to_string())?;
 
     let result = stream_completion(
         &app,
@@ -873,6 +897,7 @@ pub async fn chat(
         &request.model,
         messages,
         0.7,
+        1024,
         &state.cancel,
     )
     .await;

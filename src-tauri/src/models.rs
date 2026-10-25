@@ -98,7 +98,7 @@ pub fn write_preset(app: &AppHandle, models: &[ModelFile], gpu_layers: u64) -> R
         };
 
         ini.push_str(&format!(
-            "[{}]\nmodel = {}\njinja = 1\nctx-size = 2048\nn-gpu-layers = {}\ncache-type-k = q8_0\ncache-type-v = q8_0\n\n",
+            "[{}]\nmodel = {}\njinja = 1\nctx-size = 4096\nn-gpu-layers = {}\ncache-type-k = q8_0\ncache-type-v = q8_0\n\n",
             m.id, m.path, layers
         ));
     }

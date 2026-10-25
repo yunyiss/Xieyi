@@ -4,14 +4,18 @@ import { ModelStateBadge } from "../components/ModelStateBadge";
 import {
   abort,
   chat,
+  deleteSession,
   getSettings,
   listRouterModels,
+  listSessions,
   newRequestId,
   onModelState,
   onToken,
+  saveSession,
   setPinned as setModelPinned,
   type ChatMessage,
   type RouterModel,
+  type Session,
 } from "../lib/ipc";
 
 const controlStyle = {
@@ -23,7 +27,13 @@ const controlStyle = {
 const controlClass =
   "h-8 rounded-lg border px-2 text-[12px] outline-none focus:border-[var(--brand)]";
 
-/** 聊天页：常规对话，复用同一套按需加载与常驻机制。 */
+function newId(): string {
+  const c = globalThis.crypto as Crypto | undefined;
+  if (c?.randomUUID) return c.randomUUID();
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+/** 聊天页：多轮对话 + 本地会话持久化，不做工具调用。 */
 export function Chat() {
   const [models, setModels] = useState<RouterModel[]>([]);
   const [model, setModel] = useState("");
@@ -32,9 +42,16 @@ export function Chat() {
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [sessions, setSessions] = useState<Session[]>([]);
+  const [sessionId, setSessionId] = useState(() => newId());
 
   const listRef = useRef<HTMLDivElement>(null);
   const unlistenRef = useRef<UnlistenFn | null>(null);
+  const messagesRef = useRef<ChatMessage[]>([]);
+
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
 
   const refresh = useCallback(async () => {
     try {
@@ -44,6 +61,8 @@ export function Chat() {
       const list = await listRouterModels();
       setModels(list);
       setModel((prev) => prev || list[0]?.id || "");
+
+      setSessions(await listSessions());
     } catch (e) {
       setError(String(e));
     }
@@ -79,29 +98,35 @@ export function Chat() {
     if (el) el.scrollTop = el.scrollHeight;
   }, [messages, busy]);
 
-  const togglePin = async (next: boolean) => {
-    if (!model) return;
+  const persist = async (msgs: ChatMessage[], currentModel: string, id: string) => {
+    if (msgs.length === 0) return;
+    const firstUser = msgs.find((m) => m.role === "user");
+    const title = firstUser
+      ? firstUser.content.slice(0, 24).replace(/\s+/g, " ")
+      : "新对话";
+
     try {
-      setPinned(await setModelPinned(model, next));
+      await saveSession({
+        id,
+        title,
+        model: currentModel,
+        updatedAt: 0,
+        messages: msgs,
+      });
+      setSessions(await listSessions());
     } catch (e) {
-      setError(String(e));
+      console.error("保存会话失败", e);
     }
   };
 
-  const send = async () => {
-    const text = input.trim();
-    if (!text || busy) return;
+  const sendWith = async (history: ChatMessage[]) => {
     if (!model) {
       setError("请先选择模型");
       return;
     }
 
     setError("");
-    setInput("");
     setBusy(true);
-
-    const history: ChatMessage[] = [...messages, { role: "user", content: text }];
-    setMessages([...history, { role: "assistant", content: "" }]);
 
     const id = newRequestId();
     unlistenRef.current?.();
@@ -119,13 +144,15 @@ export function Chat() {
 
     try {
       const full = await chat({ requestId: id, model, messages: history });
-      setMessages((prev) => {
-        if (prev.length === 0) return prev;
-        return [...prev.slice(0, -1), { role: "assistant", content: full }];
-      });
+      const finalMessages: ChatMessage[] = [
+        ...history,
+        { role: "assistant", content: full },
+      ];
+      setMessages(finalMessages);
+      await persist(finalMessages, model, sessionId);
     } catch (e) {
       setError(String(e));
-      setMessages((prev) => prev.slice(0, -1));
+      setMessages(history);
     } finally {
       unlistenRef.current?.();
       unlistenRef.current = null;
@@ -133,11 +160,73 @@ export function Chat() {
     }
   };
 
+  const send = async () => {
+    const text = input.trim();
+    if (!text || busy) return;
+
+    setInput("");
+    const history: ChatMessage[] = [
+      ...messages,
+      { role: "user", content: text },
+    ];
+    setMessages([...history, { role: "assistant", content: "" }]);
+    await sendWith(history);
+  };
+
+  /** 丢掉最后一条助手回复，用同样的用户输入重新生成。 */
+  const regenerate = async () => {
+    if (busy) return;
+    const current = messagesRef.current;
+    if (current.length < 2) return;
+
+    const withoutLast = current.slice(0, -1);
+    if (withoutLast[withoutLast.length - 1].role !== "user") return;
+
+    setMessages([...withoutLast, { role: "assistant", content: "" }]);
+    await sendWith(withoutLast);
+  };
+
+  const switchSession = (id: string) => {
+    const target = sessions.find((s) => s.id === id);
+    if (!target) return;
+
+    setSessionId(id);
+    setMessages(target.messages);
+    if (target.model) setModel(target.model);
+    setError("");
+  };
+
+  const newSession = () => {
+    setSessionId(newId());
+    setMessages([]);
+    setError("");
+  };
+
+  const removeSession = async () => {
+    try {
+      await deleteSession(sessionId);
+      setSessions(await listSessions());
+      newSession();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const copyText = async (text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      setError("复制失败");
+    }
+  };
+
   const isPinned = pinned.includes(model);
+  const sessionTitle =
+    sessions.find((s) => s.id === sessionId)?.title ?? "新对话";
 
   return (
     <div className="flex h-full flex-col gap-3 p-4">
-      {/* 顶部：模型与常驻（单行，不换行） */}
+      {/* 顶部：模型与常驻（单行） */}
       <div className="flex flex-nowrap items-center gap-2">
         <select
           className={`${controlClass} min-w-0 flex-1`}
@@ -150,7 +239,7 @@ export function Chat() {
           {models.length === 0 && <option value="">未发现模型</option>}
           {models.map((m) => (
             <option key={m.id} value={m.id}>
-              {m.id} {m.state === "loaded" ? "（已加载）" : ""}
+              {m.id}
             </option>
           ))}
         </select>
@@ -159,15 +248,21 @@ export function Chat() {
           state={models.find((m) => m.id === model)?.state ?? "unloaded"}
         />
 
-        <label className="flex cursor-pointer items-center gap-1.5 text-[12px]">
+        <label className="flex shrink-0 cursor-pointer items-center gap-1.5 text-[12px]">
           <input
             type="checkbox"
             checked={isPinned}
             disabled={!model}
-            onChange={(e) => togglePin(e.target.checked)}
+            onChange={async (e) => {
+              try {
+                setPinned(await setModelPinned(model, e.target.checked));
+              } catch (err) {
+                setError(String(err));
+              }
+            }}
             className="accent-[var(--brand)]"
           />
-          常驻此模型
+          常驻
         </label>
 
         <span
@@ -176,17 +271,45 @@ export function Chat() {
         >
           {isPinned ? "常驻中，不会被自动卸载" : "按需模式，空闲后自动释放"}
         </span>
+      </div>
+
+      {/* 会话栏 */}
+      <div className="flex flex-nowrap items-center gap-2">
+        <select
+          className={`${controlClass} min-w-0 max-w-[240px] flex-1`}
+          style={controlStyle}
+          value={sessionId}
+          onChange={(e) => switchSession(e.target.value)}
+        >
+          <option value={sessionId}>{sessionTitle}</option>
+          {sessions
+            .filter((s) => s.id !== sessionId)
+            .map((s) => (
+              <option key={s.id} value={s.id}>
+                {s.title}
+              </option>
+            ))}
+        </select>
 
         <button
-          className="ml-auto h-8 shrink-0 rounded-lg border px-3 text-[12px]"
+          className="h-8 shrink-0 rounded-lg border px-2.5 text-[12px]"
           style={controlStyle}
-          onClick={() => {
-            setMessages([]);
-            setError("");
-          }}
+          onClick={newSession}
         >
-          清空对话
+          新对话
         </button>
+        <button
+          className="h-8 shrink-0 rounded-lg border px-2.5 text-[12px]"
+          style={controlStyle}
+          onClick={removeSession}
+          disabled={!sessions.some((s) => s.id === sessionId)}
+        >
+          删除
+        </button>
+
+        <span className="ml-auto truncate text-[11px]" style={{ color: "var(--text-muted)" }}>
+          会话自动保存
+        </span>
       </div>
 
       {/* 消息列表 */}
@@ -206,6 +329,7 @@ export function Chat() {
         <div className="flex flex-col gap-3">
           {messages.map((m, i) => {
             const isUser = m.role === "user";
+            const isLast = i === messages.length - 1;
             return (
               <div
                 key={i}
@@ -219,11 +343,30 @@ export function Chat() {
                   }}
                 >
                   {m.content ||
-                    (busy && i === messages.length - 1 ? "…" : "")}
+                    (busy && isLast ? "…" : "")}
                 </div>
               </div>
             );
           })}
+
+          {!busy && messages.length > 0 && messages[messages.length - 1].role === "assistant" && (
+            <div className="flex justify-start gap-2">
+              <button
+                className="h-7 rounded-md border px-2 text-[11px]"
+                style={controlStyle}
+                onClick={regenerate}
+              >
+                重新生成
+              </button>
+              <button
+                className="h-7 rounded-md border px-2 text-[11px]"
+                style={controlStyle}
+                onClick={() => copyText(messages[messages.length - 1].content)}
+              >
+                复制
+              </button>
+            </div>
+          )}
         </div>
       </section>
 
