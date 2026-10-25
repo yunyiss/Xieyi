@@ -453,38 +453,37 @@ pub async fn unload_model(
     s.unload(&app, &model).await
 }
 
-fn system_prompt(source: &str, target: &str) -> String {
-    let src = if source == "auto" { "the source language" } else { source };
-    format!(
-        "You are a professional translator. Translate the user's text from {src} to {target}. \
-Output only the translation, without explanations, notes, or quotation marks."
-    )
+#[derive(Deserialize, Serialize, Clone)]
+pub struct ChatMessage {
+    pub role: String,
+    pub content: String,
 }
 
-#[tauri::command]
-pub async fn translate(
-    app: AppHandle,
-    state: tauri::State<'_, AppState>,
-    request: TranslateRequest,
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatRequest {
+    #[serde(default)]
+    pub request_id: String,
+    pub model: String,
+    pub messages: Vec<ChatMessage>,
+}
+
+/// 通用的流式补全：负责加载模型、发请求、解析 SSE 并把 token 推给前端。
+async fn stream_completion(
+    app: &AppHandle,
+    s: &mut Service,
+    request_id: &str,
+    model: &str,
+    messages: serde_json::Value,
+    temperature: f64,
 ) -> Result<String, String> {
-    if request.text.trim().is_empty() {
-        return Err("请输入要翻译的内容".into());
-    }
-
-    ensure(&app, &state).await?;
-
-    let mut guard = state.service.lock().await;
-    let s = guard.as_mut().ok_or("服务未启动")?;
-    s.load(&app, &request.model).await?;
+    s.load(app, model).await?;
 
     let body = serde_json::json!({
-        "model": request.model,
-        "messages": [
-            { "role": "system", "content": system_prompt(&request.source, &request.target) },
-            { "role": "user", "content": request.text }
-        ],
+        "model": model,
+        "messages": messages,
         "stream": true,
-        "temperature": 0.2,
+        "temperature": temperature,
         "max_tokens": 2048
     });
 
@@ -496,10 +495,10 @@ pub async fn translate(
         .timeout(Duration::from_secs(300))
         .send()
         .await
-        .map_err(|e| format!("翻译请求失败: {e}"))?;
+        .map_err(|e| format!("请求失败: {e}"))?;
 
     if !resp.status().is_success() {
-        return Err(format!("翻译失败，HTTP {}", resp.status()));
+        return Err(format!("推理失败，HTTP {}", resp.status()));
     }
 
     let mut stream = resp.bytes_stream();
@@ -525,9 +524,9 @@ pub async fn translate(
                     if !token.is_empty() {
                         full.push_str(token);
                         let _ = app.emit(
-                            "translate://token",
+                            "llm://token",
                             TokenPayload {
-                                request_id: request.request_id.clone(),
+                                request_id: request_id.to_string(),
                                 token: token.to_string(),
                             },
                         );
@@ -536,6 +535,62 @@ pub async fn translate(
             }
         }
     }
+
+    Ok(full)
+}
+
+fn system_prompt(source: &str, target: &str) -> String {
+    let src = if source == "auto" { "the source language" } else { source };
+    format!(
+        "You are a professional translator. Translate the user's text from {src} to {target}. \
+Output only the translation, without explanations, notes, or quotation marks."
+    )
+}
+
+#[tauri::command]
+pub async fn translate(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    request: TranslateRequest,
+) -> Result<String, String> {
+    if request.text.trim().is_empty() {
+        return Err("请输入要翻译的内容".into());
+    }
+
+    ensure(&app, &state).await?;
+
+    let messages = serde_json::json!([
+        { "role": "system", "content": system_prompt(&request.source, &request.target) },
+        { "role": "user", "content": request.text }
+    ]);
+
+    let mut guard = state.service.lock().await;
+    let s = guard.as_mut().ok_or("服务未启动")?;
+    let full = stream_completion(&app, s, &request.request_id, &request.model, messages, 0.2).await?;
+    drop(guard);
+
+    *state.last_used.lock().await = Instant::now();
+    Ok(full)
+}
+
+#[tauri::command]
+pub async fn chat(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    request: ChatRequest,
+) -> Result<String, String> {
+    if request.messages.is_empty() {
+        return Err("消息为空".into());
+    }
+
+    ensure(&app, &state).await?;
+
+    let messages = serde_json::to_value(&request.messages).map_err(|e| e.to_string())?;
+
+    let mut guard = state.service.lock().await;
+    let s = guard.as_mut().ok_or("服务未启动")?;
+    let full = stream_completion(&app, s, &request.request_id, &request.model, messages, 0.7).await?;
+    drop(guard);
 
     *state.last_used.lock().await = Instant::now();
     Ok(full)

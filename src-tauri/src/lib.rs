@@ -74,6 +74,7 @@ pub fn run() {
             service::load_model,
             service::unload_model,
             service::translate,
+            service::chat,
             service::set_ttl,
             service::set_gpu_layers,
             service::set_pinned,

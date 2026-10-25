@@ -5,6 +5,7 @@ import {
   getRuntimeStatus,
   installRuntime,
   listRouterModels,
+  newRequestId,
   onRuntimeProgress,
   onToken,
   openModelsDir,
@@ -39,12 +40,6 @@ const selectStyle = {
 
 const selectClass =
   "h-9 rounded-lg border px-2.5 text-[13px] outline-none transition-colors focus:border-[var(--brand)]";
-
-function requestId(): string {
-  const c = globalThis.crypto as Crypto | undefined;
-  if (c?.randomUUID) return c.randomUUID();
-  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-}
 
 function stageLabel(stage: RuntimeProgress["stage"]): string {
   switch (stage) {
@@ -155,7 +150,7 @@ export function Translate() {
     setOutput("");
     setBusy(true);
 
-    const id = requestId();
+    const id = newRequestId();
     unlistenRef.current?.();
     unlistenRef.current = await onToken((p) => {
       if (p.requestId === id) setOutput((prev) => prev + p.token);

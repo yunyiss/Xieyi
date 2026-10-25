@@ -60,6 +60,17 @@ export interface TranslateRequest {
   text: string;
 }
 
+export interface ChatMessage {
+  role: "user" | "assistant" | "system";
+  content: string;
+}
+
+export interface ChatRequest {
+  requestId: string;
+  model: string;
+  messages: ChatMessage[];
+}
+
 export const getAppInfo = () => invoke<AppInfo>("app_info");
 export const getRuntimeStatus = () => invoke<RuntimeStatus>("runtime_status");
 export const installRuntime = (backend: string) =>
@@ -86,6 +97,8 @@ export const unloadModel = (model: string) =>
   invoke<void>("unload_model", { model });
 export const translate = (request: TranslateRequest) =>
   invoke<string>("translate", { request });
+export const chat = (request: ChatRequest) =>
+  invoke<string>("chat", { request });
 
 export interface TokenPayload {
   requestId: string;
@@ -98,7 +111,7 @@ export const onRuntimeProgress = (
   listen<RuntimeProgress>("runtime://progress", (e) => cb(e.payload));
 
 export const onToken = (cb: (p: TokenPayload) => void): Promise<UnlistenFn> =>
-  listen<TokenPayload>("translate://token", (e) => cb(e.payload));
+  listen<TokenPayload>("llm://token", (e) => cb(e.payload));
 
 export const onModelState = (
   cb: (p: { model: string; state: string }) => void,
@@ -106,3 +119,10 @@ export const onModelState = (
   listen<{ model: string; state: string }>("model://state-changed", (e) =>
     cb(e.payload),
   );
+
+/** 生成一次请求的标识，用于把流式 token 归属到具体请求。 */
+export function newRequestId(): string {
+  const c = globalThis.crypto as Crypto | undefined;
+  if (c?.randomUUID) return c.randomUUID();
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
