@@ -260,8 +260,9 @@ export function Translate() {
                 className="h-9 rounded-lg px-4 text-[13px] font-medium text-white"
                 style={{ background: "var(--brand)" }}
                 onClick={() => handleInstall("vulkan")}
+                title="下载并解压到应用私有目录，约 31 MB"
               >
-                下载运行时（Vulkan）
+                下载运行时（Vulkan · 约 31 MB）
               </button>
               <button
                 className="h-9 rounded-lg border px-3 text-[13px]"
@@ -271,6 +272,16 @@ export function Translate() {
                 使用已有 llama-server
               </button>
             </div>
+          )}
+
+          {!progress && (
+            <p
+              className="m-0 mt-2 text-[11px]"
+              style={{ color: "var(--text-muted)" }}
+            >
+              Vulkan 为通用后端，首次推理会有约 3 秒着色器编译；NVIDIA 用户若追求更低延迟，
+              可用「使用已有 llama-server」指向本机 CUDA 版。
+            </p>
           )}
 
           {engineError && (

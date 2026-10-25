@@ -10,8 +10,15 @@ use crate::paths;
 /// 固定的 llama.cpp 构建号。路由模式属于较新特性，必须 pin 版本而不是用 latest。
 pub const PINNED_VERSION: &str = "b11714";
 
-/// 预留的校验值：填入后下载会自动校验；留空则仅记录实际哈希。
-const RUNTIME_SHA256: &str = "";
+/// 已核对过的下载包校验值（按后端区分；没有记录的组合跳过校验、仅保存实际哈希）。
+fn expected_sha256(backend: &str) -> Option<&'static str> {
+    if cfg!(target_os = "windows") && backend == "vulkan" {
+        // llama-b11714-bin-win-vulkan-x64.zip
+        Some("d4765447307f29fc0b4c8ae5b8b806c46b3e515d0ce5c2a54dd90d9b2c7a392f")
+    } else {
+        None
+    }
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -189,10 +196,13 @@ pub async fn install_runtime(app: AppHandle, backend: String) -> Result<RuntimeS
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
     let actual = format!("{:x}", hasher.finalize());
-    if !RUNTIME_SHA256.is_empty() && actual != RUNTIME_SHA256 {
-        return Err(format!(
-            "校验失败：期望 {RUNTIME_SHA256}，实际 {actual}。已删除下载文件。"
-        ));
+    if let Some(expected) = expected_sha256(&backend) {
+        if actual != expected {
+            let _ = std::fs::remove_file(&zip_path);
+            return Err(format!(
+                "下载包校验失败：期望 {expected}，实际 {actual}。文件已删除。"
+            ));
+        }
     }
 
     // 解压
