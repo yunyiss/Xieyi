@@ -2,7 +2,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { ModelDrawer } from "../components/ModelDrawer";
 import { ModelStateBadge } from "../components/ModelStateBadge";
-import { QuickModelControls } from "../components/QuickModelControls";
 import {
   abort,
   getRuntimeStatus,
@@ -325,10 +324,10 @@ export function Translate() {
         </section>
       )}
 
-      {/* 语言对 + 模型 */}
-      <div className="flex flex-wrap items-center gap-2">
+      {/* 工具栏：强制单行，窗口变窄时只压缩模型下拉，不换行 */}
+      <div className="flex flex-nowrap items-center gap-2">
         <select
-          className={selectClass}
+          className={`${selectClass} w-[104px] shrink-0`}
           style={selectStyle}
           value={source}
           onChange={(e) => setSource(e.target.value)}
@@ -340,10 +339,12 @@ export function Translate() {
           ))}
         </select>
 
-        <span style={{ color: "var(--text-muted)" }}>→</span>
+        <span className="shrink-0" style={{ color: "var(--text-muted)" }}>
+          →
+        </span>
 
         <select
-          className={selectClass}
+          className={`${selectClass} w-[96px] shrink-0`}
           style={selectStyle}
           value={target}
           onChange={(e) => setTarget(e.target.value)}
@@ -355,32 +356,50 @@ export function Translate() {
           ))}
         </select>
 
-        <span className="mx-1" style={{ color: "var(--border-strong)" }}>|</span>
+        <span
+          className="mx-0.5 h-5 w-px shrink-0"
+          style={{ background: "var(--border)" }}
+        />
 
         <select
-          className={selectClass}
-          style={{ ...selectStyle, minWidth: 180 }}
+          className={`${selectClass} min-w-0 flex-1`}
+          style={selectStyle}
           value={model}
           onChange={(e) => setModel(e.target.value)}
           disabled={models.length === 0}
+          title={model || "未发现模型"}
         >
           {models.length === 0 && <option value="">未发现模型</option>}
           {models.map((m) => (
             <option key={m.id} value={m.id}>
-              {m.id} {m.state === "loaded" ? "（已加载）" : ""}
+              {m.id}
             </option>
           ))}
         </select>
 
         <ModelStateBadge state={currentModelState} />
 
-        <div className="ml-auto">
-          <QuickModelControls
-            model={model}
-            onChanged={bootstrap}
-            onOpenDrawer={() => setDrawerOpen(true)}
-          />
-        </div>
+        <button
+          className="ml-1 flex h-9 shrink-0 items-center gap-1.5 rounded-lg border px-3 text-[12px] transition-colors"
+          style={selectStyle}
+          onClick={() => setDrawerOpen(true)}
+          title="模型管理与引擎设置"
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden>
+            <path
+              d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"
+              stroke="currentColor"
+              strokeWidth="1.7"
+            />
+            <path
+              d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.03 1.56V21a2 2 0 1 1-4 0v-.09A1.7 1.7 0 0 0 8.9 19.4a1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-1.56-1.03H3a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.6 8.9a1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 9 4.6h.09A1.7 1.7 0 0 0 10.1 3.04V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1.03 1.56 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.7 1.7 0 0 0 19.4 9v.09a1.7 1.7 0 0 0 1.56 1.03H21a2 2 0 1 1 0 4h-.09A1.7 1.7 0 0 0 19.4 15Z"
+              stroke="currentColor"
+              strokeWidth="1.7"
+              strokeLinejoin="round"
+            />
+          </svg>
+          管理
+        </button>
       </div>
 
       {/* 输入 / 输出 */}

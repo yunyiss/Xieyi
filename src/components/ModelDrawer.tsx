@@ -6,11 +6,35 @@ import {
   listRouterModels,
   openModelsDir,
   restartService,
+  setGpuLayers,
   setModelsDir,
   setPinned,
+  setTtl,
   type LocalModel,
   type Settings,
 } from "../lib/ipc";
+
+const TTL_OPTIONS = [
+  { value: 60, label: "空闲 60 秒释放" },
+  { value: 120, label: "空闲 120 秒释放" },
+  { value: 300, label: "空闲 5 分钟释放" },
+  { value: 0, label: "不自动释放" },
+];
+
+const LAYER_OPTIONS = [
+  { value: 999, label: "全 GPU" },
+  { value: 16, label: "混合 16 层" },
+  { value: 0, label: "纯 CPU" },
+];
+
+const fieldStyle = {
+  background: "var(--surface)",
+  borderColor: "var(--border)",
+  color: "var(--text)",
+};
+
+const fieldClass =
+  "h-8 w-full rounded-lg border px-2 text-[12px] outline-none focus:border-[var(--brand)]";
 
 interface Props {
   open: boolean;
@@ -127,6 +151,26 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
     }
   };
 
+  const changeTtl = async (value: number) => {
+    setError("");
+    try {
+      await setTtl(value);
+      setSettings((prev) => (prev ? { ...prev, ttlSecs: value } : prev));
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const changeLayers = async (value: number) => {
+    setError("");
+    try {
+      await setGpuLayers(value);
+      setSettings((prev) => (prev ? { ...prev, gpuLayers: value } : prev));
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
   return (
     <>
       <div
@@ -158,6 +202,68 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
         </header>
 
         <div className="min-h-0 flex-1 overflow-auto px-4 py-3">
+          {/* 引擎设置 */}
+          <section className="mb-4">
+            <div
+              className="mb-1.5 text-[11px] font-medium"
+              style={{ color: "var(--text-muted)" }}
+            >
+              引擎设置
+            </div>
+
+            <div className="flex flex-col gap-2">
+              <label className="flex items-center gap-2 text-[12px]">
+                <span className="w-[64px] shrink-0" style={{ color: "var(--text-muted)" }}>
+                  空闲释放
+                </span>
+                <select
+                  className={fieldClass}
+                  style={fieldStyle}
+                  value={settings?.ttlSecs ?? 120}
+                  onChange={(e) => changeTtl(Number(e.target.value))}
+                >
+                  {TTL_OPTIONS.map((o) => (
+                    <option key={o.value} value={o.value}>
+                      {o.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label className="flex items-center gap-2 text-[12px]">
+                <span className="w-[64px] shrink-0" style={{ color: "var(--text-muted)" }}>
+                  推理档位
+                </span>
+                <select
+                  className={fieldClass}
+                  style={fieldStyle}
+                  value={settings?.gpuLayers ?? 999}
+                  onChange={(e) => changeLayers(Number(e.target.value))}
+                >
+                  {LAYER_OPTIONS.map((o) => (
+                    <option key={o.value} value={o.value}>
+                      {o.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+
+            <div className="mt-2 flex items-center gap-2">
+              <button
+                className={btnClass}
+                style={btnStyle}
+                onClick={restart}
+                disabled={busy === "restart"}
+              >
+                {busy === "restart" ? "重启中…" : "重启引擎"}
+              </button>
+              <span className="text-[11px]" style={{ color: "var(--text-muted)" }}>
+                档位改动后需重启生效
+              </span>
+            </div>
+          </section>
+
           {/* 模型目录 */}
           <div className="mb-3">
             <div className="mb-1 text-[11px]" style={{ color: "var(--text-muted)" }}>
@@ -191,10 +297,9 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
             <button
               className={`ml-auto ${btnClass}`}
               style={btnStyle}
-              onClick={restart}
-              disabled={busy === "restart"}
+              onClick={refresh}
             >
-              {busy === "restart" ? "重启中…" : "重启引擎"}
+              刷新
             </button>
           </div>
 

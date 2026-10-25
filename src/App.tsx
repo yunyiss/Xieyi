@@ -6,9 +6,11 @@ import {
   getAppInfo,
   getRuntimeStatus,
   getServiceStatus,
+  getSettings,
   type AppInfo,
   type RuntimeStatus,
   type ServiceStatus,
+  type Settings,
 } from "./lib/ipc";
 
 type Tab = "translate" | "chat";
@@ -18,6 +20,7 @@ function App() {
   const [info, setInfo] = useState<AppInfo | null>(null);
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
   const [service, setService] = useState<ServiceStatus | null>(null);
+  const [settings, setSettings] = useState<Settings | null>(null);
 
   useEffect(() => {
     getAppInfo()
@@ -32,9 +35,11 @@ function App() {
       try {
         const rt = await getRuntimeStatus();
         const sv = await getServiceStatus();
+        const cfg = await getSettings();
         if (alive) {
           setRuntime(rt);
           setService(sv);
+          setSettings(cfg);
         }
       } catch {
         // 引擎未启动时静默
@@ -87,7 +92,12 @@ function App() {
         {tab === "translate" ? <Translate /> : <Chat />}
       </main>
 
-      <StatusBar info={info} runtime={runtime} service={service} />
+      <StatusBar
+        info={info}
+        runtime={runtime}
+        service={service}
+        settings={settings}
+      />
     </div>
   );
 }

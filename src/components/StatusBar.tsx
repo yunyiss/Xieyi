@@ -1,9 +1,15 @@
-import type { AppInfo, RuntimeStatus, ServiceStatus } from "../lib/ipc";
+import type {
+  AppInfo,
+  RuntimeStatus,
+  ServiceStatus,
+  Settings,
+} from "../lib/ipc";
 
 interface Props {
   info: AppInfo | null;
   runtime: RuntimeStatus | null;
   service: ServiceStatus | null;
+  settings: Settings | null;
 }
 
 function Dot({ on }: { on: boolean }) {
@@ -15,10 +21,26 @@ function Dot({ on }: { on: boolean }) {
   );
 }
 
-/** 底部状态条：运行时 / 引擎 / 驻留状态。 */
-export function StatusBar({ info, runtime, service }: Props) {
+/** 底部状态条：运行时 / 引擎 / 驻留 / 释放策略。 */
+export function StatusBar({ info, runtime, service, settings }: Props) {
   const loaded = service?.loaded ?? [];
   const running = Boolean(service?.running);
+
+  const ttlLabel =
+    settings == null
+      ? "—"
+      : settings.ttlSecs === 0
+        ? "不自动释放"
+        : `空闲 ${settings.ttlSecs}s 释放`;
+
+  const layersLabel =
+    settings == null
+      ? "—"
+      : settings.gpuLayers === 0
+        ? "纯 CPU"
+        : settings.gpuLayers >= 999
+          ? "全 GPU"
+          : `混合 ${settings.gpuLayers} 层`;
 
   return (
     <footer
@@ -42,7 +64,11 @@ export function StatusBar({ info, runtime, service }: Props) {
         {loaded.length > 0 ? `驻留 ${loaded.join(", ")}` : "模型未加载 · 显存 0"}
       </span>
 
-      <span className="ml-auto">
+      <span className="truncate">
+        {ttlLabel} · {layersLabel}
+      </span>
+
+      <span className="ml-auto shrink-0">
         {info ? `${info.os} / ${info.arch} · v${info.version}` : "读取环境…"}
       </span>
     </footer>

@@ -137,14 +137,15 @@ export function Chat() {
 
   return (
     <div className="flex h-full flex-col gap-3 p-4">
-      {/* 顶部：模型与常驻 */}
-      <div className="flex flex-wrap items-center gap-2">
+      {/* 顶部：模型与常驻（单行，不换行） */}
+      <div className="flex flex-nowrap items-center gap-2">
         <select
-          className={controlClass}
-          style={{ ...controlStyle, minWidth: 200 }}
+          className={`${controlClass} min-w-0 flex-1`}
+          style={controlStyle}
           value={model}
           onChange={(e) => setModel(e.target.value)}
           disabled={models.length === 0}
+          title={model || "未发现模型"}
         >
           {models.length === 0 && <option value="">未发现模型</option>}
           {models.map((m) => (
@@ -169,12 +170,15 @@ export function Chat() {
           常驻此模型
         </label>
 
-        <span className="text-[12px]" style={{ color: "var(--text-muted)" }}>
+        <span
+          className="hidden shrink-0 text-[12px] xl:inline"
+          style={{ color: "var(--text-muted)" }}
+        >
           {isPinned ? "常驻中，不会被自动卸载" : "按需模式，空闲后自动释放"}
         </span>
 
         <button
-          className="ml-auto h-8 rounded-lg border px-3 text-[12px]"
+          className="ml-auto h-8 shrink-0 rounded-lg border px-3 text-[12px]"
           style={controlStyle}
           onClick={() => {
             setMessages([]);
