@@ -187,6 +187,13 @@ pub struct AppState {
     pub service: tokio::sync::Mutex<Option<Arc<Service>>>,
     /// 串行化推理请求，避免同时向单模型服务打并发；不阻塞状态查询。
     pub infer_lock: tokio::sync::Mutex<()>,
+    /// 正在进行/排队中的推理请求数。
+    ///
+    /// TTL 的本意是"用户走开了就把显存还回去"，不能用它给**正在使用**的请求计时：
+    /// 思考型模型一次生成可能好几分钟，期间 `last_used` 不动，空闲计时照样会
+    /// 走满并把模型卸掉——表现为思考到一半突然中断、只留下一小段内容。
+    /// 因此只要这个计数大于 0，TTL 就必须让路。
+    pub inflight: Arc<AtomicU64>,
     /// 当前请求是否被用户取消。
     pub cancel: Arc<std::sync::atomic::AtomicBool>,
     pub last_used: tokio::sync::Mutex<Instant>,
@@ -204,6 +211,7 @@ impl Default for AppState {
         Self {
             service: tokio::sync::Mutex::new(None),
             infer_lock: tokio::sync::Mutex::new(()),
+            inflight: Arc::new(AtomicU64::new(0)),
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_used: tokio::sync::Mutex::new(Instant::now()),
             ttl_secs: AtomicU64::new(120),
@@ -217,6 +225,26 @@ impl Default for AppState {
 /// 翻译缓存上限。超过后整体清空——翻译多是一次性内容，
 /// 做 LRU 的复杂度换不来收益。
 const CACHE_LIMIT: usize = 4000;
+
+/// 推理期间给 TTL 让路的守卫：构造时 +1，Drop 时 -1。
+///
+/// 用 RAII 而不是"在函数末尾手动减"：这条路径上有大量 `?` 提前返回、
+/// 还有取消/超时分支，手写递减迟早漏一处，而漏掉的后果很严重——
+/// 计数永远大于 0，TTL 从此彻底失效，显存再也不释放。
+pub(crate) struct InflightGuard(Arc<AtomicU64>);
+
+impl InflightGuard {
+    pub(crate) fn new(counter: &Arc<AtomicU64>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self(counter.clone())
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// 把一段译文写进缓存，**唯一的写入口**。
 ///
@@ -1069,7 +1097,11 @@ async fn stream_completion(
         if cancel.load(Ordering::Relaxed) {
             return Err("已取消".into());
         }
-        return Err(empty_reply_message(reasoning_chars, max_tokens));
+        return Err(empty_reply_message(
+            reasoning_chars,
+            max_tokens,
+            &finish_reason,
+        ));
     }
 
     // 有正文但被上限截断：至少留痕，方便排查长回答被切断
@@ -1080,12 +1112,32 @@ async fn stream_completion(
     Ok(full)
 }
 
-/// 空回复的诊断文案。实测 Qwen3.5 会先思考再作答，
-/// 思维链把 `max_tokens` 吃光时正文就是空的（`finish_reason = length`）。
-fn empty_reply_message(reasoning_chars: usize, max_tokens: u32) -> String {
+/// 空回复的诊断文案。
+///
+/// 三种情况必须分开说，否则会给出误导性的建议：
+/// - `length`：思考真的把输出额度吃光了——这才是"调低思考档位"的场景；
+/// - 其它 finish_reason（或压根没收到）：**流被中断**，多半是模型进程在
+///   生成期间没了（被卸载、崩溃、连接断开）。此时让用户"调低思考档位"
+///   纯属误导，他们会调低后发现问题依旧。
+/// - 有思考但没有任何正文且没收到 finish_reason：同上，按中断处理。
+fn empty_reply_message(reasoning_chars: usize, max_tokens: u32, finish_reason: &str) -> String {
+    let exhausted = finish_reason == "length";
+
+    if exhausted {
+        if reasoning_chars > 0 {
+            return format!(
+                "模型只输出了思考内容（{reasoning_chars} 字）就用完了 {max_tokens} token 的输出预算，正文为空。请把思考档位调低，或在设置里给这个模型更大的上下文。"
+            );
+        }
+        return format!(
+            "模型在 {max_tokens} token 的输出预算内没有产出正文。请把思考档位调低，或在设置里给这个模型更大的上下文。"
+        );
+    }
+
+    // 没到上限却没有正文 → 生成被打断了，和预算无关
     if reasoning_chars > 0 {
         format!(
-            "模型只输出了思考内容（{reasoning_chars} 字）就用完了 {max_tokens} token 的输出预算，正文为空。请把思考档位调低，或在设置里给这个模型更大的上下文。"
+            "生成在思考阶段中断了（已输出 {reasoning_chars} 字思考内容），没有收到正文。多半是模型加载被中断或推理进程退出了，请重试。"
         )
     } else {
         "模型没有返回内容，请重试。".to_string()
@@ -1098,7 +1150,8 @@ mod tests {
 
     #[test]
     fn empty_reply_blames_thinking_when_reasoning_present() {
-        let message = empty_reply_message(2985, 1024);
+        // 真正"思考吃光预算"才会带 finish_reason=length
+        let message = empty_reply_message(2985, 1024, "length");
         // 实测 Qwen3.5 就是这个形态：思考 2985 字、正文 0 字
         assert!(message.contains("2985"), "应带上思考字数: {message}");
         assert!(message.contains("1024"), "应带上输出上限: {message}");
@@ -1107,7 +1160,28 @@ mod tests {
 
     #[test]
     fn empty_reply_without_thinking_stays_generic() {
-        assert_eq!(empty_reply_message(0, 1024), "模型没有返回内容，请重试。");
+        assert_eq!(
+            empty_reply_message(0, 1024, "length"),
+            "模型在 1024 token 的输出预算内没有产出正文。请把思考档位调低，或在设置里给这个模型更大的上下文。"
+        );
+        assert_eq!(
+            empty_reply_message(0, 1024, ""),
+            "模型没有返回内容，请重试。"
+        );
+    }
+
+    /// 流被中断时不能建议"调低思考档位"——那会导致用户按错误方向排查。
+    #[test]
+    fn interrupted_stream_is_not_reported_as_budget_exhaustion() {
+        // 思考只输出 6 字就被打断：真实形态是 finish_reason 为空/stop
+        let message = empty_reply_message(6, 1536, "");
+        assert!(
+            !message.contains("预算"),
+            "中断不该说成预算耗尽: {message}"
+        );
+        assert!(!message.contains("调低"), "中断不该建议调低档位: {message}");
+        assert!(message.contains("中断"), "应指出是中断: {message}");
+        assert!(message.contains("6"), "应带上已输出的思考字数: {message}");
     }
 
     #[test]
@@ -1117,6 +1191,51 @@ mod tests {
         assert_eq!(messages[0]["content"], "SYS");
         assert_eq!(messages[1]["role"], "user");
         assert_eq!(messages[1]["content"], "TEXT");
+    }
+
+    /// 推理期间 `inflight` 必须大于 0，TTL 才不会误杀正在用的模型。
+    #[test]
+    fn inflight_guard_marks_busy_and_releases_on_drop() {
+        let counter = Arc::new(AtomicU64::new(0));
+
+        {
+            let _guard = InflightGuard::new(&counter);
+            assert_eq!(
+                counter.load(Ordering::Relaxed),
+                1,
+                "推理开始时 TTL 就该让路"
+            );
+        }
+
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            0,
+            "推理结束后必须归零，否则 TTL 会永久失效、显存再也不释放"
+        );
+    }
+
+    /// 嵌套/并发守卫要能正确叠加，提前返回（`?`）时也必须回退。
+    #[test]
+    fn inflight_guard_nests_and_releases_on_early_return() {
+        let counter = Arc::new(AtomicU64::new(0));
+
+        fn bail(counter: &Arc<AtomicU64>) -> Result<(), String> {
+            let _guard = InflightGuard::new(counter);
+            Err("提前返回".into())
+        }
+
+        {
+            let _outer = InflightGuard::new(&counter);
+            assert_eq!(counter.load(Ordering::Relaxed), 1);
+            assert!(bail(&counter).is_err());
+            assert_eq!(
+                counter.load(Ordering::Relaxed),
+                1,
+                "内层提前返回后应回退到只剩外层"
+            );
+        }
+
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
     }
 
     fn stats() -> SegmentStats {
@@ -1210,6 +1329,8 @@ pub async fn translate(
 
     let service = ensure(&app, &state).await?;
     let _infer = state.infer_lock.lock().await;
+    // 拿到推理通道后立刻挂上守卫：从这一刻起 TTL 不再倒计时
+    let _busy = InflightGuard::new(&state.inflight);
     state.cancel.store(false, Ordering::Relaxed);
 
     let glossary = load_glossary(&app);
@@ -1318,6 +1439,8 @@ pub async fn chat(
 
     let s = ensure(&app, &state).await?;
     let _infer = state.infer_lock.lock().await;
+    // 思考型模型可能一跑好几分钟，这段时间绝不能算作"空闲"
+    let _busy = InflightGuard::new(&state.inflight);
     state.cancel.store(false, Ordering::Relaxed);
 
     let trimmed = trim_history(&request.messages);
@@ -1539,6 +1662,11 @@ pub async fn restart_service(
 }
 
 /// 空闲 TTL 守护：停手若干秒后自动卸载，把显存还回去。
+///
+/// 注意这里是「用户停手」的计时，不是「距上次刷新多久」的计时：
+/// 只要还有推理在跑（`inflight > 0`），就说明用户正用着，模型绝不能卸。
+/// 否则思考型模型跑到一半被卸载，界面会只留下一小段内容并报出
+/// 一个自相矛盾的「思考 N 字就用完预算」错误。
 pub fn spawn_ttl_watcher(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         loop {
@@ -1549,6 +1677,12 @@ pub fn spawn_ttl_watcher(app: AppHandle) {
             if ttl == 0 {
                 continue;
             }
+
+            // 正在推理 / 排队中：用户在用它，不算空闲
+            if state.inflight.load(Ordering::Relaxed) > 0 {
+                continue;
+            }
+
             let idle = state.last_used.lock().await.elapsed();
             if idle < Duration::from_secs(ttl) {
                 continue;

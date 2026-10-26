@@ -113,6 +113,8 @@ pub async fn batch_translate(
 
     // 批处理期间独占推理通道，避免和翻译页 / 聊天的请求互相插队
     let _infer = state.infer_lock.lock().await;
+    // 批量可能跑很久，期间不能算"空闲"，否则 TTL 会把正在用的模型卸掉
+    let _busy = service::InflightGuard::new(&state.inflight);
     state.cancel.store(false, Ordering::Relaxed);
 
     // 先把模型装好，别让第一个文件独自承担加载时间
