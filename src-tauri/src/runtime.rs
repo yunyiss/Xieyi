@@ -220,6 +220,11 @@ pub async fn install_runtime(app: AppHandle, backend: String) -> Result<RuntimeS
 
     let exe = find_executable(&dest).ok_or("压缩包内未找到 llama-server")?;
 
+    // 解压完安装包就没用了，31 MB 留着只是白占磁盘（失败路径见下方各 return 分支）
+    let _ = std::fs::remove_file(&zip_path);
+    // 空掉就顺手把 downloads 目录也收掉；非空时 remove_dir 会失败，正好当"别动"
+    let _ = std::fs::remove_dir(&downloads);
+
     // 自检
     emit(&app, "checking", 0, 0);
     let output = tokio::time::timeout(

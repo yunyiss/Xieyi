@@ -36,6 +36,12 @@ function App() {
 
   const handleDraftTaken = useCallback(() => setChatDraft(""), []);
 
+  /** 运行时装好后三个页面都要重新拉模型，复用设置抽屉那条刷新信号。 */
+  const handleRuntimeChanged = useCallback(
+    () => setRefreshSignal((n) => n + 1),
+    [],
+  );
+
   useEffect(() => {
     getAppInfo()
       .then(setInfo)
@@ -136,6 +142,7 @@ function App() {
           <Translate
             refreshSignal={refreshSignal}
             onSendToChat={handleSendToChat}
+            onRuntimeChanged={handleRuntimeChanged}
           />
         </div>
         <div className={tab === "batch" ? "h-full" : "hidden"}>

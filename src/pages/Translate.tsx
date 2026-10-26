@@ -65,9 +65,15 @@ interface Props {
   refreshSignal?: number;
   /** 把译文送到对话页继续调整语意。 */
   onSendToChat?: (text: string) => void;
+  /** 运行时安装/切换成功后通知父级，让常驻挂载的其他页面也重新拉取模型。 */
+  onRuntimeChanged?: () => void;
 }
 
-export function Translate({ refreshSignal = 0, onSendToChat }: Props) {
+export function Translate({
+  refreshSignal = 0,
+  onSendToChat,
+  onRuntimeChanged,
+}: Props) {
   const [source, setSource] = useState("auto");
   const [target, setTarget] = useState("zh");
   const [input, setInput] = useState("");
@@ -156,6 +162,8 @@ export function Translate({ refreshSignal = 0, onSendToChat }: Props) {
       setRuntime(rt);
       setProgress(null);
       await bootstrap();
+      // 批量页/对话页是常驻挂载的，不会自己重新拉模型；装完运行时统一通知一次
+      onRuntimeChanged?.();
     } catch (e) {
       setProgress(null);
       setEngineError(String(e));
@@ -171,6 +179,7 @@ export function Translate({ refreshSignal = 0, onSendToChat }: Props) {
     try {
       setRuntime(await setManualRuntime(path));
       await bootstrap();
+      onRuntimeChanged?.();
     } catch (e) {
       setEngineError(String(e));
     }
