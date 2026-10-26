@@ -14,34 +14,76 @@ pub const DEFAULT_CTX: u64 = 4096;
 pub const MIN_CTX: u64 = 512;
 pub const MAX_CTX: u64 = 262_144;
 
-/// 思考开关。
+/// 思考档位。
 ///
-/// 能否真正生效取决于模型自己的对话模板：实测 Qwen3.5 只认 `enable_thinking`
-/// 这个布尔值，没有预算/强度参数；Hy-MT2 这类翻译模板会直接忽略它。
+/// 对齐 llama.cpp Web UI 的做法：`enable_thinking` 走对话模板，
+/// `thinking_budget_tokens` 是**服务端硬限制**（已实测生效），
+/// `reasoning_control` 表示由客户端掌控思考预算。
+///
+/// 注意：预算只管"思考什么时候收尾"，和 `max_tokens` 共用同一份输出额度。
+/// 总预算太小的话，思考照样把正文挤掉，所以发预算时要同步放大 max_tokens。
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Thinking {
-    /// 不干预，交给模板默认行为（思考型模型会先输出思维链）
-    Auto,
-    On,
+    /// 不干预，交给模型模板的默认行为
+    Default,
     #[default]
     Off,
+    Low,
+    Medium,
+    High,
+    /// 不限思考长度
+    Max,
 }
 
 impl Thinking {
     pub fn as_str(self) -> &'static str {
         match self {
-            Thinking::Auto => "auto",
-            Thinking::On => "on",
+            Thinking::Default => "default",
             Thinking::Off => "off",
+            Thinking::Low => "low",
+            Thinking::Medium => "medium",
+            Thinking::High => "high",
+            Thinking::Max => "max",
         }
     }
 
+    /// 兼容旧配置：之前的 auto/on/off 三态。
     pub fn parse(s: &str) -> Self {
         match s {
-            "auto" => Thinking::Auto,
-            "on" => Thinking::On,
+            "auto" | "default" => Thinking::Default,
+            "on" | "max" => Thinking::Max,
+            "low" => Thinking::Low,
+            "medium" => Thinking::Medium,
+            "high" => Thinking::High,
             _ => Thinking::Off,
+        }
+    }
+
+    /// 是否让模型思考。
+    pub fn enabled(self) -> bool {
+        matches!(self, Thinking::Low | Thinking::Medium | Thinking::High | Thinking::Max)
+    }
+
+    /// 思考预算（token）。`None` 表示不设置，交给服务端或模板。
+    pub fn budget(self) -> Option<i64> {
+        match self {
+            Thinking::Low => Some(512),
+            Thinking::Medium => Some(2048),
+            Thinking::High => Some(8192),
+            Thinking::Max => Some(-1),
+            Thinking::Default | Thinking::Off => None,
+        }
+    }
+
+    /// 思考最多会占多少 token（用于给 max_tokens 留余量）。
+    /// 不限或默认时无法预估，返回 0。
+    pub fn reserved_tokens(self) -> u32 {
+        match self {
+            Thinking::Low => 512,
+            Thinking::Medium => 2048,
+            Thinking::High => 8192,
+            Thinking::Default | Thinking::Off | Thinking::Max => 0,
         }
     }
 }
@@ -108,15 +150,50 @@ mod tests {
 
     #[test]
     fn thinking_round_trips_through_str() {
-        for mode in [Thinking::Auto, Thinking::On, Thinking::Off] {
+        for mode in [
+            Thinking::Default,
+            Thinking::Off,
+            Thinking::Low,
+            Thinking::Medium,
+            Thinking::High,
+            Thinking::Max,
+        ] {
             assert_eq!(Thinking::parse(mode.as_str()), mode);
         }
+    }
+
+    #[test]
+    fn legacy_thinking_values_still_load() {
+        // 旧配置里是 auto/on/off
+        assert_eq!(Thinking::parse("auto"), Thinking::Default);
+        assert_eq!(Thinking::parse("on"), Thinking::Max);
+        assert_eq!(Thinking::parse("off"), Thinking::Off);
     }
 
     #[test]
     fn unknown_thinking_defaults_to_off() {
         // 配置被手改坏时不能悄悄打开思考
         assert_eq!(Thinking::parse("bogus"), Thinking::Off);
+    }
+
+    #[test]
+    fn budgets_match_llamacpp_web_ui() {
+        // 与 llama.cpp Web UI 的 Low/Medium/High/Max 一一对应
+        assert_eq!(Thinking::Low.budget(), Some(512));
+        assert_eq!(Thinking::Medium.budget(), Some(2048));
+        assert_eq!(Thinking::High.budget(), Some(8192));
+        assert_eq!(Thinking::Max.budget(), Some(-1));
+        assert_eq!(Thinking::Off.budget(), None);
+        assert_eq!(Thinking::Default.budget(), None);
+    }
+
+    #[test]
+    fn enabled_only_for_thinking_tiers() {
+        assert!(!Thinking::Off.enabled());
+        assert!(!Thinking::Default.enabled());
+        for mode in [Thinking::Low, Thinking::Medium, Thinking::High, Thinking::Max] {
+            assert!(mode.enabled(), "{mode:?} 应被视为开启思考");
+        }
     }
 
     #[test]

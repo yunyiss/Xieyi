@@ -34,10 +34,14 @@ const LAYER_OPTIONS = [
   { value: 0, label: "纯 CPU" },
 ];
 
-const THINKING_OPTIONS: { value: ThinkingMode; label: string }[] = [
-  { value: "off", label: "关闭" },
-  { value: "auto", label: "跟随模型" },
-  { value: "on", label: "开启" },
+/** 思考档位，与 llama.cpp Web UI 的六档一一对应。 */
+const THINKING_OPTIONS: { value: ThinkingMode; label: string; needCtx: number }[] = [
+  { value: "default", label: "默认（模型决定）", needCtx: 0 },
+  { value: "off", label: "关闭", needCtx: 0 },
+  { value: "low", label: "低 · 最多 512", needCtx: 1024 },
+  { value: "medium", label: "中 · 最多 2048", needCtx: 4096 },
+  { value: "high", label: "高 · 最多 8192", needCtx: 16384 },
+  { value: "max", label: "不限", needCtx: 0 },
 ];
 
 /** 可选的上下文档位：不超过模型原生上限，且保留当前值。 */
@@ -556,21 +560,38 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
                       思考
                     </span>
                     <select
-                      className="h-6 shrink-0 rounded-md border px-1 text-[11px] outline-none focus:border-[var(--brand)]"
+                      className="h-6 shrink-0 rounded-md border px-1 text-[11px] outline-none focus:border-[var(--brand)] disabled:opacity-50"
                       style={fieldStyle}
                       value={m.thinking}
+                      disabled={!m.supportsThinking}
                       onChange={(e) =>
                         changeThinking(m, e.target.value as ThinkingMode)
                       }
-                      title="只有模型对话模板支持 enable_thinking 时才真正生效；翻译始终关闭"
+                      title={
+                        m.supportsThinking
+                          ? "连接到 libllama 的思考预算；档位越高思考越久，正文配额也会同步放大"
+                          : "该模型的对话模板不含思考指令，设置不会生效"
+                      }
                     >
                       {THINKING_OPTIONS.map((o) => (
                         <option key={o.value} value={o.value}>
                           {o.label}
+                          {o.needCtx > 0 && m.ctxSize < o.needCtx
+                            ? "（上下文不足）"
+                            : ""}
                         </option>
                       ))}
                     </select>
                   </div>
+
+                  {!m.supportsThinking && (
+                    <p
+                      className="m-0 mt-1 text-[10px]"
+                      style={{ color: "var(--text-muted)" }}
+                    >
+                      该模型不支持思考（模板里没有 enable_thinking）
+                    </p>
+                  )}
 
                   {m.trainedCtx != null && (
                     <p

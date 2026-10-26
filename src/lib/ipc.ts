@@ -55,12 +55,17 @@ export interface LocalModel {
   ctxSize: number;
   /** 模型原生上限（读 GGUF 元数据），读不到为 null */
   trainedCtx: number | null;
-  /** auto / on / off */
+  /** 对话模板是否支持思考（读 GGUF 里的 chat_template 判断） */
+  supportsThinking: boolean;
   thinking: ThinkingMode;
 }
 
-/** 思考开关。能否生效取决于模型自己的对话模板。 */
-export type ThinkingMode = "auto" | "on" | "off";
+/**
+ * 思考档位，与 llama.cpp Web UI 一致：
+ * default 交给模型、off 关闭、low/medium/high 分别限 512/2048/8192 token、max 不限。
+ * 能否生效取决于模型对话模板是否支持 enable_thinking。
+ */
+export type ThinkingMode = "default" | "off" | "low" | "medium" | "high" | "max";
 
 export interface GlossaryEntry {
   from: string;
@@ -102,6 +107,8 @@ export interface ChatRequest {
   requestId: string;
   model: string;
   messages: ChatMessage[];
+  /** 本次对话的思考档位覆盖；不传则用该模型在设置里的档位 */
+  thinking?: ThinkingMode;
 }
 
 export interface Session {
@@ -181,6 +188,8 @@ export interface UsagePayload {
   cachedTokens: number;
   /** 该模型当前的上下文上限 */
   ctxSize: number;
+  /** 本次请求耗时（毫秒），用于算 tokens/s */
+  elapsedMs: number;
 }
 
 export const onUsage = (cb: (p: UsagePayload) => void): Promise<UnlistenFn> =>

@@ -56,6 +56,8 @@ struct UsagePayload {
     cached_tokens: u64,
     /// 该模型当前的上下文上限
     ctx_size: u64,
+    /// 本次请求耗时（毫秒），用于算 tokens/s
+    elapsed_ms: u64,
 }
 
 #[derive(Serialize, Clone)]
@@ -789,6 +791,10 @@ pub struct ChatRequest {
     pub request_id: String,
     pub model: String,
     pub messages: Vec<ChatMessage>,
+    /// 本次对话的思考档位覆盖（default/off/low/medium/high/max）。
+    /// 为空时用该模型在设置里保存的档位。
+    #[serde(default)]
+    pub thinking: Option<String>,
 }
 
 /// 通用的流式补全：负责加载模型、发请求、解析 SSE 并把 token 推给前端。
@@ -808,6 +814,8 @@ async fn stream_completion(
 ) -> Result<String, String> {
     s.load(app, model, cancel).await?;
 
+    let started = Instant::now();
+
     let mut body = serde_json::json!({
         "model": model,
         "messages": messages,
@@ -818,10 +826,18 @@ async fn stream_completion(
         "stream_options": { "include_usage": true }
     });
 
-    // auto = 不干预，交给模型模板的默认行为
-    if thinking != Thinking::Auto {
+    // 思考控制：与 llama.cpp Web UI 的请求体保持一致
+    //   - enable_thinking 走对话模板
+    //   - thinking_budget_tokens 由服务端硬限制思考长度（实测生效）
+    //   - reasoning_control 表示预算由客户端掌控
+    if thinking != Thinking::Default {
         body["chat_template_kwargs"] =
-            serde_json::json!({ "enable_thinking": thinking == Thinking::On });
+            serde_json::json!({ "enable_thinking": thinking.enabled() });
+        body["reasoning_control"] = serde_json::json!(true);
+
+        if let Some(budget) = thinking.budget() {
+            body["thinking_budget_tokens"] = serde_json::json!(budget);
+        }
     }
 
     let resp = s
@@ -916,6 +932,7 @@ async fn stream_completion(
                     completion_tokens,
                     cached_tokens,
                     ctx_size: params::ctx_of(app, model),
+                    elapsed_ms: started.elapsed().as_millis() as u64,
                 },
             );
         }
@@ -942,7 +959,7 @@ async fn stream_completion(
 fn empty_reply_message(reasoning_chars: usize, max_tokens: u32) -> String {
     if reasoning_chars > 0 {
         format!(
-            "模型只输出了思考内容（{reasoning_chars} 字）就达到 {max_tokens} token 的输出上限，正文为空。请重试或换用非思考型模型。"
+            "模型只输出了思考内容（{reasoning_chars} 字）就用完了 {max_tokens} token 的输出预算，正文为空。请把思考档位调低，或在设置里给这个模型更大的上下文。"
         )
     } else {
         "模型没有返回内容，请重试。".to_string()
@@ -1132,8 +1149,18 @@ pub async fn chat(
     let trimmed = trim_history(&request.messages);
     let messages = serde_json::to_value(&trimmed).map_err(|e| e.to_string())?;
 
-    // 对话允许按模型选择是否思考（设置里可调，默认关闭）
-    let thinking = params::get(&app, &request.model).thinking;
+    // 对话允许按模型（或按这次会话）选择思考档位
+    let model_params = params::get(&app, &request.model);
+    let thinking = request
+        .thinking
+        .as_deref()
+        .map(Thinking::parse)
+        .unwrap_or(model_params.thinking);
+
+    // 思考与正文共用同一份输出额度，所以要把思考的份额加进 max_tokens。
+    // 再夹到 ctx 的一半，给 prompt 留出空间，避免一开思考就撑爆上下文。
+    let max_tokens = (1024 + thinking.reserved_tokens())
+        .min((model_params.ctx / 2).max(512) as u32);
 
     let result = stream_completion(
         &app,
@@ -1142,7 +1169,7 @@ pub async fn chat(
         &request.model,
         messages,
         0.7,
-        1024,
+        max_tokens,
         thinking,
         &state.cancel,
     )
@@ -1245,6 +1272,9 @@ pub struct LocalModelInfo {
     /// 模型原生上下文上限（读 GGUF 元数据）；读不到时为 None。
     pub trained_ctx: Option<u64>,
     pub thinking: String,
+    /// 对话模板是否支持思考开关（读 GGUF 里的 chat_template 判断）。
+    /// 为 false 时界面应禁用思考档位，而不是让用户白设。
+    pub supports_thinking: bool,
 }
 
 #[tauri::command]
@@ -1253,8 +1283,12 @@ pub fn list_local_models(app: AppHandle) -> Vec<LocalModelInfo> {
         .into_iter()
         .map(|m| {
             let p = params::get(&app, &m.id);
+            let path = std::path::Path::new(&m.path);
+            let caps = models::model_caps(path);
+
             LocalModelInfo {
-                trained_ctx: models::read_context_length(std::path::Path::new(&m.path)),
+                trained_ctx: caps.trained_ctx,
+                supports_thinking: caps.supports_thinking,
                 ctx_size: p.ctx,
                 thinking: p.thinking.as_str().to_string(),
                 id: m.id,

@@ -1,6 +1,8 @@
 use serde::Serialize;
+use std::collections::HashMap;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use tauri::AppHandle;
 
 use crate::hardware;
@@ -141,6 +143,135 @@ pub fn read_context_length(path: &Path) -> Option<u64> {
     read_numeric_meta(path, "context_length")
 }
 
+/// 模型自带的元数据能力，供界面显示与禁用控件。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModelCaps {
+    pub supports_thinking: bool,
+    pub trained_ctx: Option<u64>,
+}
+
+/// 读 GGUF 元数据要扫过十几万条词汇表，几十毫秒量级；
+/// 设置抽屉每 2.5 秒刷新一次，所以按「路径 + 体积 + 修改时间」缓存结果。
+pub fn model_caps(path: &Path) -> ModelCaps {
+    fn cache() -> &'static Mutex<HashMap<String, ModelCaps>> {
+        static CACHE: OnceLock<Mutex<HashMap<String, ModelCaps>>> = OnceLock::new();
+        CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    let meta = std::fs::metadata(path).ok();
+    let key = match &meta {
+        Some(m) => {
+            let mtime = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            format!("{}|{}|{}", path.display(), m.len(), mtime)
+        }
+        None => path.display().to_string(),
+    };
+
+    if let Some(hit) = cache().lock().ok().and_then(|c| c.get(&key).copied()) {
+        return hit;
+    }
+
+    let caps = ModelCaps {
+        supports_thinking: read_chat_template(path)
+            .map(|t| supports_thinking(&t))
+            .unwrap_or(false),
+        trained_ctx: read_context_length(path),
+    };
+
+    if let Ok(mut guard) = cache().lock() {
+        // 缓存键带修改时间，旧条目留着也不会命中，简单限一下大小
+        if guard.len() > 128 {
+            guard.clear();
+        }
+        guard.insert(key, caps);
+    }
+
+    caps
+}
+
+/// 读取模型自带的对话模板（`tokenizer.chat_template`）。
+/// 用它判断模型到底支不支持思考，而不是靠模型名字猜。
+pub fn read_chat_template(path: &Path) -> Option<String> {
+    read_string_meta(path, "chat_template")
+}
+
+/// 模型是否支持思考开关。
+///
+/// 思路与 llama.cpp Web UI 一致：模板里必须真的引用
+/// `enable_thinking` / `reasoning_effort` / `thinking_budget` 之一，
+/// 或者带 `<think>` 这类思考标记，才算支持。翻译模型（如 Hy-MT2）两项都没有。
+pub fn supports_thinking(template: &str) -> bool {
+    const NAMES: [&str; 3] = ["enable_thinking", "reasoning_effort", "thinking_budget"];
+    NAMES.iter().any(|n| template_references(template, n)) || template.contains("<think>")
+}
+
+/// 判断 `name` 是否真的出现在 jinja 的 `{{ }}` 或 `{% %}` 里，
+/// 避免把模板注释或文档文字误判成"支持"。
+fn template_references(template: &str, name: &str) -> bool {
+    let mut from = 0;
+
+    while let Some(at) = template[from..].find(name) {
+        let at = from + at;
+
+        let open = [template[..at].rfind("{{"), template[..at].rfind("{%")]
+            .into_iter()
+            .flatten()
+            .max();
+
+        if let Some(open) = open {
+            let between = &template[open..at];
+            // 两个标签之间不能已经闭合，否则说明变量在标签外面
+            if !between.contains("}}") && !between.contains("%}") {
+                return true;
+            }
+        }
+
+        from = at + name.len();
+    }
+
+    false
+}
+
+fn read_string_meta(path: &Path, key_suffix: &str) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = BufReader::new(file);
+    let mut magic = [0u8; 4];
+    reader.read_exact(&mut magic).ok()?;
+    if &magic != b"GGUF" {
+        return None;
+    }
+
+    let version = read_u32(&mut reader)?;
+    if version < 2 {
+        return None;
+    }
+
+    let _tensor_count = read_u64(&mut reader)?;
+    let kv_count = read_u64(&mut reader)?;
+
+    for _ in 0..kv_count {
+        let key = read_string(&mut reader)?;
+        let vtype = read_u32(&mut reader)?;
+
+        if key.ends_with(key_suffix) {
+            if vtype == 8 {
+                return read_string(&mut reader);
+            }
+            skip_value(&mut reader, vtype, 0)?;
+            continue;
+        }
+
+        skip_value(&mut reader, vtype, 0)?;
+    }
+
+    None
+}
+
 /// 在 GGUF 元数据里找一个以 `key_suffix` 结尾的数值项。
 pub fn read_numeric_meta(path: &Path, key_suffix: &str) -> Option<u64> {
     let file = std::fs::File::open(path).ok()?;
@@ -200,7 +331,8 @@ fn read_u64<R: Read>(r: &mut R) -> Option<u64> {
 
 fn read_string<R: Read>(r: &mut R) -> Option<String> {
     let len = read_u64(r)? as usize;
-    if len > 4096 {
+    // 对话模板可能有几 KB（Qwen3.5 约 7.8KB），上限留到 1MB
+    if len > 1_048_576 {
         return None;
     }
     let mut buf = vec![0u8; len];
@@ -226,12 +358,14 @@ fn skip_value<R: Read>(r: &mut R, vtype: u32, depth: u8) -> Option<()> {
             r.read_exact(&mut b).ok()?;
         }
         8 => {
-            read_string(r)?;
+            // 分词器词汇表动辄十几万条，这里不分配字符串，直接跳过字节
+            skip_string(r)?;
         }
         9 => {
             let elem_type = read_u32(r)?;
             let count = read_u64(r)?;
-            if count > 100_000 {
+            // 词汇表数组可以到十几万项，上限只做防爆保护
+            if count > 10_000_000 {
                 return None;
             }
             for _ in 0..count {
@@ -243,6 +377,22 @@ fn skip_value<R: Read>(r: &mut R, vtype: u32, depth: u8) -> Option<()> {
             r.read_exact(&mut b).ok()?;
         }
         _ => return None,
+    }
+    Some(())
+}
+
+fn skip_string<R: Read>(r: &mut R) -> Option<()> {
+    let len = read_u64(r)? as usize;
+    skip_bytes(r, len)
+}
+
+/// 按块丢弃指定字节数，避免为分词器词汇表分配内存。
+fn skip_bytes<R: Read>(r: &mut R, mut len: usize) -> Option<()> {
+    let mut buf = [0u8; 8192];
+    while len > 0 {
+        let take = len.min(buf.len());
+        r.read_exact(&mut buf[..take]).ok()?;
+        len -= take;
     }
     Some(())
 }
@@ -287,5 +437,38 @@ mod tests {
             ctx.map(|n| n >= 512).unwrap_or(false),
             "未能从 {sample} 解析出 context_length"
         );
+
+        // 对话模板用于判断是否支持思考，顺带打印出来供人核对
+        let template = read_chat_template(Path::new(&sample));
+        assert!(template.is_some(), "未能从 {sample} 解析出 chat_template");
+        println!(
+            "{sample} 支持思考: {}",
+            supports_thinking(&template.unwrap_or_default())
+        );
+    }
+
+    #[test]
+    fn template_references_requires_jinja_tag() {
+        assert!(template_references(
+            "{%- if enable_thinking is defined %}",
+            "enable_thinking"
+        ));
+        assert!(template_references("{{ enable_thinking }}", "enable_thinking"));
+        // 注释里提到不算支持
+        assert!(!template_references(
+            "{# note: enable_thinking is supported #}",
+            "enable_thinking"
+        ));
+        // 标签已闭合，变量在外面出现不算
+        assert!(!template_references("{%- if x %} enable_thinking", "enable_thinking"));
+    }
+
+    #[test]
+    fn supports_thinking_detects_think_markers() {
+        assert!(supports_thinking("<|im_start|>assistant<think>"));
+        assert!(supports_thinking(
+            "{%- if reasoning_effort is defined %}high{%- endif %}"
+        ));
+        assert!(!supports_thinking("You are a professional translator."));
     }
 }

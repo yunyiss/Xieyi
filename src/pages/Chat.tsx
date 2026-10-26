@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { LoadIndicator, toLoadState, type LoadState } from "../components/LoadIndicator";
+import { ContextMeter } from "../components/ContextMeter";
 import { ModelStateBadge } from "../components/ModelStateBadge";
 import {
   abort,
   chat,
   deleteSession,
   getSettings,
+  listLocalModels,
   listRouterModels,
   listSessions,
   newRequestId,
@@ -16,8 +18,10 @@ import {
   saveSession,
   setPinned as setModelPinned,
   type ChatMessage,
+  type LocalModel,
   type RouterModel,
   type Session,
+  type ThinkingMode,
   type UsagePayload,
 } from "../lib/ipc";
 
@@ -75,10 +79,15 @@ const QUICK_ACTIONS = [
   },
 ];
 
-function formatTokens(n: number): string {
-  if (n < 1000) return String(n);
-  return `${(n / 1000).toFixed(1)}k`;
-}
+/** 思考档位，与 llama.cpp Web UI 一致。needCtx 为可用此档所需的最小上下文。 */
+const THINKING_OPTIONS: { value: ThinkingMode; label: string; needCtx: number }[] = [
+  { value: "default", label: "默认", needCtx: 0 },
+  { value: "off", label: "不思考", needCtx: 0 },
+  { value: "low", label: "思考·低", needCtx: 1024 },
+  { value: "medium", label: "思考·中", needCtx: 4096 },
+  { value: "high", label: "思考·高", needCtx: 16384 },
+  { value: "max", label: "思考·不限", needCtx: 0 },
+];
 
 /** 聊天页：多轮对话 + 本地会话持久化，不做工具调用。 */
 export function Chat({
@@ -97,6 +106,10 @@ export function Chat({
   const [sessionId, setSessionId] = useState(() => newId());
   const [load, setLoad] = useState<LoadState | null>(null);
   const [usage, setUsage] = useState<UsagePayload | null>(null);
+  /** 本次会话累计用量 */
+  const [totals, setTotals] = useState({ prompt: 0, generated: 0 });
+  const [localModels, setLocalModels] = useState<LocalModel[]>([]);
+  const [thinking, setThinking] = useState<ThinkingMode>("off");
   /** 本次发送要附加的快捷指令（不写进会话历史，只作用于这一轮） */
   const [instruction, setInstruction] = useState<typeof QUICK_ACTIONS[number] | null>(
     null,
@@ -122,6 +135,7 @@ export function Chat({
       setModel((prev) => prev || list[0]?.id || "");
 
       setSessions(await listSessions());
+      setLocalModels(await listLocalModels());
     } catch (e) {
       setError(String(e));
     }
@@ -141,11 +155,23 @@ export function Chat({
   // 每次补全的真实 token 用量，用来显示"上下文用了多少"
   useEffect(() => {
     let un: UnlistenFn | null = null;
-    onUsage((p) => setUsage(p)).then((fn) => (un = fn));
+    onUsage((p) => {
+      setUsage(p);
+      setTotals((t) => ({
+        prompt: t.prompt + p.promptTokens,
+        generated: t.generated + p.completionTokens,
+      }));
+    }).then((fn) => (un = fn));
     return () => {
       un?.();
     };
   }, []);
+
+  // 切换模型时，思考档位跟随该模型在设置里保存的值
+  useEffect(() => {
+    const m = localModels.find((x) => x.id === model);
+    if (m) setThinking(m.thinking);
+  }, [model, localModels]);
 
   useEffect(() => {
     return () => {
@@ -225,7 +251,7 @@ export function Chat({
     });
 
     try {
-      const full = await chat({ requestId: id, model, messages: outbound });
+      const full = await chat({ requestId: id, model, messages: outbound, thinking });
       const finalMessages: ChatMessage[] = [
         ...display,
         { role: "assistant", content: full },
@@ -294,12 +320,14 @@ export function Chat({
     setSessionId(id);
     setMessages(target.messages);
     if (target.model) setModel(target.model);
+    setTotals({ prompt: 0, generated: 0 });
     setError("");
   };
 
   const newSession = () => {
     setSessionId(newId());
     setMessages([]);
+    setTotals({ prompt: 0, generated: 0 });
     setError("");
   };
 
@@ -324,6 +352,8 @@ export function Chat({
   const isPinned = pinned.includes(model);
   const sessionTitle =
     sessions.find((s) => s.id === sessionId)?.title ?? "新对话";
+  const currentModel = localModels.find((m) => m.id === model);
+  const supportsThinking = currentModel?.supportsThinking ?? false;
 
   return (
     <div className="flex h-full flex-col gap-3 p-4">
@@ -376,38 +406,8 @@ export function Chat({
 
       {load && <LoadIndicator load={load} />}
 
-      {/* 上下文用量：来自模型返回的真实 usage，不是估算 */}
-      {usage && (
-        <div className="flex items-center gap-2 text-[11px]">
-          <span className="shrink-0 tabular-nums" style={{ color: "var(--text-muted)" }}>
-            上下文 {formatTokens(usage.promptTokens + usage.completionTokens)} /{" "}
-            {formatTokens(usage.ctxSize)}
-          </span>
-          <div
-            className="h-1 min-w-0 flex-1 overflow-hidden rounded-full"
-            style={{ background: "var(--surface-muted)" }}
-          >
-            <div
-              className="h-full rounded-full"
-              style={{
-                width: `${Math.min(
-                  100,
-                  ((usage.promptTokens + usage.completionTokens) / usage.ctxSize) * 100,
-                )}%`,
-                background:
-                  usage.promptTokens + usage.completionTokens > usage.ctxSize * 0.85
-                    ? "var(--danger)"
-                    : "var(--brand)",
-              }}
-            />
-          </div>
-          {usage.cachedTokens > 0 && (
-            <span className="shrink-0 tabular-nums" style={{ color: "var(--text-muted)" }}>
-              缓存 {formatTokens(usage.cachedTokens)}
-            </span>
-          )}
-        </div>
-      )}
+      {/* 上下文用量：数据来自模型返回的真实 usage */}
+      {usage && <ContextMeter usage={usage} totals={totals} />}
 
       {/* 会话栏 */}
       <div className="flex flex-nowrap items-center gap-2">
@@ -535,6 +535,38 @@ export function Chat({
             下一句生效
           </span>
         )}
+
+        {/* 思考档位：与 llama.cpp Web UI 六档一致，模型不支持时禁用 */}
+        <label
+          className="ml-auto flex shrink-0 items-center gap-1"
+          title={
+            supportsThinking
+              ? "思考越久通常越慢；档位越高，正文可用的输出配额也会同步放大"
+              : "该模型的对话模板不支持思考"
+          }
+        >
+          <span className="text-[11px]" style={{ color: "var(--text-muted)" }}>
+            💡
+          </span>
+          <select
+            className="h-7 rounded-md border px-1 text-[11px] outline-none focus:border-[var(--brand)] disabled:opacity-40"
+            style={controlStyle}
+            value={thinking}
+            disabled={!supportsThinking || busy}
+            onChange={(e) => setThinking(e.target.value as ThinkingMode)}
+          >
+            {THINKING_OPTIONS.map((o) => {
+              const tooSmall =
+                o.needCtx > 0 && (currentModel?.ctxSize ?? 0) < o.needCtx;
+              return (
+                <option key={o.value} value={o.value}>
+                  {o.label}
+                  {tooSmall ? "（上下文不足）" : ""}
+                </option>
+              );
+            })}
+          </select>
+        </label>
       </div>
 
       {/* 输入区 */}
