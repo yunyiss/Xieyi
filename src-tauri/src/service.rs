@@ -214,6 +214,32 @@ impl Default for AppState {
     }
 }
 
+/// 翻译缓存上限。超过后整体清空——翻译多是一次性内容，
+/// 做 LRU 的复杂度换不来收益。
+const CACHE_LIMIT: usize = 4000;
+
+/// 把一段译文写进缓存，**唯一的写入口**。
+///
+/// 被取消的片段一律不写：`stream_completion` 在取消时会把已经流出的那半截
+/// 当作正常结果返回（界面要保留已显示内容，不能凭空清空），但那不是一段翻完的
+/// 译文。写进去以后，同样的原文会直接命中它，再无机会重新翻译——用户会拿到一段
+/// 看着正常、实际被截断的译文，而且查不出原因。
+fn store_segment(
+    cache: &mut HashMap<String, (String, SegmentStats)>,
+    key: String,
+    text: String,
+    stats: SegmentStats,
+    cancelled: bool,
+) {
+    if cancelled {
+        return;
+    }
+    if cache.len() >= CACHE_LIMIT {
+        cache.clear();
+    }
+    cache.insert(key, (text, stats));
+}
+
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
@@ -546,12 +572,15 @@ impl Service {
             );
         }
 
-        let mut cache = state.cache.lock().await;
-        if cache.len() > 4000 {
-            cache.clear();
+        let stats = SegmentStats { flagged, fixed };
+        let cancelled = cancel.load(Ordering::Relaxed);
+
+        {
+            let mut cache = state.cache.lock().await;
+            store_segment(&mut cache, key, best.clone(), stats, cancelled);
         }
-        cache.insert(key, (best.clone(), SegmentStats { flagged, fixed }));
-        Ok((best, SegmentStats { flagged, fixed }))
+
+        Ok((best, stats))
     }
 
     pub async fn load(
@@ -1088,6 +1117,50 @@ mod tests {
         assert_eq!(messages[0]["content"], "SYS");
         assert_eq!(messages[1]["role"], "user");
         assert_eq!(messages[1]["content"], "TEXT");
+    }
+
+    fn stats() -> SegmentStats {
+        SegmentStats {
+            flagged: false,
+            fixed: false,
+        }
+    }
+
+    /// 取消时必须拦住缓存写入：半截译文一旦进缓存就再也翻不掉了。
+    #[test]
+    fn cancelled_segment_is_never_cached() {
+        let mut cache = HashMap::new();
+        store_segment(&mut cache, "k".into(), "半截译".into(), stats(), true);
+        assert!(cache.is_empty(), "被取消的片段不能写缓存");
+    }
+
+    #[test]
+    fn finished_segment_is_cached_with_its_stats() {
+        let mut cache = HashMap::new();
+        let flagged = SegmentStats {
+            flagged: true,
+            fixed: true,
+        };
+        store_segment(&mut cache, "k".into(), "完整译文".into(), flagged, false);
+
+        let (text, stored) = cache.get("k").expect("完整片段应该命中缓存");
+        assert_eq!(text, "完整译文");
+        // 统计要跟着一起存：批量重复跑时"检出多少段"才不会丢
+        assert!(stored.flagged && stored.fixed);
+    }
+
+    #[test]
+    fn cache_clears_itself_at_the_limit() {
+        let mut cache = HashMap::new();
+        for i in 0..CACHE_LIMIT {
+            store_segment(&mut cache, format!("k{i}"), format!("v{i}"), stats(), false);
+        }
+        assert_eq!(cache.len(), CACHE_LIMIT);
+
+        store_segment(&mut cache, "overflow".into(), "v".into(), stats(), false);
+        // 超限就整体清空，只留下这一次写入
+        assert_eq!(cache.len(), 1);
+        assert!(cache.contains_key("overflow"));
     }
 }
 
