@@ -4,6 +4,7 @@ import { LoadIndicator, toLoadState, type LoadState } from "../components/LoadIn
 import { ModelStateBadge, stateLabel } from "../components/ModelStateBadge";
 import { RunButton } from "../components/RunButton";
 import { Select } from "../components/Select";
+import { TRANSLATE_STYLES } from "../lib/translateStyles";
 import {
   abort,
   getRuntimeStatus,
@@ -26,6 +27,7 @@ import {
   type RuntimeProgress,
   type RuntimeStatus,
   type ServiceStatus,
+  type TranslateStyle,
 } from "../lib/ipc";
 
 const LANGUAGES = [
@@ -62,12 +64,21 @@ function stageLabel(stage: RuntimeProgress["stage"]): string {
 }
 
 /** 质检提示：平时只是一个数字，鼠标悬停才展开细节，不打扰正常翻译。 */
-function QualityNote({ reports }: { reports: QualityReport[] }) {
+function QualityNote({
+  reports,
+  total,
+}: {
+  reports: QualityReport[];
+  /** 本次翻译的总片段数，用来显示「2/12 段」而不是孤零零一个数字 */
+  total: number;
+}) {
+  const flagged = reports.length;
   const unfixed = reports.filter((r) => !r.fixed).length;
+  const scope = total > 0 ? `/${total}` : "";
   const text =
     unfixed > 0
-      ? `质检 ${reports.length} 段 · ${unfixed} 段仍可疑`
-      : `已自动修正 ${reports.length} 段`;
+      ? `质检 ${flagged}${scope} 段 · ${unfixed} 段仍可疑`
+      : `质检 ${flagged}${scope} 段 · 均已修正`;
 
   const detail = reports
     .map(
@@ -103,6 +114,7 @@ export function Translate({
 }: Props) {
   const [source, setSource] = useState("auto");
   const [target, setTarget] = useState("zh");
+  const [style, setStyle] = useState<TranslateStyle>("general");
   const [input, setInput] = useState("");
   const [output, setOutput] = useState("");
   const [busy, setBusy] = useState(false);
@@ -254,6 +266,7 @@ export function Translate({
         model,
         source,
         target,
+        style,
         text: input,
       });
       setOutput(text);
@@ -433,6 +446,14 @@ export function Translate({
           title="译文语言"
         />
 
+        <Select
+          className="w-[92px] shrink-0"
+          value={style}
+          options={TRANSLATE_STYLES}
+          onChange={setStyle}
+          title="翻译风格"
+        />
+
         <span
           className="mx-0.5 h-5 w-px shrink-0"
           style={{ background: "var(--border)" }}
@@ -476,7 +497,9 @@ export function Translate({
           <header className="panel-head">
             <span>译文</span>
             <span className="flex min-w-0 items-center gap-2.5">
-              {quality.length > 0 && <QualityNote reports={quality} />}
+              {quality.length > 0 && (
+                <QualityNote reports={quality} total={segmentProgress.total} />
+              )}
               {output && !busy && (
                 <button
                   className="btn rounded px-1 text-[11px] opacity-70 hover:opacity-100"

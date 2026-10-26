@@ -14,7 +14,8 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tauri::{AppHandle, Emitter};
 
-use crate::service::{self, AppState, GlossaryEntry, Service};
+use crate::prompts::Style;
+use crate::service::{self, AppState, GlossaryEntry, SegmentStats, Service};
 use crate::translate as segmenter;
 
 /// 单个片段的字符上限，与翻译页保持一致。
@@ -30,6 +31,9 @@ pub struct BatchRequest {
     pub model: String,
     pub source: String,
     pub target: String,
+    /// 翻译风格（general/formal/technical/literary/subtitle），空值按 general。
+    #[serde(default)]
+    pub style: String,
     pub paths: Vec<String>,
 }
 
@@ -61,15 +65,22 @@ pub struct BatchSummary {
     pub skipped: usize,
     /// 所有文件里未能翻译、保留了原文的片段总数
     pub failed_segments: usize,
+    /// 首次质检就检出问题的片段总数（含已修好的）
+    pub quality_segments: usize,
+    /// 其中重试后修好的片段数
+    pub quality_fixed: usize,
     pub elapsed_ms: u64,
     pub cancelled: bool,
 }
 
 /// 单个文件的处理结果，用于最后汇总。
+#[derive(Default)]
 struct FileOutcome {
     ok: bool,
     skipped: bool,
     failed_segments: usize,
+    flagged_segments: usize,
+    fixed_segments: usize,
 }
 
 /// 待回填的组装结构。
@@ -138,6 +149,8 @@ pub async fn batch_translate(
         failed: outcomes.iter().filter(|o| !o.ok && !o.skipped).count(),
         skipped: outcomes.iter().filter(|o| o.skipped).count(),
         failed_segments: outcomes.iter().map(|o| o.failed_segments).sum(),
+        quality_segments: outcomes.iter().map(|o| o.flagged_segments).sum(),
+        quality_fixed: outcomes.iter().map(|o| o.fixed_segments).sum(),
         elapsed_ms: started.elapsed().as_millis() as u64,
         cancelled,
     })
@@ -183,14 +196,14 @@ async fn process_file(
 
     if state.cancel.load(Ordering::Relaxed) {
         report!("skipped", 0, 0, 0, None, Some("已取消".into()));
-        return FileOutcome { ok: false, skipped: true, failed_segments: 0 };
+        return FileOutcome { skipped: true, ..Default::default() };
     }
 
     let source = PathBuf::from(path);
 
     let Some(output) = output_path(&source, &request.target) else {
         report!("failed", 0, 0, 0, None, Some("无法推导输出文件名".into()));
-        return FileOutcome { ok: false, skipped: false, failed_segments: 0 };
+        return FileOutcome::default();
     };
 
     // 不覆盖已有译文，避免重跑一次就把上次的结果冲掉
@@ -203,14 +216,14 @@ async fn process_file(
             Some(output.to_string_lossy().to_string()),
             Some("输出文件已存在".into())
         );
-        return FileOutcome { ok: false, skipped: true, failed_segments: 0 };
+        return FileOutcome { skipped: true, ..Default::default() };
     }
 
     let bytes = match std::fs::read(&source) {
         Ok(b) => b,
         Err(e) => {
             report!("failed", 0, 0, 0, None, Some(format!("读取失败: {e}")));
-            return FileOutcome { ok: false, skipped: false, failed_segments: 0 };
+            return FileOutcome::default();
         }
     };
 
@@ -218,7 +231,7 @@ async fn process_file(
 
     if units.is_empty() {
         report!("failed", 0, 0, 0, None, Some("没有可翻译的文本".into()));
-        return FileOutcome { ok: false, skipped: false, failed_segments: 0 };
+        return FileOutcome::default();
     }
 
     let segments = units.len();
@@ -226,6 +239,8 @@ async fn process_file(
 
     let mut done = 0usize;
     let mut failed = 0usize;
+    let mut flagged = 0usize;
+    let mut fixed = 0usize;
 
     for (i, text) in units.iter().enumerate() {
         if state.cancel.load(Ordering::Relaxed) {
@@ -233,7 +248,15 @@ async fn process_file(
         }
 
         match translate_with_retry(service, app, state, request, glossary, text).await {
-            Some(translated) => set_body(&mut assembled, i, translated),
+            Some((translated, stats)) => {
+                if stats.flagged {
+                    flagged += 1;
+                }
+                if stats.fixed {
+                    fixed += 1;
+                }
+                set_body(&mut assembled, i, translated);
+            }
             // 保留原文：宁可混一段原文，也不要静默丢内容
             None => {
                 failed += 1;
@@ -247,7 +270,13 @@ async fn process_file(
 
     if state.cancel.load(Ordering::Relaxed) {
         report!("skipped", done, segments, failed, None, Some("已取消".into()));
-        return FileOutcome { ok: false, skipped: true, failed_segments: failed };
+        return FileOutcome {
+            skipped: true,
+            failed_segments: failed,
+            flagged_segments: flagged,
+            fixed_segments: fixed,
+            ..Default::default()
+        };
     }
 
     report!("writing", done, segments, failed, None, None);
@@ -256,7 +285,12 @@ async fn process_file(
 
     if let Err(e) = std::fs::write(&output, rendered.as_bytes()) {
         report!("failed", done, segments, failed, None, Some(format!("写入失败: {e}")));
-        return FileOutcome { ok: false, skipped: false, failed_segments: failed };
+        return FileOutcome {
+            failed_segments: failed,
+            flagged_segments: flagged,
+            fixed_segments: fixed,
+            ..Default::default()
+        };
     }
 
     report!(
@@ -267,7 +301,13 @@ async fn process_file(
         Some(output.to_string_lossy().to_string()),
         None
     );
-    FileOutcome { ok: true, skipped: false, failed_segments: failed }
+    FileOutcome {
+        ok: true,
+        failed_segments: failed,
+        flagged_segments: flagged,
+        fixed_segments: fixed,
+        ..Default::default()
+    }
 }
 
 /// 失败重试：最多 `MAX_ATTEMPTS` 次，全部失败返回 `None`。
@@ -278,7 +318,8 @@ async fn translate_with_retry(
     request: &BatchRequest,
     glossary: &[GlossaryEntry],
     text: &str,
-) -> Option<String> {
+) -> Option<(String, SegmentStats)> {
+    let style = Style::parse(&request.style);
     let mut last_error = String::new();
 
     for attempt in 0..MAX_ATTEMPTS {
@@ -298,13 +339,16 @@ async fn translate_with_retry(
                 &request.model,
                 &request.source,
                 &request.target,
+                style,
                 glossary,
                 text,
                 &state.cancel,
             )
             .await
         {
-            Ok(translated) if !translated.trim().is_empty() => return Some(translated),
+            Ok((translated, stats)) if !translated.trim().is_empty() => {
+                return Some((translated, stats));
+            }
             Ok(_) => last_error = "模型返回空内容".into(),
             Err(e) => last_error = e,
         }

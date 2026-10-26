@@ -9,6 +9,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use crate::models;
 use crate::params::{self, Thinking};
 use crate::paths;
+use crate::prompts::{self, Style};
 use crate::quality;
 use crate::runtime;
 use crate::translate as segmenter;
@@ -72,6 +73,15 @@ struct QualityPayload {
     found: String,
     /// 重试后是否修好
     fixed: bool,
+}
+
+/// 单个片段的质量统计，供批量任务汇总"检出多少、修好多少"。
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct SegmentStats {
+    /// 首次输出被质检挑出了问题（无论最后有没有修好）
+    pub flagged: bool,
+    /// 重试后的结果被采用，并且通过了质检
+    pub fixed: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -167,6 +177,9 @@ pub struct TranslateRequest {
     pub model: String,
     pub source: String,
     pub target: String,
+    /// 翻译风格（general/formal/technical/literary/subtitle），空值按 general。
+    #[serde(default)]
+    pub style: String,
     pub text: String,
 }
 
@@ -181,8 +194,9 @@ pub struct AppState {
     pub gpu_layers: AtomicU64,
     /// 常驻（Pinned）模型：永不自动卸载。
     pub pinned: tokio::sync::Mutex<HashSet<String>>,
-    /// 句子级翻译缓存：相同模型 / 语言对 / 术语表 / 原文直接命中。
-    pub cache: tokio::sync::Mutex<HashMap<String, String>>,
+    /// 句子级翻译缓存：相同模型 / 风格 / 语言对 / 术语表 / 原文直接命中。
+    /// 值里带上当时的质检统计，命中缓存时批量汇总仍然准确。
+    pub cache: tokio::sync::Mutex<HashMap<String, (String, SegmentStats)>>,
 }
 
 impl Default for AppState {
@@ -428,6 +442,8 @@ impl Service {
     ///
     /// `request_id` 为 `None` 时不会向前端推送 token —— 批量任务走这条路径，
     /// 避免把批量过程的中间结果灌进翻译页的输出框。
+    ///
+    /// 返回值带上质检统计：批量任务据此汇总"检出多少段、修好多少段"。
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn translate_segment(
         &self,
@@ -437,13 +453,14 @@ impl Service {
         model: &str,
         source: &str,
         target: &str,
+        style: Style,
         glossary: &[GlossaryEntry],
         text: &str,
         cancel: &std::sync::atomic::AtomicBool,
-    ) -> Result<String, String> {
-        let key = cache_key(model, source, target, glossary, text);
+    ) -> Result<(String, SegmentStats), String> {
+        let key = cache_key(style, model, source, target, glossary, text);
 
-        if let Some(hit) = state.cache.lock().await.get(&key).cloned() {
+        if let Some((hit, stats)) = state.cache.lock().await.get(&key).cloned() {
             if let Some(id) = request_id {
                 let _ = app.emit(
                     "llm://token",
@@ -453,8 +470,9 @@ impl Service {
                     },
                 );
             }
-            // 缓存里的结果在写入前已经过了质检，不必再查一次
-            return Ok(hit);
+            // 缓存里的结果在写入前已经过了质检，不必再查一次；
+            // 统计沿用首次生成时的结果，重复跑批量不会把"检出的段"算丢。
+            return Ok((hit, stats));
         }
 
         let terms: Vec<quality::Term> = glossary
@@ -465,7 +483,7 @@ impl Service {
             })
             .collect();
 
-        let prompt = system_prompt(source, target, glossary);
+        let prompt = prompts::system_prompt(style, source, target, glossary);
         let first = stream_completion(
             app,
             self,
@@ -483,16 +501,17 @@ impl Service {
         let report = quality::check(text, &first, &terms);
         // 首次检出的问题（用户看到的是"发现了什么"，不是重试之后的状态）
         let found = report.describe();
+        let flagged = !report.is_ok();
         let mut best = first;
         let mut best_report = report;
-        let mut fixed = true;
+        // 只有"重试结果被采用且通过质检"才算修好
+        let mut fixed = false;
 
         // 有问题就带纠正提示重试一次。重试**不推流**：第一次的内容已经流到界面上了，
         // 再流一遍会在输出框里重复一遍；翻译页最后会用返回值整体覆盖显示。
         // 已经被取消就不重试了，那只会白跑一次请求。
         if !best_report.is_ok() && !cancel.load(Ordering::Relaxed) {
-            fixed = false;
-            let hinted = system_prompt_with_hint(source, target, glossary, &best_report);
+            let hinted = prompts::system_prompt_with_hint(style, source, target, glossary, &best_report);
             let second = stream_completion(
                 app,
                 self,
@@ -531,8 +550,8 @@ impl Service {
         if cache.len() > 4000 {
             cache.clear();
         }
-        cache.insert(key, best.clone());
-        Ok(best)
+        cache.insert(key, (best.clone(), SegmentStats { flagged, fixed }));
+        Ok((best, SegmentStats { flagged, fixed }))
     }
 
     pub async fn load(
@@ -1063,32 +1082,6 @@ mod tests {
     }
 
     #[test]
-    fn retry_prompt_keeps_the_base_and_appends_the_hint() {
-        let glossary = vec![GlossaryEntry {
-            from: "apple".into(),
-            to: "苹果".into(),
-        }];
-        let base = system_prompt("en", "zh", &glossary);
-        assert!(!base.contains("previous attempt"), "基础提示不该提重试");
-
-        // 译文丢了列表、也没用上术语表指定的"苹果"
-        let report = quality::check(
-            "- apple\n- banana",
-            "红果和香蕉",
-            &[quality::Term {
-                from: "apple",
-                to: "苹果",
-            }],
-        );
-        assert!(!report.is_ok());
-
-        let hinted = system_prompt_with_hint("en", "zh", &glossary, &report);
-        assert!(hinted.starts_with(&base), "重试提示应建立在基础提示之上");
-        assert!(hinted.contains("Your previous attempt had problems."));
-        assert!(hinted.contains("apple => 苹果"), "应带上具体术语：{hinted}");
-    }
-
-    #[test]
     fn segment_messages_shapes_system_then_user() {
         let messages = segment_messages("SYS", "TEXT");
         assert_eq!(messages[0]["role"], "system");
@@ -1104,38 +1097,6 @@ pub(crate) fn load_glossary(app: &AppHandle) -> Vec<GlossaryEntry> {
         .unwrap_or_default()
 }
 
-fn system_prompt(source: &str, target: &str, glossary: &[GlossaryEntry]) -> String {
-    let src = if source == "auto" { "the source language" } else { source };
-    let mut prompt = format!(
-        "You are a professional translator. Translate the user's text from {src} to {target}. \
-Output only the translation, without explanations, notes, or quotation marks."
-    );
-
-    if !glossary.is_empty() {
-        prompt.push_str("\nUse these term mappings when they appear:\n");
-        for entry in glossary {
-            prompt.push_str(&format!("- {} => {}\n", entry.from, entry.to));
-        }
-    }
-
-    prompt
-}
-
-/// 在基础提示后面追加质检给出的纠正要求，用于重试。
-fn system_prompt_with_hint(
-    source: &str,
-    target: &str,
-    glossary: &[GlossaryEntry],
-    report: &quality::Report,
-) -> String {
-    let mut prompt = system_prompt(source, target, glossary);
-    if let Some(hint) = report.retry_hint() {
-        prompt.push_str("\n\nYour previous attempt had problems. ");
-        prompt.push_str(&hint);
-    }
-    prompt
-}
-
 /// 拼一次翻译请求的消息体。
 fn segment_messages(prompt: &str, text: &str) -> serde_json::Value {
     serde_json::json!([
@@ -1145,6 +1106,7 @@ fn segment_messages(prompt: &str, text: &str) -> serde_json::Value {
 }
 
 fn cache_key(
+    style: Style,
     model: &str,
     source: &str,
     target: &str,
@@ -1156,8 +1118,9 @@ fn cache_key(
         .map(|e| format!("{}={}", e.from, e.to))
         .collect();
     format!(
-        "{model}\u{1}{source}\u{1}{target}\u{1}{}\u{1}{text}",
-        terms.join("\u{1}")
+        "{model}\u{1}{style}\u{1}{source}\u{1}{target}\u{1}{}\u{1}{text}",
+        terms.join("\u{1}"),
+        style = style.as_str()
     )
 }
 
@@ -1177,6 +1140,7 @@ pub async fn translate(
     state.cancel.store(false, Ordering::Relaxed);
 
     let glossary = load_glossary(&app);
+    let style = Style::parse(&request.style);
     let segments = segmenter::split_segments(&request.text, 1200);
     let total = segments.len();
     let _ = app.emit("translate://progress", TranslateProgress { done: 0, total });
@@ -1188,7 +1152,7 @@ pub async fn translate(
             break;
         }
 
-        let translated = service
+        let (translated, _stats) = service
             .translate_segment(
                 &app,
                 &state,
@@ -1196,6 +1160,7 @@ pub async fn translate(
                 &request.model,
                 &request.source,
                 &request.target,
+                style,
                 &glossary,
                 &segment.text,
                 &state.cancel,

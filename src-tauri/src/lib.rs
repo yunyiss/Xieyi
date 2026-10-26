@@ -3,6 +3,7 @@ mod hardware;
 mod models;
 mod params;
 mod paths;
+mod prompts;
 mod quality;
 mod runtime;
 mod service;

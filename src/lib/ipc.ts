@@ -101,11 +101,23 @@ export interface ModelStatePayload {
   percent?: number;
 }
 
+/**
+ * 翻译风格。后端 `prompts::Style` 与之逐字对应；
+ * 只影响 system prompt，请求形状与输出额度不变。
+ */
+export type TranslateStyle =
+  | "general"
+  | "formal"
+  | "technical"
+  | "literary"
+  | "subtitle";
+
 export interface TranslateRequest {
   requestId: string;
   model: string;
   source: string;
   target: string;
+  style: TranslateStyle;
   text: string;
 }
 
@@ -268,6 +280,10 @@ export interface BatchSummary {
   failed: number;
   skipped: number;
   failedSegments: number;
+  /** 首次质检就检出问题的片段数（含已修好的） */
+  qualitySegments: number;
+  /** 其中重试后修好的片段数 */
+  qualityFixed: number;
   elapsedMs: number;
   cancelled: boolean;
 }
@@ -276,6 +292,7 @@ export interface BatchRequest {
   model: string;
   source: string;
   target: string;
+  style: TranslateStyle;
   paths: string[];
 }
 

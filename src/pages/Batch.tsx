@@ -5,6 +5,7 @@ import { LoadIndicator, toLoadState, type LoadState } from "../components/LoadIn
 import { ModelStateBadge, stateLabel } from "../components/ModelStateBadge";
 import { RunButton } from "../components/RunButton";
 import { Select } from "../components/Select";
+import { TRANSLATE_STYLES } from "../lib/translateStyles";
 import {
   baseName,
   batchCancel,
@@ -20,6 +21,7 @@ import {
   type BatchSummary,
   type RouterModel,
   type RuntimeStatus,
+  type TranslateStyle,
 } from "../lib/ipc";
 
 const LANGUAGES = [
@@ -94,6 +96,7 @@ interface Props {
 export function Batch({ refreshSignal = 0, active = true }: Props) {
   const [source, setSource] = useState("auto");
   const [target, setTarget] = useState("zh");
+  const [style, setStyle] = useState<TranslateStyle>("general");
   const [models, setModels] = useState<RouterModel[]>([]);
   const [model, setModel] = useState("");
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
@@ -254,6 +257,7 @@ export function Batch({ refreshSignal = 0, active = true }: Props) {
         model,
         source,
         target,
+        style,
         paths: queue.map((i) => i.path),
       });
       setSummary(result);
@@ -301,6 +305,15 @@ export function Batch({ refreshSignal = 0, active = true }: Props) {
           onChange={setTarget}
           disabled={running}
           title="译文语言"
+        />
+
+        <Select
+          className="w-[92px] shrink-0"
+          value={style}
+          options={TRANSLATE_STYLES}
+          onChange={setStyle}
+          disabled={running}
+          title="翻译风格"
         />
 
         <span
@@ -500,6 +513,10 @@ export function Batch({ refreshSignal = 0, active = true }: Props) {
             {summary.cancelled ? "已中断 · " : ""}
             成功 {summary.succeeded} · 失败 {summary.failed} · 跳过 {summary.skipped}
             {summary.failedSegments > 0 && ` · ${summary.failedSegments} 段保留原文`}
+            {summary.qualitySegments > 0 &&
+              (summary.qualityFixed >= summary.qualitySegments
+                ? ` · 质检 ${summary.qualitySegments} 段均修正`
+                : ` · 质检 ${summary.qualitySegments} 段，修正 ${summary.qualityFixed}`)}
             {" · "}
             {formatDuration(summary.elapsedMs)}
           </span>
