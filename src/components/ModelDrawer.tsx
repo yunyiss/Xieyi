@@ -17,7 +17,6 @@ import {
   type GlossaryEntry,
   type LocalModel,
   type Settings,
-  type ThinkingMode,
 } from "../lib/ipc";
 import { Select } from "./Select";
 
@@ -33,16 +32,6 @@ const LAYER_OPTIONS = [
   { value: 999, label: "全 GPU" },
   { value: 16, label: "混合 16 层" },
   { value: 0, label: "纯 CPU" },
-];
-
-/** 思考档位，与 llama.cpp Web UI 的六档一一对应。 */
-const THINKING_OPTIONS: { value: ThinkingMode; label: string }[] = [
-  { value: "default", label: "默认（模型决定）" },
-  { value: "off", label: "关闭" },
-  { value: "low", label: "低 · 最多 512 token" },
-  { value: "medium", label: "中 · 最多 2,048 token" },
-  { value: "high", label: "高 · 最多 8,192 token" },
-  { value: "max", label: "不限" },
 ];
 
 /** 可选的上下文档位：不超过模型原生上限，且保留当前值。 */
@@ -216,19 +205,6 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
         prev.map((x) => (x.id === m.id ? { ...x, ctxSize: saved.ctx } : x)),
       );
       setNeedsRestart(true);
-    } catch (e) {
-      setError(String(e));
-    }
-  };
-
-  /** 思考开关逐请求生效，不需要重启。 */
-  const changeThinking = async (m: LocalModel, thinking: ThinkingMode) => {
-    setError("");
-    try {
-      const saved = await setModelParams(m.id, m.ctxSize, thinking);
-      setLocal((prev) =>
-        prev.map((x) => (x.id === m.id ? { ...x, thinking: saved.thinking } : x)),
-      );
     } catch (e) {
       setError(String(e));
     }
@@ -538,7 +514,8 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
                     )}
                   </div>
 
-                  {/* 单个模型的上下文与思考开关 */}
+                  {/* 单个模型的上下文：进程级参数，只能在这里改；
+                      思考强度在对话页输入区选，不在这里重复一份 */}
                   <div className="mt-1.5 flex items-center gap-1.5 text-[11px]">
                     <span className="shrink-0" style={{ color: "var(--text-muted)" }}>
                       上下文
@@ -555,23 +532,6 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
                           : "未能从 GGUF 读出原生上限"
                       }
                     />
-
-                    <span className="shrink-0" style={{ color: "var(--text-muted)" }}>
-                      思考
-                    </span>
-                    <Select
-                      className="w-[92px] shrink-0"
-                      size="sm"
-                      value={m.thinking}
-                      options={THINKING_OPTIONS}
-                      disabled={!m.supportsThinking}
-                      onChange={(v) => changeThinking(m, v)}
-                      title={
-                        m.supportsThinking
-                          ? "连接到 libllama 的思考预算；档位越高思考越久，正文配额也会同步放大"
-                          : "该模型的对话模板不含思考指令，设置不会生效"
-                      }
-                    />
                   </div>
 
                   {!m.supportsThinking && (
@@ -579,7 +539,7 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
                       className="m-0 mt-1 text-[10px]"
                       style={{ color: "var(--text-muted)" }}
                     >
-                      该模型不支持思考（模板里没有 enable_thinking）
+                      该模型不支持思考，对话页不会显示思考强度
                     </p>
                   )}
 

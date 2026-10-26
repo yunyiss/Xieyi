@@ -168,10 +168,15 @@ export function Select<T extends string | number>({
         <div
           id={listId}
           role="listbox"
-          className={`popover absolute top-full z-30 mt-1.5 max-h-[320px] min-w-full overflow-y-auto p-1 ${
+          className={`popover absolute top-full z-30 mt-1.5 min-w-full overflow-y-auto p-1 ${
             align === "right" ? "right-0" : "left-0"
           }`}
-          style={{ width: "max-content", maxWidth: "min(320px, calc(100vw - 24px))" }}
+          style={{
+            width: "max-content",
+            maxWidth: "min(320px, calc(100vw - 24px))",
+            // 选项不多时按实际行数给高度：语言列表只有 9 项，正常窗口下不该出现滚动条
+            maxHeight: `min(56vh, ${8 + options.length * 44}px)`,
+          }}
         >
           {options.map((o, i) => {
             const isSelected = o.value === value;

@@ -17,6 +17,7 @@ import {
   onToken,
   onUsage,
   saveSession,
+  setModelParams,
   type ChatMessage,
   type LocalModel,
   type RouterModel,
@@ -150,11 +151,31 @@ export function Chat({
     };
   }, []);
 
-  // 切换模型时，思考档位跟随该模型在设置里保存的值
+  // 切换模型时，思考档位跟随该模型保存的值
   useEffect(() => {
     const m = localModels.find((x) => x.id === model);
     if (m) setThinking(m.thinking);
   }, [model, localModels]);
+
+  /**
+   * 思考强度现在只在对话页选（设置抽屉里那份已删）。
+   * 选完就写回该模型的参数，下次切回来还是这个档位。
+   */
+  const changeThinking = async (mode: ThinkingMode) => {
+    setThinking(mode);
+    if (!model) return;
+
+    const ctx = localModels.find((m) => m.id === model)?.ctxSize ?? 4096;
+    try {
+      const saved = await setModelParams(model, ctx, mode);
+      setLocalModels((prev) =>
+        prev.map((m) => (m.id === model ? { ...m, thinking: saved.thinking } : m)),
+      );
+    } catch (e) {
+      // 存不上不影响本次对话（请求里已经带了这个档位），只在控制台留一条
+      console.error("保存思考档位失败", e);
+    }
+  };
 
   useEffect(() => {
     return () => {
@@ -554,7 +575,7 @@ export function Chat({
                 model={model}
                 onModel={setModel}
                 thinking={thinking}
-                onThinking={setThinking}
+                onThinking={changeThinking}
                 thinkingSupported={supportsThinking}
                 disabled={busy}
               />

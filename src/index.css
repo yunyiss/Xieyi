@@ -252,6 +252,45 @@
   box-sizing: border-box;
 }
 
+/*
+ * 滚动条：系统默认那条又粗又带箭头按钮，跟整套 UI 不搭。
+ * 这里统一成 6px 细条、无轨道、无箭头，只在需要时出现。
+ * 只影响 Chromium（WebView2），Firefox 由 scrollbar-width 兜底。
+ */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--text-muted) 26%, transparent) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--text-muted) 26%, transparent);
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--text-muted) 45%, transparent);
+  background-clip: content-box;
+}
+
+/* 去掉上下箭头按钮（Windows 原生滚动条才有） */
+::-webkit-scrollbar-button {
+  display: none;
+  width: 0;
+  height: 0;
+}
+
 html,
 body,
 #root {
