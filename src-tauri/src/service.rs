@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::models;
+use crate::params::{self, Thinking};
 use crate::paths;
 use crate::runtime;
 use crate::translate as segmenter;
@@ -40,6 +41,21 @@ pub struct RouterModel {
 struct TokenPayload {
     request_id: String,
     token: String,
+}
+
+/// 一次补全的 token 用量，用于在界面上显示"上下文用了多少"。
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct UsagePayload {
+    request_id: String,
+    /// 本次输入占用（含系统提示与历史）
+    prompt_tokens: u64,
+    /// 本次输出占用
+    completion_tokens: u64,
+    /// 命中缓存、无需重算的前缀 token 数
+    cached_tokens: u64,
+    /// 该模型当前的上下文上限
+    ctx_size: u64,
 }
 
 #[derive(Serialize, Clone)]
@@ -437,6 +453,8 @@ impl Service {
             messages,
             0.2,
             1024,
+            // 翻译不让模型思考：既慢又容易把输出预算吃光
+            Thinking::Off,
             cancel,
         )
         .await?;
@@ -775,9 +793,8 @@ pub struct ChatRequest {
 
 /// 通用的流式补全：负责加载模型、发请求、解析 SSE 并把 token 推给前端。
 ///
-/// 思考型模型（Qwen3.5、Qwen3 等）默认先输出思维链。我们的界面不展示思考内容，
-/// 它只会把 `max_tokens` 吃光、让正文变成空字符串，所以统一关闭；
-/// 不支持该参数的模板会忽略它（已在 Hy-MT2 上验证过输出不受影响）。
+/// `thinking` 决定是否让思考型模型先输出思维链。翻译固定关闭：
+/// 界面不展示思维链，它只会吃光 `max_tokens` 并拖慢首字。
 async fn stream_completion(
     app: &AppHandle,
     s: &Service,
@@ -786,18 +803,26 @@ async fn stream_completion(
     messages: serde_json::Value,
     temperature: f64,
     max_tokens: u32,
+    thinking: Thinking,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<String, String> {
     s.load(app, model, cancel).await?;
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": model,
         "messages": messages,
         "stream": true,
         "temperature": temperature,
         "max_tokens": max_tokens,
-        "chat_template_kwargs": { "enable_thinking": false }
+        // 没有它，流式响应拿不到 usage，"上下文用了多少"就只能靠猜
+        "stream_options": { "include_usage": true }
     });
+
+    // auto = 不干预，交给模型模板的默认行为
+    if thinking != Thinking::Auto {
+        body["chat_template_kwargs"] =
+            serde_json::json!({ "enable_thinking": thinking == Thinking::On });
+    }
 
     let resp = s
         .client
@@ -818,6 +843,7 @@ async fn stream_completion(
     let mut full = String::new();
     let mut finish_reason = String::new();
     let mut reasoning_chars = 0usize;
+    let mut usage: Option<(u64, u64, u64)> = None;
 
     while let Some(chunk) = stream.next().await {
         if cancel.load(Ordering::Relaxed) {
@@ -862,7 +888,36 @@ async fn stream_completion(
                         }
                     }
                 }
+
+                // 只有 stream_options.include_usage 打开时，最后一块才带 usage
+                if let Some(u) = value["usage"].as_object() {
+                    usage = Some((
+                        u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                        u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                        u.get("prompt_tokens_details")
+                            .and_then(|d| d.get("cached_tokens"))
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0),
+                    ));
+                }
             }
+        }
+    }
+
+    // 上报真实用量，让界面能显示"上下文用了多少"。
+    // 放在空回复判断之前：预算被思考吃光时，正是最需要看到用量的场景。
+    if !request_id.is_empty() {
+        if let Some((prompt_tokens, completion_tokens, cached_tokens)) = usage {
+            let _ = app.emit(
+                "llm://usage",
+                UsagePayload {
+                    request_id: request_id.to_string(),
+                    prompt_tokens,
+                    completion_tokens,
+                    cached_tokens,
+                    ctx_size: params::ctx_of(app, model),
+                },
+            );
         }
     }
 
@@ -1077,6 +1132,9 @@ pub async fn chat(
     let trimmed = trim_history(&request.messages);
     let messages = serde_json::to_value(&trimmed).map_err(|e| e.to_string())?;
 
+    // 对话允许按模型选择是否思考（设置里可调，默认关闭）
+    let thinking = params::get(&app, &request.model).thinking;
+
     let result = stream_completion(
         &app,
         &s,
@@ -1085,6 +1143,7 @@ pub async fn chat(
         messages,
         0.7,
         1024,
+        thinking,
         &state.cancel,
     )
     .await;
@@ -1174,9 +1233,54 @@ pub async fn get_settings(
     })
 }
 
+/// 模型目录里的一个文件，附带当前生效的参数，供设置抽屉直接渲染。
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalModelInfo {
+    pub id: String,
+    pub path: String,
+    pub size_mb: u64,
+    /// 当前生效的上下文。改完需要重启引擎才生效。
+    pub ctx_size: u64,
+    /// 模型原生上下文上限（读 GGUF 元数据）；读不到时为 None。
+    pub trained_ctx: Option<u64>,
+    pub thinking: String,
+}
+
 #[tauri::command]
-pub fn list_local_models(app: AppHandle) -> Vec<models::ModelFile> {
+pub fn list_local_models(app: AppHandle) -> Vec<LocalModelInfo> {
     models::scan(&app)
+        .into_iter()
+        .map(|m| {
+            let p = params::get(&app, &m.id);
+            LocalModelInfo {
+                trained_ctx: models::read_context_length(std::path::Path::new(&m.path)),
+                ctx_size: p.ctx,
+                thinking: p.thinking.as_str().to_string(),
+                id: m.id,
+                path: m.path,
+                size_mb: m.size_mb,
+            }
+        })
+        .collect()
+}
+
+/// 保存单个模型的上下文与思考开关。上下文改动需重启引擎生效。
+#[tauri::command]
+pub fn set_model_params(
+    app: AppHandle,
+    model: String,
+    ctx: u64,
+    thinking: String,
+) -> Result<params::ModelParams, String> {
+    params::set(
+        &app,
+        &model,
+        &params::ModelParams {
+            ctx,
+            thinking: Thinking::parse(&thinking),
+        },
+    )
 }
 
 /// 改完 GPU 档位后重启引擎，让新参数生效。

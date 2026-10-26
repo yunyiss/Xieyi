@@ -63,9 +63,11 @@ function stageLabel(stage: RuntimeProgress["stage"]): string {
 interface Props {
   /** 设置抽屉里改动后递增，用于触发重新扫描。 */
   refreshSignal?: number;
+  /** 把译文送到对话页继续调整语意。 */
+  onSendToChat?: (text: string) => void;
 }
 
-export function Translate({ refreshSignal = 0 }: Props) {
+export function Translate({ refreshSignal = 0, onSendToChat }: Props) {
   const [source, setSource] = useState("auto");
   const [target, setTarget] = useState("zh");
   const [input, setInput] = useState("");
@@ -510,6 +512,17 @@ export function Translate({ refreshSignal = 0 }: Props) {
           <span className="text-[12px]" style={{ color: "var(--text-muted)" }}>
             引擎 127.0.0.1:{service.port}
           </span>
+        )}
+
+        {output && onSendToChat && (
+          <button
+            className="h-10 rounded-lg border px-4 text-[13px]"
+            style={selectStyle}
+            onClick={() => onSendToChat(output)}
+            title="把译文带到对话页，可以润色、改语意、增减内容"
+          >
+            在对话中调整
+          </button>
         )}
 
         <button

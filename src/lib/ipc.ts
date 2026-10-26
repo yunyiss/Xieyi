@@ -51,7 +51,16 @@ export interface LocalModel {
   id: string;
   path: string;
   sizeMb: number;
+  /** 当前生效的上下文；改完需重启引擎 */
+  ctxSize: number;
+  /** 模型原生上限（读 GGUF 元数据），读不到为 null */
+  trainedCtx: number | null;
+  /** auto / on / off */
+  thinking: ThinkingMode;
 }
+
+/** 思考开关。能否生效取决于模型自己的对话模板。 */
+export type ThinkingMode = "auto" | "on" | "off";
 
 export interface GlossaryEntry {
   from: string;
@@ -120,6 +129,13 @@ export const setModelsDir = (path: string) =>
 export const setTtl = (seconds: number) => invoke<void>("set_ttl", { seconds });
 export const setGpuLayers = (layers: number) =>
   invoke<void>("set_gpu_layers", { layers });
+/** 保存单个模型的上下文与思考开关；上下文改动需重启引擎。 */
+export const setModelParams = (model: string, ctx: number, thinking: ThinkingMode) =>
+  invoke<{ ctx: number; thinking: ThinkingMode }>("set_model_params", {
+    model,
+    ctx,
+    thinking,
+  });
 export const setPinned = (model: string, pinned: boolean) =>
   invoke<string[]>("set_pinned", { model, pinned });
 export const getSettings = () => invoke<Settings>("get_settings");
@@ -155,6 +171,20 @@ export const onRuntimeProgress = (
 
 export const onToken = (cb: (p: TokenPayload) => void): Promise<UnlistenFn> =>
   listen<TokenPayload>("llm://token", (e) => cb(e.payload));
+
+/** 一次补全的 token 用量，来自 llama.cpp 的 usage 统计。 */
+export interface UsagePayload {
+  requestId: string;
+  promptTokens: number;
+  completionTokens: number;
+  /** 命中缓存、无需重算的前缀 token 数 */
+  cachedTokens: number;
+  /** 该模型当前的上下文上限 */
+  ctxSize: number;
+}
+
+export const onUsage = (cb: (p: UsagePayload) => void): Promise<UnlistenFn> =>
+  listen<UsagePayload>("llm://usage", (e) => cb(e.payload));
 
 export const onTranslateProgress = (
   cb: (p: TranslateProgress) => void,

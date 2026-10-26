@@ -10,12 +10,14 @@ import {
   restartService,
   setGlossary,
   setGpuLayers,
+  setModelParams,
   setModelsDir,
   setPinned,
   setTtl,
   type GlossaryEntry,
   type LocalModel,
   type Settings,
+  type ThinkingMode,
 } from "../lib/ipc";
 
 const TTL_OPTIONS = [
@@ -31,6 +33,20 @@ const LAYER_OPTIONS = [
   { value: 16, label: "混合 16 层" },
   { value: 0, label: "纯 CPU" },
 ];
+
+const THINKING_OPTIONS: { value: ThinkingMode; label: string }[] = [
+  { value: "off", label: "关闭" },
+  { value: "auto", label: "跟随模型" },
+  { value: "on", label: "开启" },
+];
+
+/** 可选的上下文档位：不超过模型原生上限，且保留当前值。 */
+function ctxOptions(model: LocalModel): number[] {
+  const max = model.trainedCtx ?? 32768;
+  const list = [2048, 4096, 8192, 16384, 32768, 65536].filter((v) => v <= max);
+  if (!list.includes(model.ctxSize)) list.push(model.ctxSize);
+  return list.sort((a, b) => a - b);
+}
 
 const fieldStyle = {
   background: "var(--surface)",
@@ -73,6 +89,8 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
   const [glossaryText, setGlossaryText] = useState("");
   const [glossarySaved, setGlossarySaved] = useState(false);
   const [freeVram, setFreeVram] = useState<number | null>(null);
+  /** 改过上下文后需要重启引擎才生效 */
+  const [needsRestart, setNeedsRestart] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -156,11 +174,39 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
     try {
       await restartService();
       await refresh();
+      setNeedsRestart(false);
       onChanged();
     } catch (e) {
       setError(String(e));
     } finally {
       setBusy("");
+    }
+  };
+
+  /** 改单个模型的上下文；引擎在启动时读 preset，所以必须重启才生效。 */
+  const changeModelCtx = async (m: LocalModel, ctx: number) => {
+    setError("");
+    try {
+      const saved = await setModelParams(m.id, ctx, m.thinking);
+      setLocal((prev) =>
+        prev.map((x) => (x.id === m.id ? { ...x, ctxSize: saved.ctx } : x)),
+      );
+      setNeedsRestart(true);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  /** 思考开关逐请求生效，不需要重启。 */
+  const changeThinking = async (m: LocalModel, thinking: ThinkingMode) => {
+    setError("");
+    try {
+      const saved = await setModelParams(m.id, m.ctxSize, thinking);
+      setLocal((prev) =>
+        prev.map((x) => (x.id === m.id ? { ...x, thinking: saved.thinking } : x)),
+      );
+    } catch (e) {
+      setError(String(e));
     }
   };
 
@@ -328,7 +374,7 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
                 {busy === "release" ? "处理中…" : "一键让位"}
               </button>
               <span className="text-[11px]" style={{ color: "var(--text-muted)" }}>
-                档位改动后需重启生效
+                {needsRestart ? "上下文已改，重启后生效" : "档位改动后需重启生效"}
               </span>
             </div>
           </section>
@@ -482,6 +528,58 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
                       </button>
                     )}
                   </div>
+
+                  {/* 单个模型的上下文与思考开关 */}
+                  <div className="mt-1.5 flex items-center gap-1.5 text-[11px]">
+                    <span className="shrink-0" style={{ color: "var(--text-muted)" }}>
+                      上下文
+                    </span>
+                    <select
+                      className="h-6 min-w-0 flex-1 rounded-md border px-1 text-[11px] outline-none focus:border-[var(--brand)]"
+                      style={fieldStyle}
+                      value={m.ctxSize}
+                      onChange={(e) => changeModelCtx(m, Number(e.target.value))}
+                      title={
+                        m.trainedCtx
+                          ? `模型原生上限 ${m.trainedCtx}`
+                          : "未能从 GGUF 读出原生上限"
+                      }
+                    >
+                      {ctxOptions(m).map((v) => (
+                        <option key={v} value={v}>
+                          {v}
+                        </option>
+                      ))}
+                    </select>
+
+                    <span className="shrink-0" style={{ color: "var(--text-muted)" }}>
+                      思考
+                    </span>
+                    <select
+                      className="h-6 shrink-0 rounded-md border px-1 text-[11px] outline-none focus:border-[var(--brand)]"
+                      style={fieldStyle}
+                      value={m.thinking}
+                      onChange={(e) =>
+                        changeThinking(m, e.target.value as ThinkingMode)
+                      }
+                      title="只有模型对话模板支持 enable_thinking 时才真正生效；翻译始终关闭"
+                    >
+                      {THINKING_OPTIONS.map((o) => (
+                        <option key={o.value} value={o.value}>
+                          {o.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  {m.trainedCtx != null && (
+                    <p
+                      className="m-0 mt-1 text-[10px]"
+                      style={{ color: "var(--text-muted)" }}
+                    >
+                      原生上下文 {m.trainedCtx}
+                    </p>
+                  )}
                 </li>
               );
             })}

@@ -1,6 +1,7 @@
 mod batch;
 mod hardware;
 mod models;
+mod params;
 mod paths;
 mod runtime;
 mod service;
@@ -94,6 +95,7 @@ pub fn run() {
             service::set_pinned,
             service::get_settings,
             service::list_local_models,
+            service::set_model_params,
             service::restart_service,
             sessions::list_sessions,
             sessions::save_session,

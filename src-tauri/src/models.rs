@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use tauri::AppHandle;
 
 use crate::hardware;
+use crate::params;
 use crate::paths;
 
 /// 表示"自动按显存分配层数"的哨兵值。
@@ -73,7 +74,8 @@ fn stem(path: &Path) -> String {
         .to_string()
 }
 
-/// 生成路由模式用的 preset（每个模型单独限上下文，避免默认 262144 吃爆显存）。
+/// 生成路由模式用的 preset。
+/// 上下文按模型取用户配置（默认 4096），避免默认 262144 吃爆显存。
 /// `gpu_layers` 为 [`AUTO_LAYERS`] 时按模型体积和当前空闲显存自动估算。
 pub fn write_preset(app: &AppHandle, models: &[ModelFile], gpu_layers: u64) -> Result<PathBuf, String> {
     let root = paths::runtime_root(app)?;
@@ -97,9 +99,11 @@ pub fn write_preset(app: &AppHandle, models: &[ModelFile], gpu_layers: u64) -> R
             gpu_layers
         };
 
+        let ctx = params::ctx_of(app, &m.id);
+
         ini.push_str(&format!(
-            "[{}]\nmodel = {}\njinja = 1\nctx-size = 4096\nn-gpu-layers = {}\ncache-type-k = q8_0\ncache-type-v = q8_0\n\n",
-            m.id, m.path, layers
+            "[{}]\nmodel = {}\njinja = 1\nctx-size = {}\nn-gpu-layers = {}\ncache-type-k = q8_0\ncache-type-v = q8_0\n\n",
+            m.id, m.path, ctx, layers
         ));
     }
 
@@ -129,6 +133,16 @@ fn estimate_layers(size_mb: u64, layers: Option<u32>, free_mb: u64) -> u64 {
 
 /// 从 GGUF 头部读取 `*.block_count`，用于按比例分配 GPU 层数。
 pub fn read_layer_count(path: &Path) -> Option<u32> {
+    read_numeric_meta(path, "block_count").map(|v| v as u32)
+}
+
+/// 模型原生上下文长度（`*.context_length`），用于给用户提示"还能开多大"。
+pub fn read_context_length(path: &Path) -> Option<u64> {
+    read_numeric_meta(path, "context_length")
+}
+
+/// 在 GGUF 元数据里找一个以 `key_suffix` 结尾的数值项。
+pub fn read_numeric_meta(path: &Path, key_suffix: &str) -> Option<u64> {
     let file = std::fs::File::open(path).ok()?;
     let mut reader = BufReader::new(file);
     let mut magic = [0u8; 4];
@@ -149,10 +163,10 @@ pub fn read_layer_count(path: &Path) -> Option<u32> {
         let key = read_string(&mut reader)?;
         let vtype = read_u32(&mut reader)?;
 
-        if key.ends_with("block_count") {
+        if key.ends_with(key_suffix) {
             match vtype {
-                4 => return read_u32(&mut reader),
-                10 => return read_u64(&mut reader).map(|v| v as u32),
+                4 => return read_u32(&mut reader).map(|v| v as u64),
+                10 => return read_u64(&mut reader),
                 _ => {
                     skip_value(&mut reader, vtype, 0)?;
                     continue;
@@ -265,6 +279,13 @@ mod tests {
         assert!(
             layers.map(|n| n > 0).unwrap_or(false),
             "未能从 {sample} 解析出 block_count"
+        );
+
+        // 原生上下文同样来自 GGUF 元数据，用于给上下文档位设上限
+        let ctx = read_context_length(Path::new(&sample));
+        assert!(
+            ctx.map(|n| n >= 512).unwrap_or(false),
+            "未能从 {sample} 解析出 context_length"
         );
     }
 }

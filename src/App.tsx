@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { ModelDrawer } from "./components/ModelDrawer";
 import { StatusBar } from "./components/StatusBar";
 import { Translate } from "./pages/Translate";
@@ -26,6 +26,15 @@ function App() {
   const [drawerOpen, setDrawerOpen] = useState(false);
   /** 设置抽屉里改动后 +1，通知当前页面重新拉取模型与状态。 */
   const [refreshSignal, setRefreshSignal] = useState(0);
+  /** 从翻译页带到对话页的草稿 */
+  const [chatDraft, setChatDraft] = useState("");
+
+  const handleSendToChat = useCallback((text: string) => {
+    setChatDraft(text);
+    setTab("chat");
+  }, []);
+
+  const handleDraftTaken = useCallback(() => setChatDraft(""), []);
 
   useEffect(() => {
     getAppInfo()
@@ -124,13 +133,20 @@ function App() {
           切页不会丢掉翻译结果、聊天草稿和批量队列 */}
       <main className="min-h-0 flex-1">
         <div className={tab === "translate" ? "h-full" : "hidden"}>
-          <Translate refreshSignal={refreshSignal} />
+          <Translate
+            refreshSignal={refreshSignal}
+            onSendToChat={handleSendToChat}
+          />
         </div>
         <div className={tab === "batch" ? "h-full" : "hidden"}>
           <Batch refreshSignal={refreshSignal} active={tab === "batch"} />
         </div>
         <div className={tab === "chat" ? "h-full" : "hidden"}>
-          <Chat refreshSignal={refreshSignal} />
+          <Chat
+            refreshSignal={refreshSignal}
+            draft={chatDraft}
+            onDraftTaken={handleDraftTaken}
+          />
         </div>
       </main>
 

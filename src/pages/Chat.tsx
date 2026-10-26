@@ -12,11 +12,13 @@ import {
   newRequestId,
   onModelState,
   onToken,
+  onUsage,
   saveSession,
   setPinned as setModelPinned,
   type ChatMessage,
   type RouterModel,
   type Session,
+  type UsagePayload,
 } from "../lib/ipc";
 
 const controlStyle = {
@@ -37,10 +39,53 @@ function newId(): string {
 interface Props {
   /** 设置抽屉里改动后递增，用于触发重新扫描。 */
   refreshSignal?: number;
+  /** 从翻译页带过来的待处理文本，会填进输入框。 */
+  draft?: string;
+  /** 取走草稿后通知父级清空，避免重复填入。 */
+  onDraftTaken?: () => void;
+}
+
+/** 对话页的快捷指令：翻译之后用它来调整语意，而不是从头翻。 */
+const QUICK_ACTIONS = [
+  {
+    key: "polish",
+    label: "润色",
+    prompt: "请润色下面这段内容，让表达更自然流畅，只输出润色后的结果：",
+  },
+  {
+    key: "formal",
+    label: "更正式",
+    prompt: "请把下面内容改写成正式、书面的表达，只输出结果：",
+  },
+  {
+    key: "concise",
+    label: "更简洁",
+    prompt: "请把下面内容压缩得更简洁，保留原意，只输出结果：",
+  },
+  {
+    key: "compare",
+    label: "对照原文",
+    prompt:
+      "下面是我要处理的译文。请先指出它与原意可能的偏差、漏译或生硬之处，再给出改进版本：",
+  },
+  {
+    key: "term",
+    label: "统一术语",
+    prompt: "请检查下面内容的术语是否前后一致，给出统一术语后的版本：",
+  },
+];
+
+function formatTokens(n: number): string {
+  if (n < 1000) return String(n);
+  return `${(n / 1000).toFixed(1)}k`;
 }
 
 /** 聊天页：多轮对话 + 本地会话持久化，不做工具调用。 */
-export function Chat({ refreshSignal = 0 }: Props) {
+export function Chat({
+  refreshSignal = 0,
+  draft = "",
+  onDraftTaken,
+}: Props) {
   const [models, setModels] = useState<RouterModel[]>([]);
   const [model, setModel] = useState("");
   const [pinned, setPinned] = useState<string[]>([]);
@@ -51,6 +96,11 @@ export function Chat({ refreshSignal = 0 }: Props) {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [sessionId, setSessionId] = useState(() => newId());
   const [load, setLoad] = useState<LoadState | null>(null);
+  const [usage, setUsage] = useState<UsagePayload | null>(null);
+  /** 本次发送要附加的快捷指令（不写进会话历史，只作用于这一轮） */
+  const [instruction, setInstruction] = useState<typeof QUICK_ACTIONS[number] | null>(
+    null,
+  );
 
   const listRef = useRef<HTMLDivElement>(null);
   const unlistenRef = useRef<UnlistenFn | null>(null);
@@ -80,6 +130,22 @@ export function Chat({ refreshSignal = 0 }: Props) {
   useEffect(() => {
     refresh();
   }, [refresh, refreshSignal]);
+
+  // 从翻译页带过来的文本：填进输入框后立即通知父级清空
+  useEffect(() => {
+    if (!draft) return;
+    setInput((prev) => (prev.trim() ? `${draft}\n\n${prev}` : draft));
+    onDraftTaken?.();
+  }, [draft, onDraftTaken]);
+
+  // 每次补全的真实 token 用量，用来显示"上下文用了多少"
+  useEffect(() => {
+    let un: UnlistenFn | null = null;
+    onUsage((p) => setUsage(p)).then((fn) => (un = fn));
+    return () => {
+      un?.();
+    };
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -129,7 +195,11 @@ export function Chat({ refreshSignal = 0 }: Props) {
     }
   };
 
-  const sendWith = async (history: ChatMessage[]) => {
+  /**
+   * `display` 用于渲染与持久化，`outbound` 是真正发给模型的版本。
+   * 两者只在带了快捷指令时不同：指令作为系统消息只作用于这一轮，不写进会话历史。
+   */
+  const sendWith = async (display: ChatMessage[], outbound: ChatMessage[]) => {
     if (!model) {
       setError("请先选择模型");
       return;
@@ -155,9 +225,9 @@ export function Chat({ refreshSignal = 0 }: Props) {
     });
 
     try {
-      const full = await chat({ requestId: id, model, messages: history });
+      const full = await chat({ requestId: id, model, messages: outbound });
       const finalMessages: ChatMessage[] = [
-        ...history,
+        ...display,
         { role: "assistant", content: full },
       ];
       setMessages(finalMessages);
@@ -190,7 +260,18 @@ export function Chat({ refreshSignal = 0 }: Props) {
       { role: "user", content: text },
     ];
     setMessages([...history, { role: "assistant", content: "" }]);
-    await sendWith(history);
+
+    // 快捷指令作为系统消息插入，只影响这一轮，不污染会话历史
+    const outbound: ChatMessage[] = instruction
+      ? [
+          ...messages,
+          { role: "system", content: instruction.prompt },
+          { role: "user", content: text },
+        ]
+      : history;
+
+    setInstruction(null);
+    await sendWith(history, outbound);
   };
 
   /** 丢掉最后一条助手回复，用同样的用户输入重新生成。 */
@@ -203,7 +284,7 @@ export function Chat({ refreshSignal = 0 }: Props) {
     if (withoutLast[withoutLast.length - 1].role !== "user") return;
 
     setMessages([...withoutLast, { role: "assistant", content: "" }]);
-    await sendWith(withoutLast);
+    await sendWith(withoutLast, withoutLast);
   };
 
   const switchSession = (id: string) => {
@@ -294,6 +375,39 @@ export function Chat({ refreshSignal = 0 }: Props) {
       </div>
 
       {load && <LoadIndicator load={load} />}
+
+      {/* 上下文用量：来自模型返回的真实 usage，不是估算 */}
+      {usage && (
+        <div className="flex items-center gap-2 text-[11px]">
+          <span className="shrink-0 tabular-nums" style={{ color: "var(--text-muted)" }}>
+            上下文 {formatTokens(usage.promptTokens + usage.completionTokens)} /{" "}
+            {formatTokens(usage.ctxSize)}
+          </span>
+          <div
+            className="h-1 min-w-0 flex-1 overflow-hidden rounded-full"
+            style={{ background: "var(--surface-muted)" }}
+          >
+            <div
+              className="h-full rounded-full"
+              style={{
+                width: `${Math.min(
+                  100,
+                  ((usage.promptTokens + usage.completionTokens) / usage.ctxSize) * 100,
+                )}%`,
+                background:
+                  usage.promptTokens + usage.completionTokens > usage.ctxSize * 0.85
+                    ? "var(--danger)"
+                    : "var(--brand)",
+              }}
+            />
+          </div>
+          {usage.cachedTokens > 0 && (
+            <span className="shrink-0 tabular-nums" style={{ color: "var(--text-muted)" }}>
+              缓存 {formatTokens(usage.cachedTokens)}
+            </span>
+          )}
+        </div>
+      )}
 
       {/* 会话栏 */}
       <div className="flex flex-nowrap items-center gap-2">
@@ -391,6 +505,37 @@ export function Chat({ refreshSignal = 0 }: Props) {
           )}
         </div>
       </section>
+
+      {/* 快捷指令：翻译之后再调整语意，比重新翻一遍省事 */}
+      <div className="flex flex-nowrap items-center gap-1.5 overflow-x-auto">
+        <span className="shrink-0 text-[11px]" style={{ color: "var(--text-muted)" }}>
+          处理
+        </span>
+        {QUICK_ACTIONS.map((action) => {
+          const active = instruction?.key === action.key;
+          return (
+            <button
+              key={action.key}
+              className="h-7 shrink-0 rounded-full border px-2.5 text-[11px] transition-colors disabled:opacity-50"
+              style={{
+                background: active ? "var(--brand-soft)" : "var(--surface)",
+                borderColor: active ? "var(--brand)" : "var(--border)",
+                color: active ? "var(--brand-text)" : "var(--text)",
+              }}
+              title={action.prompt}
+              disabled={busy}
+              onClick={() => setInstruction(active ? null : action)}
+            >
+              {action.label}
+            </button>
+          );
+        })}
+        {instruction && (
+          <span className="shrink-0 text-[11px]" style={{ color: "var(--brand-text)" }}>
+            下一句生效
+          </span>
+        )}
+      </div>
 
       {/* 输入区 */}
       <div className="flex items-end gap-2">
