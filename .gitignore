@@ -16,6 +16,7 @@ dist-ssr
 docs/
 .trae/
 .trae-html-share-packages/
+.screenshots/
 
 # Editor directories and files
 .vscode/*

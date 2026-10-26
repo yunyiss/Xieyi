@@ -16,6 +16,13 @@ npm install
 npm run tauri dev
 ```
 
+## 测试
+
+```bash
+npm test                    # 前端：Vitest + Testing Library
+cd src-tauri && cargo test  # 后端：Rust 单测
+```
+
 ## 构建
 
 ```bash
@@ -24,4 +31,4 @@ npm run tauri build
 
 ## 文档
 
-需求与技术方案位于 `.trae/docs/`（本地文件，不入库）。
+需求与技术方案位于 `docs/`（本地文件，不入库）。
