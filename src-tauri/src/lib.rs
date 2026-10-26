@@ -1,3 +1,4 @@
+mod batch;
 mod hardware;
 mod models;
 mod paths;
@@ -62,6 +63,7 @@ fn probe_vram() -> Option<u64> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(service::AppState::default())
         .setup(|app| {
             service::load_settings(app.handle());
@@ -96,6 +98,8 @@ pub fn run() {
             sessions::list_sessions,
             sessions::save_session,
             sessions::delete_session,
+            batch::batch_translate,
+            batch::batch_cancel,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

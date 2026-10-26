@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
 
 export interface AppInfo {
   os: string;
@@ -164,6 +165,84 @@ export const onModelState = (
   cb: (p: ModelStatePayload) => void,
 ): Promise<UnlistenFn> =>
   listen<ModelStatePayload>("model://state-changed", (e) => cb(e.payload));
+
+export type BatchStage =
+  | "reading"
+  | "translating"
+  | "writing"
+  | "done"
+  | "failed"
+  | "skipped";
+
+export interface BatchFileProgress {
+  path: string;
+  index: number;
+  total: number;
+  stage: BatchStage;
+  done: number;
+  segments: number;
+  failedSegments: number;
+  output?: string;
+  error?: string;
+}
+
+export interface BatchSummary {
+  total: number;
+  succeeded: number;
+  failed: number;
+  skipped: number;
+  failedSegments: number;
+  elapsedMs: number;
+  cancelled: boolean;
+}
+
+export interface BatchRequest {
+  model: string;
+  source: string;
+  target: string;
+  paths: string[];
+}
+
+export const batchTranslate = (request: BatchRequest) =>
+  invoke<BatchSummary>("batch_translate", { request });
+export const batchCancel = () => invoke<void>("batch_cancel");
+
+export const onBatchProgress = (
+  cb: (p: BatchFileProgress) => void,
+): Promise<UnlistenFn> =>
+  listen<BatchFileProgress>("batch://progress", (e) => cb(e.payload));
+
+/** 选择待翻译的文本 / 字幕文件。 */
+export const pickBatchFiles = () =>
+  open({
+    multiple: true,
+    filters: [{ name: "文本与字幕", extensions: ["txt", "md", "srt"] }],
+  });
+
+/** 批量翻译支持的扩展名（含点号，小写）。 */
+export const BATCH_EXTENSIONS = [".txt", ".md", ".srt"] as const;
+
+/** 过滤出支持的文件并去重，保持原有顺序。 */
+export function filterBatchPaths(paths: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+
+  for (const path of paths) {
+    const lower = path.toLowerCase();
+    if (!BATCH_EXTENSIONS.some((ext) => lower.endsWith(ext))) continue;
+    if (seen.has(path)) continue;
+    seen.add(path);
+    out.push(path);
+  }
+
+  return out;
+}
+
+/** 从完整路径取出文件名（兼容 Windows 与 POSIX 分隔符）。 */
+export function baseName(path: string): string {
+  const at = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+  return at >= 0 ? path.slice(at + 1) : path;
+}
 
 /** 生成一次请求的标识，用于把流式 token 归属到具体请求。 */
 export function newRequestId(): string {

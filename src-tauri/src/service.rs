@@ -391,6 +391,63 @@ impl Service {
         Ok(())
     }
 
+    /// 翻译单个片段：命中缓存直接返回，否则流式推理并回填缓存。
+    ///
+    /// `request_id` 为 `None` 时不会向前端推送 token —— 批量任务走这条路径，
+    /// 避免把批量过程的中间结果灌进翻译页的输出框。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn translate_segment(
+        &self,
+        app: &AppHandle,
+        state: &AppState,
+        request_id: Option<&str>,
+        model: &str,
+        source: &str,
+        target: &str,
+        glossary: &[GlossaryEntry],
+        text: &str,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<String, String> {
+        let key = cache_key(model, source, target, glossary, text);
+
+        if let Some(hit) = state.cache.lock().await.get(&key).cloned() {
+            if let Some(id) = request_id {
+                let _ = app.emit(
+                    "llm://token",
+                    TokenPayload {
+                        request_id: id.to_string(),
+                        token: hit.clone(),
+                    },
+                );
+            }
+            return Ok(hit);
+        }
+
+        let messages = serde_json::json!([
+            { "role": "system", "content": system_prompt(source, target, glossary) },
+            { "role": "user", "content": text }
+        ]);
+
+        let translated = stream_completion(
+            app,
+            self,
+            request_id.unwrap_or_default(),
+            model,
+            messages,
+            0.2,
+            1024,
+            cancel,
+        )
+        .await?;
+
+        let mut cache = state.cache.lock().await;
+        if cache.len() > 4000 {
+            cache.clear();
+        }
+        cache.insert(key, translated.clone());
+        Ok(translated)
+    }
+
     pub async fn load(
         &self,
         app: &AppHandle,
@@ -775,13 +832,16 @@ async fn stream_completion(
                 if let Some(token) = value["choices"][0]["delta"]["content"].as_str() {
                     if !token.is_empty() {
                         full.push_str(token);
-                        let _ = app.emit(
-                            "llm://token",
-                            TokenPayload {
-                                request_id: request_id.to_string(),
-                                token: token.to_string(),
-                            },
-                        );
+                        // 空 request_id 表示"不需要推流"（批量任务），省掉无谓的事件
+                        if !request_id.is_empty() {
+                            let _ = app.emit(
+                                "llm://token",
+                                TokenPayload {
+                                    request_id: request_id.to_string(),
+                                    token: token.to_string(),
+                                },
+                            );
+                        }
                     }
                 }
             }
@@ -791,7 +851,7 @@ async fn stream_completion(
     Ok(full)
 }
 
-fn load_glossary(app: &AppHandle) -> Vec<GlossaryEntry> {
+pub(crate) fn load_glossary(app: &AppHandle) -> Vec<GlossaryEntry> {
     paths::config_value(app, "glossary")
         .and_then(|v| serde_json::from_value::<Vec<GlossaryEntry>>(v).ok())
         .unwrap_or_default()
@@ -858,56 +918,19 @@ pub async fn translate(
             break;
         }
 
-        let key = cache_key(
-            &request.model,
-            &request.source,
-            &request.target,
-            &glossary,
-            &segment.text,
-        );
-
-        let cached = {
-            let cache = state.cache.lock().await;
-            cache.get(&key).cloned()
-        };
-
-        let translated = match cached {
-            Some(text) => {
-                let _ = app.emit(
-                    "llm://token",
-                    TokenPayload {
-                        request_id: request.request_id.clone(),
-                        token: text.clone(),
-                    },
-                );
-                text
-            }
-            None => {
-                let messages = serde_json::json!([
-                    { "role": "system", "content": system_prompt(&request.source, &request.target, &glossary) },
-                    { "role": "user", "content": segment.text }
-                ]);
-
-                let text = stream_completion(
-                    &app,
-                    &service,
-                    &request.request_id,
-                    &request.model,
-                    messages,
-                    0.2,
-                    1024,
-                    &state.cancel,
-                )
-                .await?;
-
-                let mut cache = state.cache.lock().await;
-                if cache.len() > 4000 {
-                    cache.clear();
-                }
-                cache.insert(key, text.clone());
-                text
-            }
-        };
+        let translated = service
+            .translate_segment(
+                &app,
+                &state,
+                Some(&request.request_id),
+                &request.model,
+                &request.source,
+                &request.target,
+                &glossary,
+                &segment.text,
+                &state.cancel,
+            )
+            .await?;
 
         output.push_str(&translated);
 

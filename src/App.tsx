@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { ModelDrawer } from "./components/ModelDrawer";
 import { StatusBar } from "./components/StatusBar";
 import { Translate } from "./pages/Translate";
+import { Batch } from "./pages/Batch";
 import { Chat } from "./pages/Chat";
 import {
   getAppInfo,
@@ -14,7 +15,7 @@ import {
   type Settings,
 } from "./lib/ipc";
 
-type Tab = "translate" | "chat";
+type Tab = "translate" | "batch" | "chat";
 
 function App() {
   const [tab, setTab] = useState<Tab>("translate");
@@ -60,6 +61,7 @@ function App() {
 
   const tabs: { key: Tab; label: string }[] = [
     { key: "translate", label: "翻译" },
+    { key: "batch", label: "批量" },
     { key: "chat", label: "对话" },
   ];
 
@@ -118,12 +120,18 @@ function App() {
         </button>
       </header>
 
+      {/* 三个页面保持挂载，只切换显隐：
+          切页不会丢掉翻译结果、聊天草稿和批量队列 */}
       <main className="min-h-0 flex-1">
-        {tab === "translate" ? (
+        <div className={tab === "translate" ? "h-full" : "hidden"}>
           <Translate refreshSignal={refreshSignal} />
-        ) : (
+        </div>
+        <div className={tab === "batch" ? "h-full" : "hidden"}>
+          <Batch refreshSignal={refreshSignal} active={tab === "batch"} />
+        </div>
+        <div className={tab === "chat" ? "h-full" : "hidden"}>
           <Chat refreshSignal={refreshSignal} />
-        )}
+        </div>
       </main>
 
       <StatusBar
