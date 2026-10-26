@@ -29,6 +29,3 @@ cd src-tauri && cargo test  # 后端：Rust 单测
 npm run tauri build
 ```
 
-## 文档
-
-需求与技术方案位于 `docs/`（本地文件，不入库）。
