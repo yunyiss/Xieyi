@@ -34,8 +34,13 @@ function newId(): string {
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
+interface Props {
+  /** 设置抽屉里改动后递增，用于触发重新扫描。 */
+  refreshSignal?: number;
+}
+
 /** 聊天页：多轮对话 + 本地会话持久化，不做工具调用。 */
-export function Chat() {
+export function Chat({ refreshSignal = 0 }: Props) {
   const [models, setModels] = useState<RouterModel[]>([]);
   const [model, setModel] = useState("");
   const [pinned, setPinned] = useState<string[]>([]);
@@ -72,7 +77,7 @@ export function Chat() {
 
   useEffect(() => {
     refresh();
-  }, [refresh]);
+  }, [refresh, refreshSignal]);
 
   useEffect(() => {
     return () => {
