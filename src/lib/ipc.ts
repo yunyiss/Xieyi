@@ -201,6 +201,10 @@ export const onRuntimeProgress = (
 export const onToken = (cb: (p: TokenPayload) => void): Promise<UnlistenFn> =>
   listen<TokenPayload>("llm://token", (e) => cb(e.payload));
 
+/** 思维链增量。只在对话页用（翻译固定关闭思考），用来显示"模型还在想"。 */
+export const onReasoning = (cb: (p: TokenPayload) => void): Promise<UnlistenFn> =>
+  listen<TokenPayload>("llm://reasoning", (e) => cb(e.payload));
+
 /** 一次补全的 token 用量，来自 llama.cpp 的 usage 统计。 */
 export interface UsagePayload {
   requestId: string;

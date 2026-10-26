@@ -947,9 +947,21 @@ async fn stream_completion(
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(data) {
                 let choice = &value["choices"][0];
 
-                // 思考型模型的思维链：不展示，但要记下长度用于诊断
+                // 思考型模型的思维链：内容照常推给对话页显示（用户需要知道模型还在思考），
+                // 同时记下长度用于"空正文"的诊断
                 if let Some(reasoning) = choice["delta"]["reasoning_content"].as_str() {
-                    reasoning_chars += reasoning.chars().count();
+                    if !reasoning.is_empty() {
+                        reasoning_chars += reasoning.chars().count();
+                        if !request_id.is_empty() {
+                            let _ = app.emit(
+                                "llm://reasoning",
+                                TokenPayload {
+                                    request_id: request_id.to_string(),
+                                    token: reasoning.to_string(),
+                                },
+                            );
+                        }
+                    }
                 }
                 if let Some(reason) = choice["finish_reason"].as_str() {
                     finish_reason = reason.to_string();

@@ -14,6 +14,7 @@ import {
   listSessions,
   newRequestId,
   onModelState,
+  onReasoning,
   onToken,
   onUsage,
   saveSession,
@@ -119,6 +120,10 @@ export function Chat({
   const [thinking, setThinking] = useState<ThinkingMode>("off");
   /** 正在编辑并准备重发的用户消息（只允许同时编辑一条） */
   const [editing, setEditing] = useState<{ index: number; text: string } | null>(null);
+  /** 本次请求的思维链正文（只在思考型模型 + 思考开启时出现） */
+  const [reasoning, setReasoning] = useState("");
+  /** 思维链面板是否展开；正文开始输出后自动收起 */
+  const [thinkOpen, setThinkOpen] = useState(true);
   /** 本次发送要附加的快捷指令（不写进会话历史，只作用于这一轮） */
   const [instruction, setInstruction] = useState<typeof QUICK_ACTIONS[number] | null>(
     null,
@@ -129,6 +134,10 @@ export function Chat({
   const messagesRef = useRef<ChatMessage[]>([]);
   /** 本次请求已经流出来的文本，用于失败时判断"要不要保留半截回复"。 */
   const streamedRef = useRef("");
+  /** 当前正在进行的请求 id：思维链事件按它过滤 */
+  const activeIdRef = useRef("");
+  /** 用户手动展开过思维链，就别在正文开始输出时自动收起 */
+  const thinkTouchedRef = useRef(false);
 
   useEffect(() => {
     messagesRef.current = messages;
@@ -170,6 +179,18 @@ export function Chat({
         prompt: t.prompt + p.promptTokens,
         generated: t.generated + p.completionTokens,
       }));
+    }).then((fn) => (un = fn));
+    return () => {
+      un?.();
+    };
+  }, []);
+
+  // 思维链增量：跟着当前请求走，避免别的请求或上一轮的残留混进来
+  useEffect(() => {
+    let un: UnlistenFn | null = null;
+    onReasoning((p) => {
+      if (p.requestId !== activeIdRef.current) return;
+      setReasoning((prev) => prev + p.token);
     }).then((fn) => (un = fn));
     return () => {
       un?.();
@@ -227,7 +248,7 @@ export function Chat({
   useEffect(() => {
     const el = listRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [messages, busy]);
+  }, [messages, busy, reasoning]);
 
   const persist = async (msgs: ChatMessage[], currentModel: string, id: string) => {
     if (msgs.length === 0) return;
@@ -263,12 +284,19 @@ export function Chat({
     setError("");
     setBusy(true);
     streamedRef.current = "";
+    // 新请求的思维链重新开始，默认展开——要让用户看到"模型在想，没卡住"
+    setReasoning("");
+    setThinkOpen(true);
+    thinkTouchedRef.current = false;
 
     const id = newRequestId();
+    activeIdRef.current = id;
     unlistenRef.current?.();
     unlistenRef.current = await onToken((p) => {
       if (p.requestId !== id) return;
       streamedRef.current += p.token;
+      // 正文开始了就自动把思维链收起来，别让长思考挡着答案
+      if (!thinkTouchedRef.current) setThinkOpen(false);
       setMessages((prev) => {
         if (prev.length === 0) return prev;
         const last = prev[prev.length - 1];
@@ -306,6 +334,9 @@ export function Chat({
     } finally {
       unlistenRef.current?.();
       unlistenRef.current = null;
+      activeIdRef.current = "";
+      // 请求结束就收掉思维链：它属于"等待中的进度提示"，不是历史内容
+      setReasoning("");
       setBusy(false);
     }
   };
@@ -564,11 +595,24 @@ export function Chat({
                       {m.content}
                     </div>
                   ) : (
-                    <div
-                      className="max-w-[94%] whitespace-pre-wrap px-0.5 text-[13px] leading-relaxed"
-                      style={{ color: "var(--text)" }}
-                    >
-                      {m.content || (busy && isLast ? "…" : "")}
+                    <div className="flex max-w-[94%] flex-col gap-1.5">
+                      {/* 思维链：只在本次请求进行中显示，告诉用户"模型还在想" */}
+                      {isLast && busy && reasoning && (
+                        <ThinkingPanel
+                          text={reasoning}
+                          open={thinkOpen}
+                          onToggle={() => {
+                            thinkTouchedRef.current = true;
+                            setThinkOpen((v) => !v);
+                          }}
+                        />
+                      )}
+                      <div
+                        className="whitespace-pre-wrap px-0.5 text-[13px] leading-relaxed"
+                        style={{ color: "var(--text)" }}
+                      >
+                        {m.content || (busy && isLast && !reasoning ? "…" : "")}
+                      </div>
                     </div>
                   )}
                 </div>
@@ -768,6 +812,74 @@ export function Chat({
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+/**
+ * 思维链面板：模型在"想"的时候显示，让人知道它没卡住。
+ *
+ * 展开时最多占 180px 高度、内部滚动——思考可能很长，不能把答案挤出视野；
+ * 正文一开始输出就自动收起（除非用户手动展开过）。
+ */
+function ThinkingPanel({
+  text,
+  open,
+  onToggle,
+}: {
+  text: string;
+  open: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <div
+      className="rounded-[10px] border"
+      style={{
+        borderColor: "var(--border)",
+        background: "color-mix(in srgb, var(--surface-muted) 60%, transparent)",
+      }}
+    >
+      <button
+        className="row flex w-full items-center gap-2 px-2.5 py-1.5 text-left text-[11px]"
+        style={{ color: "var(--text-muted)" }}
+        onClick={onToggle}
+        title={open ? "收起思考过程" : "展开思考过程"}
+        aria-expanded={open}
+      >
+        <span
+          className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full"
+          style={{ background: "var(--brand)" }}
+        />
+        <span className="shrink-0">模型正在思考</span>
+        <span className="min-w-0 flex-1 truncate opacity-70">
+          {open ? "" : text.slice(-40)}
+        </span>
+        <span className="shrink-0 tabular-nums opacity-70">{text.length} 字</span>
+        <svg
+          className="h-3 w-3 shrink-0 opacity-60 transition-transform"
+          style={{ transform: open ? "rotate(180deg)" : "none" }}
+          viewBox="0 0 24 24"
+          fill="none"
+          aria-hidden
+        >
+          <path
+            d="M6 9l6 6 6-6"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+        </svg>
+      </button>
+
+      {open && (
+        <div
+          className="max-h-[180px] overflow-auto whitespace-pre-wrap px-2.5 pb-2 text-[12px] leading-relaxed"
+          style={{ color: "var(--text-muted)" }}
+        >
+          {text}
+        </div>
+      )}
     </div>
   );
 }
