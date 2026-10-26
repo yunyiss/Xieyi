@@ -33,6 +33,7 @@ import {
   makeMessage,
   normalizeHistory,
 } from "../lib/chat";
+import { useTauriEvent } from "../lib/useTauriEvent";
 
 /** 会话 id 与消息 id 用同一套生成方式，但两者互不相干。 */
 function newSessionId(): string {
@@ -166,32 +167,20 @@ export function Chat({
   }, [draft, onDraftTaken]);
 
   // 每次补全的真实 token 用量，用来显示"上下文用了多少"
-  useEffect(() => {
-    let un: UnlistenFn | null = null;
-    onUsage((p) => {
-      setUsage(p);
-      setTotals((t) => ({
-        prompt: t.prompt + p.promptTokens,
-        generated: t.generated + p.completionTokens,
-      }));
-    }).then((fn) => (un = fn));
-    return () => {
-      un?.();
-    };
-  }, []);
+  useTauriEvent(onUsage, (p) => {
+    setUsage(p);
+    setTotals((t) => ({
+      prompt: t.prompt + p.promptTokens,
+      generated: t.generated + p.completionTokens,
+    }));
+  });
 
   // 思维链增量：跟着当前请求走，避免别的请求或上一轮的残留混进来
-  useEffect(() => {
-    let un: UnlistenFn | null = null;
-    onReasoning((p) => {
-      if (p.requestId !== activeIdRef.current) return;
-      reasoningRef.current += p.token;
-      setReasoning((prev) => prev + p.token);
-    }).then((fn) => (un = fn));
-    return () => {
-      un?.();
-    };
-  }, []);
+  useTauriEvent(onReasoning, (p) => {
+    if (p.requestId !== activeIdRef.current) return;
+    reasoningRef.current += p.token;
+    setReasoning((prev) => prev + p.token);
+  });
 
   // 切换模型时，思考档位跟随该模型保存的值
   useEffect(() => {
@@ -226,20 +215,14 @@ export function Chat({
   }, []);
 
   // 模型状态实时同步
-  useEffect(() => {
-    let un: UnlistenFn | null = null;
-    onModelState((p) => {
-      const mapped =
-        p.state === "warm" ? "loaded" : p.state === "cold" ? "unloaded" : p.state;
-      setModels((prev) =>
-        prev.map((m) => (m.id === p.model ? { ...m, state: mapped } : m)),
-      );
-      setLoad(toLoadState(p));
-    }).then((fn) => (un = fn));
-    return () => {
-      un?.();
-    };
-  }, []);
+  useTauriEvent(onModelState, (p) => {
+    const mapped =
+      p.state === "warm" ? "loaded" : p.state === "cold" ? "unloaded" : p.state;
+    setModels((prev) =>
+      prev.map((m) => (m.id === p.model ? { ...m, state: mapped } : m)),
+    );
+    setLoad(toLoadState(p));
+  });
 
   useEffect(() => {
     const el = listRef.current;

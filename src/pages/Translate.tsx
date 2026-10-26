@@ -29,6 +29,7 @@ import {
   type ServiceStatus,
   type TranslateStyle,
 } from "../lib/ipc";
+import { useTauriEvent } from "../lib/useTauriEvent";
 
 const LANGUAGES = [
   { value: "auto", label: "自动检测" },
@@ -157,50 +158,26 @@ export function Translate({
     bootstrap();
   }, [bootstrap, refreshSignal]);
 
-  useEffect(() => {
-    let un: UnlistenFn | null = null;
-    onRuntimeProgress(setProgress).then((fn) => (un = fn));
-    return () => {
-      un?.();
-    };
-  }, []);
+  useTauriEvent(onRuntimeProgress, setProgress);
 
   // 长文分段翻译的进度
-  useEffect(() => {
-    let un: UnlistenFn | null = null;
-    onTranslateProgress(setSegmentProgress).then((fn) => (un = fn));
-    return () => {
-      un?.();
-    };
-  }, []);
+  useTauriEvent(onTranslateProgress, setSegmentProgress);
 
   // 质检报告：后端发现译文有问题并自动重试过。批量任务的 requestId 为空，不在这里显示
-  useEffect(() => {
-    let un: UnlistenFn | null = null;
-    onQualityReport((p) => {
-      if (!p.requestId) return;
-      setQuality((prev) => [...prev, p]);
-    }).then((fn) => (un = fn));
-    return () => {
-      un?.();
-    };
-  }, []);
+  useTauriEvent(onQualityReport, (p) => {
+    if (!p.requestId) return;
+    setQuality((prev) => [...prev, p]);
+  });
 
   // 模型状态实时同步（加载中 / 已加载 / 卸载中）
-  useEffect(() => {
-    let un: UnlistenFn | null = null;
-    onModelState((p) => {
-      const mapped =
-        p.state === "warm" ? "loaded" : p.state === "cold" ? "unloaded" : p.state;
-      setModels((prev) =>
-        prev.map((m) => (m.id === p.model ? { ...m, state: mapped } : m)),
-      );
-      setLoad(toLoadState(p));
-    }).then((fn) => (un = fn));
-    return () => {
-      un?.();
-    };
-  }, []);
+  useTauriEvent(onModelState, (p) => {
+    const mapped =
+      p.state === "warm" ? "loaded" : p.state === "cold" ? "unloaded" : p.state;
+    setModels((prev) =>
+      prev.map((m) => (m.id === p.model ? { ...m, state: mapped } : m)),
+    );
+    setLoad(toLoadState(p));
+  });
 
   useEffect(() => {
     return () => {

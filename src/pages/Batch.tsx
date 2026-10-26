@@ -6,6 +6,7 @@ import { ModelStateBadge, stateLabel } from "../components/ModelStateBadge";
 import { RunButton } from "../components/RunButton";
 import { Select } from "../components/Select";
 import { TRANSLATE_STYLES } from "../lib/translateStyles";
+import { useTauriEvent } from "../lib/useTauriEvent";
 import {
   baseName,
   batchCancel,
@@ -128,45 +129,33 @@ export function Batch({ refreshSignal = 0, active = true }: Props) {
   }, [bootstrap, refreshSignal]);
 
   // 模型状态：更新下拉里的状态标签，同时驱动加载进度条
-  useEffect(() => {
-    let un: UnlistenFn | null = null;
-    onModelState((p) => {
-      const mapped =
-        p.state === "warm" ? "loaded" : p.state === "cold" ? "unloaded" : p.state;
-      setModels((prev) =>
-        prev.map((m) => (m.id === p.model ? { ...m, state: mapped } : m)),
-      );
-      setLoad(toLoadState(p));
-    }).then((fn) => (un = fn));
-    return () => {
-      un?.();
-    };
-  }, []);
+  useTauriEvent(onModelState, (p) => {
+    const mapped =
+      p.state === "warm" ? "loaded" : p.state === "cold" ? "unloaded" : p.state;
+    setModels((prev) =>
+      prev.map((m) => (m.id === p.model ? { ...m, state: mapped } : m)),
+    );
+    setLoad(toLoadState(p));
+  });
 
   // 批量进度
-  useEffect(() => {
-    let un: UnlistenFn | null = null;
-    onBatchProgress((p) => {
-      setQueue((prev) =>
-        prev.map((item) =>
-          item.path === p.path
-            ? {
-                ...item,
-                stage: p.stage,
-                done: p.done,
-                segments: p.segments,
-                failedSegments: p.failedSegments,
-                output: p.output ?? item.output,
-                error: p.error,
-              }
-            : item,
-        ),
-      );
-    }).then((fn) => (un = fn));
-    return () => {
-      un?.();
-    };
-  }, []);
+  useTauriEvent(onBatchProgress, (p) => {
+    setQueue((prev) =>
+      prev.map((item) =>
+        item.path === p.path
+          ? {
+              ...item,
+              stage: p.stage,
+              done: p.done,
+              segments: p.segments,
+              failedSegments: p.failedSegments,
+              output: p.output ?? item.output,
+              error: p.error,
+            }
+          : item,
+      ),
+    );
+  });
 
   /** 把路径加进队列，过滤掉不支持的扩展名。 */
   const addPaths = useCallback((paths: string[]) => {
@@ -200,6 +189,8 @@ export function Batch({ refreshSignal = 0, active = true }: Props) {
     }
 
     let un: UnlistenFn | null = null;
+    let dead = false;
+
     // 拖放走 Tauri 原生 API。在纯浏览器里跑（比如本地预览 UI）它不存在，
     // 抛错会把整页打白，所以这里兜一层：没有原生拖放就退回只有「添加文件」。
     try {
@@ -215,11 +206,17 @@ export function Batch({ refreshSignal = 0, active = true }: Props) {
             addPaths(payload.paths);
           }
         })
-        .then((fn) => (un = fn));
+        .then((fn) => {
+          // 切换页签常常发生在订阅兑现之前，这里必须补一次注销，
+          // 否则每切一次页就多一个拖放监听器（重复触发 drop 会重复入队）
+          if (dead) fn();
+          else un = fn;
+        });
     } catch {
       // 忽略：非 Tauri 环境没有拖放能力
     }
     return () => {
+      dead = true;
       un?.();
     };
   }, [addPaths, active]);

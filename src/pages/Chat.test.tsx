@@ -1,5 +1,6 @@
 import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import React from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as ipc from "../lib/ipc";
 import type { TokenPayload } from "../lib/ipc";
@@ -9,6 +10,8 @@ import { Chat } from "./Chat";
 const streams = vi.hoisted(() => ({
   token: null as ((p: { requestId: string; token: string }) => void) | null,
   reasoning: null as ((p: { requestId: string; token: string }) => void) | null,
+  /** 当前仍然挂着的思维链订阅者。泄漏时这里会有多个 */
+  reasoningListeners: [] as ((p: { requestId: string; token: string }) => void)[],
 }));
 
 /**
@@ -46,8 +49,15 @@ vi.mock("../lib/ipc", async (importOriginal) => {
       return () => {};
     }),
     onReasoning: vi.fn(async (cb: (p: TokenPayload) => void) => {
+      // 像真实的 listen() 一样：登记订阅者，注销时移除。
+      // 只有真正注销干净，界面才不会重复累加——这正是被验证的行为。
       streams.reasoning = cb;
-      return () => {};
+      streams.reasoningListeners.push(cb);
+      return () => {
+        streams.reasoningListeners = streams.reasoningListeners.filter(
+          (fn) => fn !== cb,
+        );
+      };
     }),
     onUsage: vi.fn(async () => () => {}),
     onModelState: vi.fn(async () => () => {}),
@@ -179,5 +189,38 @@ describe("Chat", () => {
     expect(screen.queryByText("第一次回答")).not.toBeInTheDocument();
     expect(screen.queryByText("原始问题")).not.toBeInTheDocument();
     expect(screen.getByText("改过的问题")).toBeInTheDocument();
+  });
+
+  /**
+   * 思维链曾被重复显示：StrictMode 会「挂载→卸载→再挂载」，
+   * 而 listen() 是异步的，cleanup 拿不到注销函数，于是留下两个监听器，
+   * 每个 token 被累加两次（`Thinking` 变成 `ThinkingThinking`）。
+   *
+   * 这条用例把「同一个 token 只追加一次」钉死：用 StrictMode 渲染，
+   * 推一个 token，界面上的思维链必须与推入内容完全一致。
+   */
+  it("StrictMode 下思维链不会重复累加", async () => {
+    chatMock.mockImplementation(async () => {
+      await act(async () => {
+        // 推给所有仍然挂着的监听器：如果卸载没注销干净，
+        // 同一个 token 就会在界面里被追加两次
+        for (const fn of streams.reasoningListeners) {
+          fn({ requestId: "req-1", token: "分析" });
+        }
+      });
+      return "好的";
+    });
+
+    render(
+      <React.StrictMode>
+        <Chat />
+      </React.StrictMode>,
+    );
+    await waitFor(() => expect(screen.getByLabelText("发送")).toBeEnabled());
+    await sendText("在吗");
+
+    // 面板里的字数应当就是 2（"分析"），而不是 4
+    expect(await screen.findByText("2 字")).toBeInTheDocument();
+    expect(screen.getAllByText("分析")).toHaveLength(1);
   });
 });
