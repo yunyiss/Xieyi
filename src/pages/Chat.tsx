@@ -88,7 +88,10 @@ export function Chat({
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
+  /** 发送 / 生成阶段的错误：浮在输入框上方提示，不占排版 */
   const [error, setError] = useState("");
+  /** 环境类问题（运行时没装、引擎起不来、模型列表拉不到）：走空状态区，不当"报错"砸出来 */
+  const [setupError, setSetupError] = useState("");
   const [sessions, setSessions] = useState<Session[]>([]);
   const [sessionId, setSessionId] = useState(() => newId());
   const [load, setLoad] = useState<LoadState | null>(null);
@@ -120,8 +123,11 @@ export function Chat({
 
       setSessions(await listSessions());
       setLocalModels(await listLocalModels());
+      setSetupError("");
     } catch (e) {
-      setError(String(e));
+      // 运行时未安装 / 引擎未启动属于"还没准备好"，不是"出错了"：
+      // 交给列表空状态说明，别弹成一条红色错误
+      setSetupError(String(e));
     }
   }, []);
 
@@ -386,10 +392,26 @@ export function Chat({
         style={{ background: "var(--surface)", borderColor: "var(--border)" }}
       >
         {messages.length === 0 && (
-          <div className="flex h-full items-center justify-center">
-            <p className="m-0 text-[13px]" style={{ color: "var(--text-muted)" }}>
-              选好模型后直接输入，发送时才会加载模型
-            </p>
+          <div className="flex h-full items-center justify-center px-4">
+            {setupError ? (
+              // 环境没就绪时给个"该怎么办"，而不是一行红字
+              <div className="max-w-[420px] text-center">
+                <p className="m-0 text-[13px]" style={{ color: "var(--text-muted)" }}>
+                  {setupError}
+                </p>
+                <p
+                  className="m-0 mt-1.5 text-[12px] leading-relaxed"
+                  style={{ color: "var(--text-muted)", opacity: 0.75 }}
+                >
+                  到「翻译」页安装推理运行时，或在右上角「设置」里确认模型目录已放入
+                  .gguf 模型。就绪后这里会自动出现模型。
+                </p>
+              </div>
+            ) : (
+              <p className="m-0 text-[13px]" style={{ color: "var(--text-muted)" }}>
+                选好模型后直接输入，发送时才会加载模型
+              </p>
+            )}
           </div>
         )}
 
@@ -479,84 +501,117 @@ export function Chat({
 
       {load && <LoadIndicator load={load} />}
 
-      {/* 输入区：整块作为一个输入容器，模型与发送都在底部一行 */}
-      <div
-        className="flex flex-col rounded-xl border px-2 py-2 transition-colors focus-within:border-[var(--brand)]"
-        style={{ background: "var(--surface)", borderColor: "var(--border)" }}
-      >
-        <textarea
-          className="min-h-[52px] w-full resize-none bg-transparent px-1 py-1 text-[13px] leading-relaxed outline-none"
-          placeholder="输入消息…"
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
-              send();
-            }
-          }}
-        />
-
-        <div className="flex items-center gap-1.5 pt-1">
-          <span
-            className="hidden shrink-0 text-[11px] sm:inline"
-            style={{ color: "var(--text-muted)", opacity: 0.7 }}
+      {/* 输入区：整块作为一个输入容器，模型与发送都在底部一行。
+          错误提示浮在输入框上方，不再参与排版，避免出错时把输入框顶上去一行 */}
+      <div className="relative">
+        {error && (
+          <div
+            className="absolute bottom-full left-0 right-0 z-20 mb-2 flex max-h-[32vh] items-start gap-2 overflow-auto rounded-lg border px-3 py-2 text-[12px] leading-relaxed shadow-lg"
+            style={{
+              background: "var(--surface)",
+              borderColor: "color-mix(in srgb, var(--danger) 38%, var(--border))",
+              color: "var(--danger)",
+            }}
+            role="alert"
           >
-            Enter 发送 · Shift+Enter 换行
-          </span>
-
-          {/* 右侧一组：上下文圆环 → 模型/思考 → 发送/停止 */}
-          <div className="ml-auto flex min-w-0 shrink items-center gap-1">
-            <ContextMeter
-              usage={usage}
-              ctxSize={currentModel?.ctxSize ?? 0}
-              totals={totals}
-            />
-
-            <ModelPicker
-              models={models}
-              model={model}
-              onModel={setModel}
-              thinking={thinking}
-              onThinking={setThinking}
-              thinkingSupported={supportsThinking}
-              disabled={busy}
-            />
-
-            <button
-              className="flex h-9 w-9 items-center justify-center rounded-full text-white transition-colors disabled:opacity-40"
-              style={{ background: busy ? "var(--text-muted)" : "var(--brand)" }}
-              onClick={() => (busy ? abort(model) : send())}
-              disabled={!busy && !model}
-              aria-label={busy ? "停止" : "发送"}
-              title={busy ? (load ? "停止加载" : "停止生成") : "发送（Enter）"}
+            <svg
+              className="mt-0.5 h-3.5 w-3.5 shrink-0"
+              viewBox="0 0 24 24"
+              fill="none"
+              aria-hidden
             >
-              {busy ? (
-                // 停止：一个方块，和发送的箭头区分开
-                <svg width="12" height="12" viewBox="0 0 24 24" aria-hidden>
-                  <rect x="5" y="5" width="14" height="14" rx="2" fill="currentColor" />
-                </svg>
-              ) : (
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden>
-                  <path
-                    d="M12 19V5M5.5 11.5 12 5l6.5 6.5"
-                    stroke="currentColor"
-                    strokeWidth="1.9"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                  />
-                </svg>
-              )}
+              <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="1.8" />
+              <path
+                d="M12 7.5v6M12 16.5v.01"
+                stroke="currentColor"
+                strokeWidth="1.9"
+                strokeLinecap="round"
+              />
+            </svg>
+            <span className="min-w-0 flex-1 break-words">{error}</span>
+            <button
+              className="shrink-0 rounded px-1 text-[14px] leading-none opacity-50 transition-opacity hover:opacity-100"
+              onClick={() => setError("")}
+              aria-label="关闭提示"
+              title="关闭"
+            >
+              ×
             </button>
+          </div>
+        )}
+
+        <div
+          className="flex flex-col rounded-xl border px-2 py-2 transition-colors focus-within:border-[var(--brand)]"
+          style={{ background: "var(--surface)", borderColor: "var(--border)" }}
+        >
+          <textarea
+            className="min-h-[52px] w-full resize-none bg-transparent px-1 py-1 text-[13px] leading-relaxed outline-none"
+            placeholder="输入消息…"
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                send();
+              }
+            }}
+          />
+
+          <div className="flex items-center gap-1.5 pt-1">
+            <span
+              className="hidden shrink-0 text-[11px] sm:inline"
+              style={{ color: "var(--text-muted)", opacity: 0.7 }}
+            >
+              Enter 发送 · Shift+Enter 换行
+            </span>
+
+            {/* 右侧一组：上下文圆环 → 模型/思考 → 发送/停止 */}
+            <div className="ml-auto flex min-w-0 shrink items-center gap-1">
+              <ContextMeter
+                usage={usage}
+                ctxSize={currentModel?.ctxSize ?? 0}
+                totals={totals}
+              />
+
+              <ModelPicker
+                models={models}
+                model={model}
+                onModel={setModel}
+                thinking={thinking}
+                onThinking={setThinking}
+                thinkingSupported={supportsThinking}
+                disabled={busy}
+              />
+
+              <button
+                className="flex h-9 w-9 items-center justify-center rounded-full text-white transition-colors disabled:opacity-40"
+                style={{ background: busy ? "var(--text-muted)" : "var(--brand)" }}
+                onClick={() => (busy ? abort(model) : send())}
+                disabled={!busy && !model}
+                aria-label={busy ? "停止" : "发送"}
+                title={busy ? (load ? "停止加载" : "停止生成") : "发送（Enter）"}
+              >
+                {busy ? (
+                  // 停止：一个方块，和发送的箭头区分开
+                  <svg width="12" height="12" viewBox="0 0 24 24" aria-hidden>
+                    <rect x="5" y="5" width="14" height="14" rx="2" fill="currentColor" />
+                  </svg>
+                ) : (
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden>
+                    <path
+                      d="M12 19V5M5.5 11.5 12 5l6.5 6.5"
+                      stroke="currentColor"
+                      strokeWidth="1.9"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    />
+                  </svg>
+                )}
+              </button>
+            </div>
           </div>
         </div>
       </div>
-
-      {error && (
-        <p className="m-0 text-[12px]" style={{ color: "var(--danger)" }}>
-          {error}
-        </p>
-      )}
     </div>
   );
 }

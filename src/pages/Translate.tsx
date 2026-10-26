@@ -481,36 +481,31 @@ export function Translate({
 
       {/* 操作区 */}
       <div className="flex items-center gap-3">
+        {/* 发送与停止合用一个键：翻译中变成「停止」，和对话页保持一致 */}
         <button
           className="h-10 rounded-lg px-5 text-[13px] font-medium text-white transition-colors disabled:opacity-50"
-          style={{ background: "var(--brand)" }}
-          onMouseEnter={(e) =>
-            (e.currentTarget.style.background = "var(--brand-hover)")
-          }
-          onMouseLeave={(e) =>
-            (e.currentTarget.style.background = "var(--brand)")
-          }
-          disabled={!ready || busy}
-          onClick={handleRun}
+          style={{ background: busy ? "var(--text-muted)" : "var(--brand)" }}
+          onMouseEnter={(e) => {
+            if (!busy) e.currentTarget.style.background = "var(--brand-hover)";
+          }}
+          onMouseLeave={(e) => {
+            e.currentTarget.style.background = busy
+              ? "var(--text-muted)"
+              : "var(--brand)";
+          }}
+          disabled={!busy && !ready}
+          onClick={busy ? handleStop : handleRun}
         >
-          {load?.state === "warming"
-            ? "预热中…"
-            : load
-              ? "加载模型中…"
-              : busy
-                ? "翻译中…"
+          {busy
+            ? load
+              ? "停止加载"
+              : "停止"
+            : load?.state === "warming"
+              ? "预热中…"
+              : load
+                ? "加载模型中…"
                 : "运行翻译"}
         </button>
-
-        {busy && (
-          <button
-            className="h-10 rounded-lg border px-4 text-[13px]"
-            style={selectStyle}
-            onClick={handleStop}
-          >
-            {load ? "停止加载" : "停止"}
-          </button>
-        )}
 
         {error && (
           <span className="text-[12px]" style={{ color: "var(--danger)" }}>

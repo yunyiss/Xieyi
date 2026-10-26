@@ -475,36 +475,31 @@ export function Batch({ refreshSignal = 0, active = true }: Props) {
           添加文件
         </button>
 
+        {/* 开始与停止合用一个键：跑起来后变成「停止」，和翻译页、对话页一致 */}
         <button
           className="h-10 rounded-lg px-5 text-[13px] font-medium text-white transition-colors disabled:opacity-50"
-          style={{ background: "var(--brand)" }}
-          onMouseEnter={(e) =>
-            (e.currentTarget.style.background = "var(--brand-hover)")
-          }
-          onMouseLeave={(e) =>
-            (e.currentTarget.style.background = "var(--brand)")
-          }
-          onClick={start}
-          disabled={!ready || running || queue.length === 0}
+          style={{ background: running ? "var(--text-muted)" : "var(--brand)" }}
+          onMouseEnter={(e) => {
+            if (!running) e.currentTarget.style.background = "var(--brand-hover)";
+          }}
+          onMouseLeave={(e) => {
+            e.currentTarget.style.background = running
+              ? "var(--text-muted)"
+              : "var(--brand)";
+          }}
+          onClick={running ? stop : start}
+          disabled={!running && (!ready || queue.length === 0)}
         >
-          {load
-            ? load.state === "warming"
-              ? "预热中…"
-              : "加载模型中…"
-            : running
-              ? "翻译中…"
+          {running
+            ? load
+              ? "停止加载"
+              : "停止"
+            : load
+              ? load.state === "warming"
+                ? "预热中…"
+                : "加载模型中…"
               : "开始翻译"}
         </button>
-
-        {running && (
-          <button
-            className="h-10 rounded-lg border px-4 text-[13px]"
-            style={btnStyle}
-            onClick={stop}
-          >
-            停止
-          </button>
-        )}
 
         {summary && (
           <span className="text-[12px]" style={{ color: "var(--text-muted)" }}>
