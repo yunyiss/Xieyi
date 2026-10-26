@@ -32,6 +32,29 @@ function newId(): string {
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
+/**
+ * 合并相邻的同角色消息。
+ *
+ * 删掉某条回复后，上下文里可能出现连续两条 user（或连续 assistant）。
+ * 不少对话模板（Qwen 一类）要求角色严格交替，遇到不交替会直接报错，
+ * 所以发请求前把相邻同角色合并成一条，用空行分隔原文。
+ */
+function normalizeHistory(messages: ChatMessage[]): ChatMessage[] {
+  const out: ChatMessage[] = [];
+  for (const m of messages) {
+    const last = out[out.length - 1];
+    if (last && last.role === m.role) {
+      out[out.length - 1] = {
+        ...last,
+        content: `${last.content}\n\n${m.content}`.trim(),
+      };
+    } else {
+      out.push({ ...m });
+    }
+  }
+  return out;
+}
+
 interface Props {
   /** 设置抽屉里改动后递增，用于触发重新扫描。 */
   refreshSignal?: number;
@@ -94,6 +117,8 @@ export function Chat({
   const [totals, setTotals] = useState({ prompt: 0, generated: 0 });
   const [localModels, setLocalModels] = useState<LocalModel[]>([]);
   const [thinking, setThinking] = useState<ThinkingMode>("off");
+  /** 正在编辑并准备重发的用户消息（只允许同时编辑一条） */
+  const [editing, setEditing] = useState<{ index: number; text: string } | null>(null);
   /** 本次发送要附加的快捷指令（不写进会话历史，只作用于这一轮） */
   const [instruction, setInstruction] = useState<typeof QUICK_ACTIONS[number] | null>(
     null,
@@ -255,7 +280,12 @@ export function Chat({
     });
 
     try {
-      const full = await chat({ requestId: id, model, messages: outbound, thinking });
+      const full = await chat({
+        requestId: id,
+        model,
+        messages: normalizeHistory(outbound),
+        thinking,
+      });
       const finalMessages: ChatMessage[] = [
         ...display,
         { role: "assistant", content: full },
@@ -304,17 +334,71 @@ export function Chat({
     await sendWith(history, outbound);
   };
 
-  /** 丢掉最后一条助手回复，用同样的用户输入重新生成。 */
-  const regenerate = async () => {
+  /**
+   * 从第 `index` 条（助手回复）重新生成：保留它之前的全部上下文，
+   * 丢掉这条及之后的所有消息，相当于"把对话回滚到这里再问一次"。
+   */
+  const regenerateAt = async (index: number) => {
     if (busy) return;
-    const current = messagesRef.current;
-    if (current.length < 2) return;
+    const before = messagesRef.current.slice(0, index);
+    if (before.length === 0 || before[before.length - 1].role !== "user") return;
 
-    const withoutLast = current.slice(0, -1);
-    if (withoutLast[withoutLast.length - 1].role !== "user") return;
+    setMessages([...before, { role: "assistant", content: "" }]);
+    await sendWith(before, before);
+  };
 
-    setMessages([...withoutLast, { role: "assistant", content: "" }]);
-    await sendWith(withoutLast, withoutLast);
+  /** 删掉单条消息（用户提问或助手回复都可以），其余上下文保持不变。 */
+  const deleteAt = async (index: number) => {
+    if (busy) return;
+    const next = messagesRef.current.filter((_, i) => i !== index);
+    setMessages(next);
+    // 全删光了就把会话文件一起删掉，别在列表里留一条空壳
+    if (next.length === 0) {
+      try {
+        await deleteSession(sessionId);
+        setSessions(await listSessions());
+        newSession();
+      } catch (e) {
+        setError(String(e));
+      }
+      return;
+    }
+    await persist(next, model, sessionId);
+  };
+
+  /** 进入"编辑并重发"：只允许改用户消息。 */
+  const startEdit = (index: number) => {
+    const target = messagesRef.current[index];
+    if (!target || target.role !== "user") return;
+    setEditing({ index, text: target.content });
+  };
+
+  /** 重试：最后一条提问没有拿到回复时（失败/中断），原样再发一次。 */
+  const resendAt = async (index: number) => {
+    const target = messagesRef.current[index];
+    if (busy || !target || target.role !== "user") return;
+
+    const history = messagesRef.current.slice(0, index + 1);
+    setMessages([...history, { role: "assistant", content: "" }]);
+    await sendWith(history, history);
+  };
+
+  /**
+   * 提交编辑：把这条用户消息换成新内容，它之后的所有消息作废，
+   * 然后重新请求回答——等同于"撤回并重发"。
+   */
+  const submitEdit = async () => {
+    const draft = editing;
+    if (!draft) return;
+    const text = draft.text.trim();
+    if (!text) return;
+
+    setEditing(null);
+    const before = messagesRef.current.slice(0, draft.index);
+    const history: ChatMessage[] = [...before, { role: "user", content: text }];
+
+    setMessages([...history, { role: "assistant", content: "" }]);
+    await sendWith(history, history);
   };
 
   const switchSession = (id: string) => {
@@ -326,6 +410,7 @@ export function Chat({
     if (target.model) setModel(target.model);
     setTotals({ prompt: 0, generated: 0 });
     setError("");
+    setEditing(null);
   };
 
   const newSession = () => {
@@ -333,6 +418,7 @@ export function Chat({
     setMessages([]);
     setTotals({ prompt: 0, generated: 0 });
     setError("");
+    setEditing(null);
   };
 
   const removeSession = async (id: string) => {
@@ -415,56 +501,129 @@ export function Chat({
           </div>
         )}
 
-        <div className="flex flex-col gap-4">
+        <div className="flex flex-col gap-3">
           {messages.map((m, i) => {
             const isUser = m.role === "user";
             const isLast = i === messages.length - 1;
+            const isEditing = editing?.index === i;
+
             return (
-              <div
-                key={i}
-                className={`flex ${isUser ? "justify-end" : "justify-start"}`}
-              >
-                {isUser ? (
-                  // 用户消息用小气泡，助手回复直接铺开，贴近 Codex / DeepSeek 的克制感
+              <div key={i} className="group flex flex-col gap-1">
+                <div className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
+                  {isEditing ? (
+                    // 编辑态：换成可改的输入框，保存即"替换这条并重发"
+                    <div className="w-full max-w-[78%]">
+                      <textarea
+                        autoFocus
+                        className="field w-full resize-none px-3 py-2 text-[13px] leading-relaxed"
+                        rows={Math.min(8, Math.max(2, editing.text.split("\n").length + 1))}
+                        value={editing.text}
+                        onChange={(e) =>
+                          setEditing((prev) => (prev ? { ...prev, text: e.target.value } : prev))
+                        }
+                        onKeyDown={(e) => {
+                          if (e.key === "Escape") {
+                            e.preventDefault();
+                            setEditing(null);
+                          }
+                          if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+                            e.preventDefault();
+                            submitEdit();
+                          }
+                        }}
+                      />
+                      <div className="mt-1 flex items-center justify-end gap-2 text-[11px]">
+                        <button
+                          className="btn rounded px-1 py-0.5 opacity-70 hover:opacity-100"
+                          style={{ color: "var(--text-muted)" }}
+                          onClick={() => setEditing(null)}
+                          title="取消（Esc）"
+                        >
+                          取消
+                        </button>
+                        <button
+                          className="btn rounded px-1 py-0.5 font-medium disabled:opacity-40"
+                          style={{ color: "var(--brand-text)" }}
+                          disabled={!editing.text.trim() || busy}
+                          onClick={submitEdit}
+                          title="保存并重新请求回答（Ctrl+Enter）"
+                        >
+                          保存并重发
+                        </button>
+                      </div>
+                    </div>
+                  ) : isUser ? (
+                    // 用户消息用小气泡，助手回复直接铺开，贴近 Codex / DeepSeek 的克制感
+                    <div
+                      className="max-w-[78%] whitespace-pre-wrap rounded-2xl px-3 py-1.5 text-[13px]"
+                      style={{
+                        background: "var(--brand-soft)",
+                        color: "var(--brand-text)",
+                      }}
+                    >
+                      {m.content}
+                    </div>
+                  ) : (
+                    <div
+                      className="max-w-[94%] whitespace-pre-wrap px-0.5 text-[13px] leading-relaxed"
+                      style={{ color: "var(--text)" }}
+                    >
+                      {m.content || (busy && isLast ? "…" : "")}
+                    </div>
+                  )}
+                </div>
+
+                {/* 每条消息的动作条：平时隐形，指上来才出现，不干扰阅读 */}
+                {!isEditing && !busy && (
                   <div
-                    className="max-w-[78%] whitespace-pre-wrap rounded-2xl px-3 py-1.5 text-[13px]"
-                    style={{
-                      background: "var(--brand-soft)",
-                      color: "var(--brand-text)",
-                    }}
+                    className={`flex gap-3 text-[11px] opacity-0 transition-opacity duration-150 group-hover:opacity-100 focus-within:opacity-100 ${
+                      isUser ? "justify-end pr-1" : "justify-start pl-0.5"
+                    }`}
                   >
-                    {m.content}
-                  </div>
-                ) : (
-                  <div
-                    className="max-w-[94%] whitespace-pre-wrap px-0.5 text-[13px] leading-relaxed"
-                    style={{ color: "var(--text)" }}
-                  >
-                    {m.content || (busy && isLast ? "…" : "")}
+                    {isUser ? (
+                      <>
+                        <MsgAction onClick={() => startEdit(i)} title="改这条并重新请求回答">
+                          编辑
+                        </MsgAction>
+                        {/* 最后一条提问没有回复（失败/中断）时，给一个原样重试 */}
+                        {isLast && (
+                          <MsgAction onClick={() => resendAt(i)} title="原样再发一次">
+                            重试
+                          </MsgAction>
+                        )}
+                        <MsgAction onClick={() => deleteAt(i)} title="从上下文里移除这条提问">
+                          删除
+                        </MsgAction>
+                      </>
+                    ) : (
+                      <>
+                        {m.content && (
+                          <MsgAction onClick={() => copyText(m.content)} title="复制这条回复">
+                            复制
+                          </MsgAction>
+                        )}
+                        {i > 0 && m.content && (
+                          <MsgAction
+                            onClick={() => regenerateAt(i)}
+                            title="从这条之前重新生成，之后的对话会丢弃"
+                          >
+                            重新生成
+                          </MsgAction>
+                        )}
+                        <MsgAction
+                          danger
+                          onClick={() => deleteAt(i)}
+                          title="从上下文里移除这条回复"
+                        >
+                          删除
+                        </MsgAction>
+                      </>
+                    )}
                   </div>
                 )}
               </div>
             );
           })}
-
-          {!busy && messages.length > 0 && messages[messages.length - 1].role === "assistant" && (
-            <div className="flex justify-start gap-3 text-[11px]">
-              <button
-                className="rounded px-0 py-0.5 transition-opacity hover:opacity-70"
-                style={{ color: "var(--text-muted)" }}
-                onClick={regenerate}
-              >
-                重新生成
-              </button>
-              <button
-                className="rounded px-0 py-0.5 transition-opacity hover:opacity-70"
-                style={{ color: "var(--text-muted)" }}
-                onClick={() => copyText(messages[messages.length - 1].content)}
-              >
-                复制
-              </button>
-            </div>
-          )}
         </div>
       </section>
 
@@ -610,5 +769,29 @@ export function Chat({
         </div>
       </div>
     </div>
+  );
+}
+
+/** 消息下方的小动作：平时隐形，悬停整条消息时出现。 */
+function MsgAction({
+  children,
+  onClick,
+  title,
+  danger = false,
+}: {
+  children: React.ReactNode;
+  onClick: () => void;
+  title: string;
+  danger?: boolean;
+}) {
+  return (
+    <button
+      className="btn rounded px-0.5 py-0.5 opacity-70 hover:opacity-100"
+      style={{ color: danger ? "var(--danger)" : "var(--text-muted)" }}
+      onClick={onClick}
+      title={title}
+    >
+      {children}
+    </button>
   );
 }
