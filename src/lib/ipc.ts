@@ -77,6 +77,17 @@ export interface TranslateProgress {
   total: number;
 }
 
+/** 质检报告：某段译文被查出问题（后端已自动带纠正提示重试一次）。 */
+export interface QualityReport {
+  requestId: string;
+  /** 出问题那段的开头几个字 */
+  segment: string;
+  /** 检出了什么，例如「疑似截断（原文 120 字，译文仅 8 字）」 */
+  found: string;
+  /** 重试后是否修好 */
+  fixed: boolean;
+}
+
 /**
  * 模型状态事件。`loading` / `warming` 时附带加载阶段信息，用于显示进度。
  * `percent` 是按模型体积估算的，不是 llama.cpp 的真实进度。
@@ -171,6 +182,8 @@ export const saveSession = (session: Session) =>
   invoke<void>("save_session", { session });
 export const deleteSession = (id: string) =>
   invoke<void>("delete_session", { id });
+/** 清空全部历史会话，返回删掉的数量。 */
+export const deleteAllSessions = () => invoke<number>("delete_all_sessions");
 export const getGlossary = () => invoke<GlossaryEntry[]>("get_glossary");
 export const setGlossary = (entries: GlossaryEntry[]) =>
   invoke<void>("set_glossary", { entries });
@@ -208,6 +221,11 @@ export const onTranslateProgress = (
   cb: (p: TranslateProgress) => void,
 ): Promise<UnlistenFn> =>
   listen<TranslateProgress>("translate://progress", (e) => cb(e.payload));
+
+export const onQualityReport = (
+  cb: (p: QualityReport) => void,
+): Promise<UnlistenFn> =>
+  listen<QualityReport>("translate://quality", (e) => cb(e.payload));
 
 export const onModelState = (
   cb: (p: ModelStatePayload) => void,

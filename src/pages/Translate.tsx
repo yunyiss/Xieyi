@@ -10,6 +10,7 @@ import {
   listRouterModels,
   newRequestId,
   onModelState,
+  onQualityReport,
   onRuntimeProgress,
   onToken,
   onTranslateProgress,
@@ -19,6 +20,7 @@ import {
   startService,
   stopService,
   translate,
+  type QualityReport,
   type RouterModel,
   type RuntimeProgress,
   type RuntimeStatus,
@@ -61,6 +63,32 @@ function stageLabel(stage: RuntimeProgress["stage"]): string {
   }
 }
 
+/** 质检提示：平时只是一个数字，鼠标悬停才展开细节，不打扰正常翻译。 */
+function QualityNote({ reports }: { reports: QualityReport[] }) {
+  const unfixed = reports.filter((r) => !r.fixed).length;
+  const text =
+    unfixed > 0
+      ? `质检 ${reports.length} 段 · ${unfixed} 段仍可疑`
+      : `已自动修正 ${reports.length} 段`;
+
+  const detail = reports
+    .map(
+      (r) =>
+        `「${r.segment}…」${r.found}${r.fixed ? "（已修正）" : "（重试后仍可疑）"}`,
+    )
+    .join("\n");
+
+  return (
+    <span
+      className="min-w-0 truncate"
+      style={{ color: unfixed > 0 ? "var(--danger)" : "var(--brand-text)" }}
+      title={detail}
+    >
+      {text}
+    </span>
+  );
+}
+
 interface Props {
   /** 设置抽屉里改动后递增，用于触发重新扫描。 */
   refreshSignal?: number;
@@ -93,6 +121,8 @@ export function Translate({
     done: 0,
     total: 0,
   });
+  /** 本次翻译里被质检挑出问题、已自动重试的片段 */
+  const [quality, setQuality] = useState<QualityReport[]>([]);
 
   const unlistenRef = useRef<UnlistenFn | null>(null);
 
@@ -129,6 +159,18 @@ export function Translate({
   useEffect(() => {
     let un: UnlistenFn | null = null;
     onTranslateProgress(setSegmentProgress).then((fn) => (un = fn));
+    return () => {
+      un?.();
+    };
+  }, []);
+
+  // 质检报告：后端发现译文有问题并自动重试过。批量任务的 requestId 为空，不在这里显示
+  useEffect(() => {
+    let un: UnlistenFn | null = null;
+    onQualityReport((p) => {
+      if (!p.requestId) return;
+      setQuality((prev) => [...prev, p]);
+    }).then((fn) => (un = fn));
     return () => {
       un?.();
     };
@@ -200,6 +242,7 @@ export function Translate({
     setOutput("");
     setBusy(true);
     setSegmentProgress({ done: 0, total: 0 });
+    setQuality([]);
 
     const id = newRequestId();
     unlistenRef.current?.();
@@ -456,12 +499,15 @@ export function Translate({
             style={{ borderColor: "var(--border)", color: "var(--text-muted)" }}
           >
             <span>译文</span>
-            <span>
-              {busy
-                ? segmentProgress.total > 1
-                  ? `翻译中 ${segmentProgress.done}/${segmentProgress.total}`
-                  : "翻译中…"
-                : model || "—"}
+            <span className="flex min-w-0 items-center gap-2.5">
+              {quality.length > 0 && <QualityNote reports={quality} />}
+              <span className="shrink-0">
+                {busy
+                  ? segmentProgress.total > 1
+                    ? `翻译中 ${segmentProgress.done}/${segmentProgress.total}`
+                    : "翻译中…"
+                  : model || "—"}
+              </span>
             </span>
           </header>
           <div className="min-h-0 flex-1 overflow-auto p-3">

@@ -3,9 +3,11 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 import { LoadIndicator, toLoadState, type LoadState } from "../components/LoadIndicator";
 import { ContextMeter } from "../components/ContextMeter";
 import { ModelPicker } from "../components/ModelPicker";
+import { SessionPicker } from "../components/SessionPicker";
 import {
   abort,
   chat,
+  deleteAllSessions,
   deleteSession,
   listLocalModels,
   listRouterModels,
@@ -22,15 +24,6 @@ import {
   type ThinkingMode,
   type UsagePayload,
 } from "../lib/ipc";
-
-const controlStyle = {
-  background: "var(--surface)",
-  borderColor: "var(--border)",
-  color: "var(--text)",
-};
-
-const controlClass =
-  "h-8 rounded-lg border px-2 text-[12px] outline-none focus:border-[var(--brand)]";
 
 function newId(): string {
   const c = globalThis.crypto as Crypto | undefined;
@@ -321,11 +314,22 @@ export function Chat({
     setError("");
   };
 
-  const removeSession = async () => {
+  const removeSession = async (id: string) => {
     try {
-      await deleteSession(sessionId);
+      await deleteSession(id);
+      // 删掉的正是当前这条，就顺手开一个新的，避免停在一个已经不存在的会话上
+      if (id === sessionId) newSession();
       setSessions(await listSessions());
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const removeAllSessions = async () => {
+    try {
+      await deleteAllSessions();
       newSession();
+      setSessions(await listSessions());
     } catch (e) {
       setError(String(e));
     }
@@ -346,42 +350,21 @@ export function Chat({
 
   return (
     <div className="flex h-full flex-col gap-3 p-4">
-      {/* 会话栏 */}
+      {/* 会话栏：一个选择器就能切换、删除任意一条历史 */}
       <div className="flex flex-nowrap items-center gap-2">
-        <select
-          className={`${controlClass} min-w-0 max-w-[240px] flex-1`}
-          style={controlStyle}
-          value={sessionId}
-          onChange={(e) => switchSession(e.target.value)}
-        >
-          <option value={sessionId}>{sessionTitle}</option>
-          {sessions
-            .filter((s) => s.id !== sessionId)
-            .map((s) => (
-              <option key={s.id} value={s.id}>
-                {s.title}
-              </option>
-            ))}
-        </select>
-
-        <button
-          className="h-8 shrink-0 rounded-lg border px-2.5 text-[12px]"
-          style={controlStyle}
-          onClick={newSession}
-        >
-          新对话
-        </button>
-        <button
-          className="h-8 shrink-0 rounded-lg border px-2.5 text-[12px]"
-          style={controlStyle}
-          onClick={removeSession}
-          disabled={!sessions.some((s) => s.id === sessionId)}
-        >
-          删除
-        </button>
+        <SessionPicker
+          sessions={sessions}
+          currentId={sessionId}
+          currentTitle={sessionTitle}
+          onPick={switchSession}
+          onNew={newSession}
+          onDelete={removeSession}
+          onDeleteAll={removeAllSessions}
+          disabled={busy}
+        />
 
         <span className="ml-auto truncate text-[11px]" style={{ color: "var(--text-muted)" }}>
-          会话自动保存
+          对话自动保存在本地
         </span>
       </div>
 

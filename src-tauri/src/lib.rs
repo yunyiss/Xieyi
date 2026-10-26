@@ -3,6 +3,7 @@ mod hardware;
 mod models;
 mod params;
 mod paths;
+mod quality;
 mod runtime;
 mod service;
 mod sessions;
@@ -101,6 +102,7 @@ pub fn run() {
             sessions::list_sessions,
             sessions::save_session,
             sessions::delete_session,
+            sessions::delete_all_sessions,
             batch::batch_translate,
             batch::batch_cancel,
         ])

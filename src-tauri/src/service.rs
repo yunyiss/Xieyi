@@ -9,6 +9,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use crate::models;
 use crate::params::{self, Thinking};
 use crate::paths;
+use crate::quality;
 use crate::runtime;
 use crate::translate as segmenter;
 
@@ -58,6 +59,19 @@ struct UsagePayload {
     ctx_size: u64,
     /// 本次请求耗时（毫秒），用于算 tokens/s
     elapsed_ms: u64,
+}
+
+/// 质检报告：某个片段翻完之后被查出了问题（可能已重试修好）。
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct QualityPayload {
+    request_id: String,
+    /// 出问题那段的开头几个字，方便定位
+    segment: String,
+    /// 检出了什么
+    found: String,
+    /// 重试后是否修好
+    fixed: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -410,7 +424,7 @@ impl Service {
         Ok(())
     }
 
-    /// 翻译单个片段：命中缓存直接返回，否则流式推理并回填缓存。
+    /// 翻译单个片段：命中缓存直接返回，否则流式推理、质检、必要时重试一次，再回填缓存。
     ///
     /// `request_id` 为 `None` 时不会向前端推送 token —— 批量任务走这条路径，
     /// 避免把批量过程的中间结果灌进翻译页的输出框。
@@ -439,20 +453,25 @@ impl Service {
                     },
                 );
             }
+            // 缓存里的结果在写入前已经过了质检，不必再查一次
             return Ok(hit);
         }
 
-        let messages = serde_json::json!([
-            { "role": "system", "content": system_prompt(source, target, glossary) },
-            { "role": "user", "content": text }
-        ]);
+        let terms: Vec<quality::Term> = glossary
+            .iter()
+            .map(|e| quality::Term {
+                from: &e.from,
+                to: &e.to,
+            })
+            .collect();
 
-        let translated = stream_completion(
+        let prompt = system_prompt(source, target, glossary);
+        let first = stream_completion(
             app,
             self,
             request_id.unwrap_or_default(),
             model,
-            messages,
+            segment_messages(&prompt, text),
             0.2,
             1024,
             // 翻译不让模型思考：既慢又容易把输出预算吃光
@@ -461,12 +480,59 @@ impl Service {
         )
         .await?;
 
+        let report = quality::check(text, &first, &terms);
+        // 首次检出的问题（用户看到的是"发现了什么"，不是重试之后的状态）
+        let found = report.describe();
+        let mut best = first;
+        let mut best_report = report;
+        let mut fixed = true;
+
+        // 有问题就带纠正提示重试一次。重试**不推流**：第一次的内容已经流到界面上了，
+        // 再流一遍会在输出框里重复一遍；翻译页最后会用返回值整体覆盖显示。
+        // 已经被取消就不重试了，那只会白跑一次请求。
+        if !best_report.is_ok() && !cancel.load(Ordering::Relaxed) {
+            fixed = false;
+            let hinted = system_prompt_with_hint(source, target, glossary, &best_report);
+            let second = stream_completion(
+                app,
+                self,
+                "",
+                model,
+                segment_messages(&hinted, text),
+                0.2,
+                1024,
+                Thinking::Off,
+                cancel,
+            )
+            .await;
+
+            if let Ok(second) = second {
+                let second_report = quality::check(text, &second, &terms);
+                // 只有确实更干净（或同样干净但更完整）才采用，避免越改越糟
+                if quality::better_than(&second, &second_report, &best, &best_report) {
+                    best = second;
+                    best_report = second_report;
+                    fixed = best_report.is_ok();
+                }
+            }
+
+            let _ = app.emit(
+                "translate://quality",
+                QualityPayload {
+                    request_id: request_id.unwrap_or_default().to_string(),
+                    segment: text.chars().take(24).collect(),
+                    found,
+                    fixed,
+                },
+            );
+        }
+
         let mut cache = state.cache.lock().await;
         if cache.len() > 4000 {
             cache.clear();
         }
-        cache.insert(key, translated.clone());
-        Ok(translated)
+        cache.insert(key, best.clone());
+        Ok(best)
     }
 
     pub async fn load(
@@ -983,6 +1049,41 @@ mod tests {
     fn empty_reply_without_thinking_stays_generic() {
         assert_eq!(empty_reply_message(0, 1024), "模型没有返回内容，请重试。");
     }
+
+    #[test]
+    fn retry_prompt_keeps_the_base_and_appends_the_hint() {
+        let glossary = vec![GlossaryEntry {
+            from: "apple".into(),
+            to: "苹果".into(),
+        }];
+        let base = system_prompt("en", "zh", &glossary);
+        assert!(!base.contains("previous attempt"), "基础提示不该提重试");
+
+        // 译文丢了列表、也没用上术语表指定的"苹果"
+        let report = quality::check(
+            "- apple\n- banana",
+            "红果和香蕉",
+            &[quality::Term {
+                from: "apple",
+                to: "苹果",
+            }],
+        );
+        assert!(!report.is_ok());
+
+        let hinted = system_prompt_with_hint("en", "zh", &glossary, &report);
+        assert!(hinted.starts_with(&base), "重试提示应建立在基础提示之上");
+        assert!(hinted.contains("Your previous attempt had problems."));
+        assert!(hinted.contains("apple => 苹果"), "应带上具体术语：{hinted}");
+    }
+
+    #[test]
+    fn segment_messages_shapes_system_then_user() {
+        let messages = segment_messages("SYS", "TEXT");
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], "SYS");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"], "TEXT");
+    }
 }
 
 pub(crate) fn load_glossary(app: &AppHandle) -> Vec<GlossaryEntry> {
@@ -1006,6 +1107,29 @@ Output only the translation, without explanations, notes, or quotation marks."
     }
 
     prompt
+}
+
+/// 在基础提示后面追加质检给出的纠正要求，用于重试。
+fn system_prompt_with_hint(
+    source: &str,
+    target: &str,
+    glossary: &[GlossaryEntry],
+    report: &quality::Report,
+) -> String {
+    let mut prompt = system_prompt(source, target, glossary);
+    if let Some(hint) = report.retry_hint() {
+        prompt.push_str("\n\nYour previous attempt had problems. ");
+        prompt.push_str(&hint);
+    }
+    prompt
+}
+
+/// 拼一次翻译请求的消息体。
+fn segment_messages(prompt: &str, text: &str) -> serde_json::Value {
+    serde_json::json!([
+        { "role": "system", "content": prompt },
+        { "role": "user", "content": text }
+    ])
 }
 
 fn cache_key(

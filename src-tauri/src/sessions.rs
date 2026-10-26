@@ -69,9 +69,35 @@ pub fn save_session(app: AppHandle, mut session: Session) -> Result<(), String> 
 
 #[tauri::command]
 pub fn delete_session(app: AppHandle, id: String) -> Result<(), String> {
+    // 只允许用 id 拼文件名，防住 ../ 之类的越界
+    if id.is_empty() || id.contains(['/', '\\', '.']) {
+        return Err("会话 id 不合法".into());
+    }
+
     let path = sessions_dir(&app)?.join(format!("{id}.json"));
     if path.exists() {
         std::fs::remove_file(path).map_err(|e| format!("删除会话失败: {e}"))?;
     }
     Ok(())
+}
+
+/// 删除全部会话，返回实际删掉的数量。
+///
+/// 上下文只存在本地，用户要能一键清干净，不该出现"删不掉的历史"。
+#[tauri::command]
+pub fn delete_all_sessions(app: AppHandle) -> Result<usize, String> {
+    let dir = sessions_dir(&app)?;
+    let entries = std::fs::read_dir(&dir).map_err(|e| format!("读取会话目录失败: {e}"))?;
+
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("json") {
+            continue;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
