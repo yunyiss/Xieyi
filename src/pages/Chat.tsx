@@ -55,6 +55,8 @@ export function Chat({ refreshSignal = 0 }: Props) {
   const listRef = useRef<HTMLDivElement>(null);
   const unlistenRef = useRef<UnlistenFn | null>(null);
   const messagesRef = useRef<ChatMessage[]>([]);
+  /** 本次请求已经流出来的文本，用于失败时判断"要不要保留半截回复"。 */
+  const streamedRef = useRef("");
 
   useEffect(() => {
     messagesRef.current = messages;
@@ -135,11 +137,13 @@ export function Chat({ refreshSignal = 0 }: Props) {
 
     setError("");
     setBusy(true);
+    streamedRef.current = "";
 
     const id = newRequestId();
     unlistenRef.current?.();
     unlistenRef.current = await onToken((p) => {
       if (p.requestId !== id) return;
+      streamedRef.current += p.token;
       setMessages((prev) => {
         if (prev.length === 0) return prev;
         const last = prev[prev.length - 1];
@@ -160,7 +164,15 @@ export function Chat({ refreshSignal = 0 }: Props) {
       await persist(finalMessages, model, sessionId);
     } catch (e) {
       setError(String(e));
-      setMessages(history);
+      // 已经流出一部分就留着，别因为报错把用户看到的内容一起抹掉；
+      // 一个字都没有时才收掉空回复气泡，只保留提问。
+      if (!streamedRef.current.trim()) {
+        setMessages((prev) => {
+          const last = prev[prev.length - 1];
+          if (last?.role === "assistant" && !last.content) return prev.slice(0, -1);
+          return prev;
+        });
+      }
     } finally {
       unlistenRef.current?.();
       unlistenRef.current = null;

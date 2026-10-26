@@ -377,7 +377,8 @@ impl Service {
             "model": model,
             "messages": [{ "role": "user", "content": "hi" }],
             "max_tokens": 1,
-            "stream": false
+            "stream": false,
+            "chat_template_kwargs": { "enable_thinking": false }
         });
 
         self.client
@@ -773,6 +774,10 @@ pub struct ChatRequest {
 }
 
 /// 通用的流式补全：负责加载模型、发请求、解析 SSE 并把 token 推给前端。
+///
+/// 思考型模型（Qwen3.5、Qwen3 等）默认先输出思维链。我们的界面不展示思考内容，
+/// 它只会把 `max_tokens` 吃光、让正文变成空字符串，所以统一关闭；
+/// 不支持该参数的模板会忽略它（已在 Hy-MT2 上验证过输出不受影响）。
 async fn stream_completion(
     app: &AppHandle,
     s: &Service,
@@ -790,7 +795,8 @@ async fn stream_completion(
         "messages": messages,
         "stream": true,
         "temperature": temperature,
-        "max_tokens": max_tokens
+        "max_tokens": max_tokens,
+        "chat_template_kwargs": { "enable_thinking": false }
     });
 
     let resp = s
@@ -810,6 +816,8 @@ async fn stream_completion(
     let mut stream = resp.bytes_stream();
     let mut buf = String::new();
     let mut full = String::new();
+    let mut finish_reason = String::new();
+    let mut reasoning_chars = 0usize;
 
     while let Some(chunk) = stream.next().await {
         if cancel.load(Ordering::Relaxed) {
@@ -829,7 +837,17 @@ async fn stream_completion(
                 continue;
             }
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(data) {
-                if let Some(token) = value["choices"][0]["delta"]["content"].as_str() {
+                let choice = &value["choices"][0];
+
+                // 思考型模型的思维链：不展示，但要记下长度用于诊断
+                if let Some(reasoning) = choice["delta"]["reasoning_content"].as_str() {
+                    reasoning_chars += reasoning.chars().count();
+                }
+                if let Some(reason) = choice["finish_reason"].as_str() {
+                    finish_reason = reason.to_string();
+                }
+
+                if let Some(token) = choice["delta"]["content"].as_str() {
                     if !token.is_empty() {
                         full.push_str(token);
                         // 空 request_id 表示"不需要推流"（批量任务），省掉无谓的事件
@@ -848,7 +866,51 @@ async fn stream_completion(
         }
     }
 
+    // 空正文绝不能当成功返回：上层会把它渲染成一个空气泡，用户以为"回复丢了"。
+    if full.trim().is_empty() {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("已取消".into());
+        }
+        return Err(empty_reply_message(reasoning_chars, max_tokens));
+    }
+
+    // 有正文但被上限截断：至少留痕，方便排查长回答被切断
+    if finish_reason == "length" {
+        eprintln!("输出达到 max_tokens={max_tokens} 上限，可能被截断（模型 {model}）");
+    }
+
     Ok(full)
+}
+
+/// 空回复的诊断文案。实测 Qwen3.5 会先思考再作答，
+/// 思维链把 `max_tokens` 吃光时正文就是空的（`finish_reason = length`）。
+fn empty_reply_message(reasoning_chars: usize, max_tokens: u32) -> String {
+    if reasoning_chars > 0 {
+        format!(
+            "模型只输出了思考内容（{reasoning_chars} 字）就达到 {max_tokens} token 的输出上限，正文为空。请重试或换用非思考型模型。"
+        )
+    } else {
+        "模型没有返回内容，请重试。".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_reply_blames_thinking_when_reasoning_present() {
+        let message = empty_reply_message(2985, 1024);
+        // 实测 Qwen3.5 就是这个形态：思考 2985 字、正文 0 字
+        assert!(message.contains("2985"), "应带上思考字数: {message}");
+        assert!(message.contains("1024"), "应带上输出上限: {message}");
+        assert!(message.contains("思考"), "应指出是思考吃掉了预算: {message}");
+    }
+
+    #[test]
+    fn empty_reply_without_thinking_stays_generic() {
+        assert_eq!(empty_reply_message(0, 1024), "模型没有返回内容，请重试。");
+    }
 }
 
 pub(crate) fn load_glossary(app: &AppHandle) -> Vec<GlossaryEntry> {
