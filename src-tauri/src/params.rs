@@ -77,7 +77,7 @@ impl Thinking {
     }
 
     /// 思考最多会占多少 token（用于给 max_tokens 留余量）。
-    /// 不限或默认时无法预估，返回 0。
+    /// 「不限」无法预估，单独在 [`Thinking::output_budget`] 里处理。
     pub fn reserved_tokens(self) -> u32 {
         match self {
             Thinking::Low => 512,
@@ -86,7 +86,26 @@ impl Thinking {
             Thinking::Default | Thinking::Off | Thinking::Max => 0,
         }
     }
+
+    /// 这次请求的 `max_tokens`（正文与思考共用同一份额度）。
+    ///
+    /// 思考会把额度吃掉，所以：
+    /// - 有限预算的档位：正文基准 + 该档思考预算
+    /// - **不限档：直接把上下文的可用部分全给它**，否则思考必然把正文挤空
+    /// - 关闭 / 默认：只留正文基准
+    /// 最后统一夹到 `ctx / 2`，给提问内容留出另一半空间。
+    pub fn output_budget(self, ctx: u64) -> u32 {
+        let room = (ctx / 2).max(512);
+        let want = match self {
+            Thinking::Max => room,
+            other => (BASE_OUTPUT_TOKENS as u64 + other.reserved_tokens() as u64).min(room),
+        };
+        want.max(1) as u32
+    }
 }
+
+/// 正文本身的输出额度基准（不含思考）。前后端共用这一份。
+pub const BASE_OUTPUT_TOKENS: u32 = 1024;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -185,6 +204,48 @@ mod tests {
         assert_eq!(Thinking::Max.budget(), Some(-1));
         assert_eq!(Thinking::Off.budget(), None);
         assert_eq!(Thinking::Default.budget(), None);
+    }
+
+    #[test]
+    fn output_budget_fits_body_plus_thinking() {
+        // 有限预算档：正文基准 + 思考预算，且不超过 ctx 的一半
+        assert_eq!(Thinking::Off.output_budget(4096), 1024);
+        assert_eq!(Thinking::Low.output_budget(4096), 1536);
+        assert_eq!(Thinking::Medium.output_budget(8192), 3072);
+        // ctx 太小时被 ctx/2 夹住
+        assert_eq!(Thinking::High.output_budget(4096), 2048);
+    }
+
+    #[test]
+    fn max_tier_gets_unlimited_room() {
+        // 不限档必须拿到 ctx 的一半，否则思考会把正文挤空
+        assert_eq!(Thinking::Max.output_budget(8192), 4096);
+        assert_eq!(Thinking::Max.output_budget(32768), 16384);
+        // 上下文极小时仍然给一个下限，不能是 0
+        assert!(Thinking::Max.output_budget(512) >= 256);
+    }
+
+    #[test]
+    fn budget_is_clamped_by_context_half() {
+        // 每个有限预算档都有一个"刚好放得下"的上下文临界点：ctx/2 等于
+        // 正文基准 + 思考预算。临界点之上不浪费额度，之下被 ctx/2 夹住。
+        for mode in [Thinking::Low, Thinking::Medium, Thinking::High] {
+            let want = BASE_OUTPUT_TOKENS as u64 + mode.reserved_tokens() as u64;
+            let boundary = 2 * want;
+
+            assert_eq!(mode.output_budget(boundary) as u64, want);
+            assert_eq!(mode.output_budget(boundary + 100) as u64, want);
+            // 差 1 就已经放不下，会被 ctx/2 夹小
+            assert_eq!(mode.output_budget(boundary - 1) as u64, want - 1);
+        }
+    }
+
+    #[test]
+    fn tiers_without_thinking_keep_base_budget() {
+        // 关闭 / 默认档只需要正文基准，且同样受 ctx/2 限制
+        assert_eq!(Thinking::Off.output_budget(4096), BASE_OUTPUT_TOKENS);
+        assert_eq!(Thinking::Default.output_budget(4096), BASE_OUTPUT_TOKENS);
+        assert_eq!(Thinking::Off.output_budget(1024), 512);
     }
 
     #[test]

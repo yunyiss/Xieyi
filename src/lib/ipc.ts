@@ -147,6 +147,15 @@ export const setPinned = (model: string, pinned: boolean) =>
   invoke<string[]>("set_pinned", { model, pinned });
 export const getSettings = () => invoke<Settings>("get_settings");
 export const listLocalModels = () => invoke<LocalModel[]>("list_local_models");
+/** 思考档位表（预算数值由后端给出，前端不另抄一份）。 */
+export const thinkingTiers = () => invoke<ThinkingTier[]>("thinking_tiers");
+
+export interface ThinkingTier {
+  value: ThinkingMode;
+  /** 该档思考预算；-1 不限，null 表示不设置 */
+  budgetTokens: number | null;
+}
+
 export const restartService = () => invoke<ServiceStatus>("restart_service");
 export const unloadModel = (model: string) =>
   invoke<void>("unload_model", { model });

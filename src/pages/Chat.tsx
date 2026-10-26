@@ -2,12 +2,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { LoadIndicator, toLoadState, type LoadState } from "../components/LoadIndicator";
 import { ContextMeter } from "../components/ContextMeter";
-import { ModelStateBadge } from "../components/ModelStateBadge";
+import { ModelPicker } from "../components/ModelPicker";
 import {
   abort,
   chat,
   deleteSession,
-  getSettings,
   listLocalModels,
   listRouterModels,
   listSessions,
@@ -16,7 +15,6 @@ import {
   onToken,
   onUsage,
   saveSession,
-  setPinned as setModelPinned,
   type ChatMessage,
   type LocalModel,
   type RouterModel,
@@ -79,16 +77,6 @@ const QUICK_ACTIONS = [
   },
 ];
 
-/** 思考档位，与 llama.cpp Web UI 一致。needCtx 为可用此档所需的最小上下文。 */
-const THINKING_OPTIONS: { value: ThinkingMode; label: string; needCtx: number }[] = [
-  { value: "default", label: "默认", needCtx: 0 },
-  { value: "off", label: "不思考", needCtx: 0 },
-  { value: "low", label: "思考·低", needCtx: 1024 },
-  { value: "medium", label: "思考·中", needCtx: 4096 },
-  { value: "high", label: "思考·高", needCtx: 16384 },
-  { value: "max", label: "思考·不限", needCtx: 0 },
-];
-
 /** 聊天页：多轮对话 + 本地会话持久化，不做工具调用。 */
 export function Chat({
   refreshSignal = 0,
@@ -97,7 +85,6 @@ export function Chat({
 }: Props) {
   const [models, setModels] = useState<RouterModel[]>([]);
   const [model, setModel] = useState("");
-  const [pinned, setPinned] = useState<string[]>([]);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
@@ -127,9 +114,6 @@ export function Chat({
 
   const refresh = useCallback(async () => {
     try {
-      const settings = await getSettings();
-      setPinned(settings.pinned);
-
       const list = await listRouterModels();
       setModels(list);
       setModel((prev) => prev || list[0]?.id || "");
@@ -349,7 +333,6 @@ export function Chat({
     }
   };
 
-  const isPinned = pinned.includes(model);
   const sessionTitle =
     sessions.find((s) => s.id === sessionId)?.title ?? "新对话";
   const currentModel = localModels.find((m) => m.id === model);
@@ -357,58 +340,6 @@ export function Chat({
 
   return (
     <div className="flex h-full flex-col gap-3 p-4">
-      {/* 顶部：模型与常驻（单行） */}
-      <div className="flex flex-nowrap items-center gap-2">
-        <select
-          className={`${controlClass} min-w-0 flex-1`}
-          style={controlStyle}
-          value={model}
-          onChange={(e) => setModel(e.target.value)}
-          disabled={models.length === 0}
-          title={model || "未发现模型"}
-        >
-          {models.length === 0 && <option value="">未发现模型</option>}
-          {models.map((m) => (
-            <option key={m.id} value={m.id}>
-              {m.id}
-            </option>
-          ))}
-        </select>
-
-        <ModelStateBadge
-          state={models.find((m) => m.id === model)?.state ?? "unloaded"}
-        />
-
-        <label className="flex shrink-0 cursor-pointer items-center gap-1.5 text-[12px]">
-          <input
-            type="checkbox"
-            checked={isPinned}
-            disabled={!model}
-            onChange={async (e) => {
-              try {
-                setPinned(await setModelPinned(model, e.target.checked));
-              } catch (err) {
-                setError(String(err));
-              }
-            }}
-            className="accent-[var(--brand)]"
-          />
-          常驻
-        </label>
-
-        <span
-          className="hidden shrink-0 text-[12px] xl:inline"
-          style={{ color: "var(--text-muted)" }}
-        >
-          {isPinned ? "常驻中，不会被自动卸载" : "按需模式，空闲后自动释放"}
-        </span>
-      </div>
-
-      {load && <LoadIndicator load={load} />}
-
-      {/* 上下文用量：数据来自模型返回的真实 usage */}
-      {usage && <ContextMeter usage={usage} totals={totals} />}
-
       {/* 会话栏 */}
       <div className="flex flex-nowrap items-center gap-2">
         <select
@@ -462,7 +393,7 @@ export function Chat({
           </div>
         )}
 
-        <div className="flex flex-col gap-3">
+        <div className="flex flex-col gap-4">
           {messages.map((m, i) => {
             const isUser = m.role === "user";
             const isLast = i === messages.length - 1;
@@ -471,32 +402,41 @@ export function Chat({
                 key={i}
                 className={`flex ${isUser ? "justify-end" : "justify-start"}`}
               >
-                <div
-                  className="max-w-[80%] whitespace-pre-wrap rounded-xl px-3 py-2 text-[13px]"
-                  style={{
-                    background: isUser ? "var(--brand-soft)" : "var(--surface-muted)",
-                    color: isUser ? "var(--brand-text)" : "var(--text)",
-                  }}
-                >
-                  {m.content ||
-                    (busy && isLast ? "…" : "")}
-                </div>
+                {isUser ? (
+                  // 用户消息用小气泡，助手回复直接铺开，贴近 Codex / DeepSeek 的克制感
+                  <div
+                    className="max-w-[78%] whitespace-pre-wrap rounded-2xl px-3 py-1.5 text-[13px]"
+                    style={{
+                      background: "var(--brand-soft)",
+                      color: "var(--brand-text)",
+                    }}
+                  >
+                    {m.content}
+                  </div>
+                ) : (
+                  <div
+                    className="max-w-[94%] whitespace-pre-wrap px-0.5 text-[13px] leading-relaxed"
+                    style={{ color: "var(--text)" }}
+                  >
+                    {m.content || (busy && isLast ? "…" : "")}
+                  </div>
+                )}
               </div>
             );
           })}
 
           {!busy && messages.length > 0 && messages[messages.length - 1].role === "assistant" && (
-            <div className="flex justify-start gap-2">
+            <div className="flex justify-start gap-3 text-[11px]">
               <button
-                className="h-7 rounded-md border px-2 text-[11px]"
-                style={controlStyle}
+                className="rounded px-0 py-0.5 transition-opacity hover:opacity-70"
+                style={{ color: "var(--text-muted)" }}
                 onClick={regenerate}
               >
                 重新生成
               </button>
               <button
-                className="h-7 rounded-md border px-2 text-[11px]"
-                style={controlStyle}
+                className="rounded px-0 py-0.5 transition-opacity hover:opacity-70"
+                style={{ color: "var(--text-muted)" }}
                 onClick={() => copyText(messages[messages.length - 1].content)}
               >
                 复制
@@ -516,11 +456,11 @@ export function Chat({
           return (
             <button
               key={action.key}
-              className="h-7 shrink-0 rounded-full border px-2.5 text-[11px] transition-colors disabled:opacity-50"
+              className="h-7 shrink-0 rounded-full px-2.5 text-[11px] transition-colors hover:bg-[var(--surface-muted)] disabled:opacity-50"
               style={{
-                background: active ? "var(--brand-soft)" : "var(--surface)",
-                borderColor: active ? "var(--brand)" : "var(--border)",
-                color: active ? "var(--brand-text)" : "var(--text)",
+                background: active ? "var(--brand-soft)" : "transparent",
+                border: `1px solid ${active ? "var(--brand)" : "transparent"}`,
+                color: active ? "var(--brand-text)" : "var(--text-muted)",
               }}
               title={action.prompt}
               disabled={busy}
@@ -535,46 +475,18 @@ export function Chat({
             下一句生效
           </span>
         )}
-
-        {/* 思考档位：与 llama.cpp Web UI 六档一致，模型不支持时禁用 */}
-        <label
-          className="ml-auto flex shrink-0 items-center gap-1"
-          title={
-            supportsThinking
-              ? "思考越久通常越慢；档位越高，正文可用的输出配额也会同步放大"
-              : "该模型的对话模板不支持思考"
-          }
-        >
-          <span className="text-[11px]" style={{ color: "var(--text-muted)" }}>
-            💡
-          </span>
-          <select
-            className="h-7 rounded-md border px-1 text-[11px] outline-none focus:border-[var(--brand)] disabled:opacity-40"
-            style={controlStyle}
-            value={thinking}
-            disabled={!supportsThinking || busy}
-            onChange={(e) => setThinking(e.target.value as ThinkingMode)}
-          >
-            {THINKING_OPTIONS.map((o) => {
-              const tooSmall =
-                o.needCtx > 0 && (currentModel?.ctxSize ?? 0) < o.needCtx;
-              return (
-                <option key={o.value} value={o.value}>
-                  {o.label}
-                  {tooSmall ? "（上下文不足）" : ""}
-                </option>
-              );
-            })}
-          </select>
-        </label>
       </div>
 
-      {/* 输入区 */}
-      <div className="flex items-end gap-2">
+      {load && <LoadIndicator load={load} />}
+
+      {/* 输入区：整块作为一个输入容器，模型与发送都在底部一行 */}
+      <div
+        className="flex flex-col rounded-xl border px-2 py-2 transition-colors focus-within:border-[var(--brand)]"
+        style={{ background: "var(--surface)", borderColor: "var(--border)" }}
+      >
         <textarea
-          className="min-h-[64px] flex-1 resize-none rounded-xl border p-2.5 text-[13px] outline-none focus:border-[var(--brand)]"
-          style={controlStyle}
-          placeholder="输入消息，Enter 发送，Shift+Enter 换行"
+          className="min-h-[52px] w-full resize-none bg-transparent px-1 py-1 text-[13px] leading-relaxed outline-none"
+          placeholder="输入消息…"
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => {
@@ -584,24 +496,60 @@ export function Chat({
             }
           }}
         />
-        <button
-          className="h-10 rounded-lg px-4 text-[13px] font-medium text-white disabled:opacity-50"
-          style={{ background: "var(--brand)" }}
-          onClick={send}
-          disabled={busy || !model}
-        >
-          {load ? "加载中…" : busy ? "生成中…" : "发送"}
-        </button>
 
-        {busy && (
-          <button
-            className="h-10 rounded-lg border px-4 text-[13px]"
-            style={controlStyle}
-            onClick={() => abort(model)}
+        <div className="flex items-center gap-1.5 pt-1">
+          <span
+            className="hidden shrink-0 text-[11px] sm:inline"
+            style={{ color: "var(--text-muted)", opacity: 0.7 }}
           >
-            {load ? "停止加载" : "停止"}
-          </button>
-        )}
+            Enter 发送 · Shift+Enter 换行
+          </span>
+
+          {/* 右侧一组：上下文圆环 → 模型/思考 → 发送/停止 */}
+          <div className="ml-auto flex min-w-0 shrink items-center gap-1">
+            <ContextMeter
+              usage={usage}
+              ctxSize={currentModel?.ctxSize ?? 0}
+              totals={totals}
+            />
+
+            <ModelPicker
+              models={models}
+              model={model}
+              onModel={setModel}
+              thinking={thinking}
+              onThinking={setThinking}
+              thinkingSupported={supportsThinking}
+              disabled={busy}
+            />
+
+            <button
+              className="flex h-9 w-9 items-center justify-center rounded-full text-white transition-colors disabled:opacity-40"
+              style={{ background: busy ? "var(--text-muted)" : "var(--brand)" }}
+              onClick={() => (busy ? abort(model) : send())}
+              disabled={!busy && !model}
+              aria-label={busy ? "停止" : "发送"}
+              title={busy ? (load ? "停止加载" : "停止生成") : "发送（Enter）"}
+            >
+              {busy ? (
+                // 停止：一个方块，和发送的箭头区分开
+                <svg width="12" height="12" viewBox="0 0 24 24" aria-hidden>
+                  <rect x="5" y="5" width="14" height="14" rx="2" fill="currentColor" />
+                </svg>
+              ) : (
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden>
+                  <path
+                    d="M12 19V5M5.5 11.5 12 5l6.5 6.5"
+                    stroke="currentColor"
+                    strokeWidth="1.9"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                </svg>
+              )}
+            </button>
+          </div>
+        </div>
       </div>
 
       {error && (

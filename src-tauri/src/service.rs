@@ -1157,10 +1157,9 @@ pub async fn chat(
         .map(Thinking::parse)
         .unwrap_or(model_params.thinking);
 
-    // 思考与正文共用同一份输出额度，所以要把思考的份额加进 max_tokens。
-    // 再夹到 ctx 的一半，给 prompt 留出空间，避免一开思考就撑爆上下文。
-    let max_tokens = (1024 + thinking.reserved_tokens())
-        .min((model_params.ctx / 2).max(512) as u32);
+    // 思考与正文共用同一份输出额度，额度按档位算（含"不限"档的特殊处理）。
+    // 规则与界面提示"上下文不足"用的是同一个函数，避免两边漂移。
+    let max_tokens = thinking.output_budget(model_params.ctx);
 
     let result = stream_completion(
         &app,
@@ -1258,6 +1257,35 @@ pub async fn get_settings(
         running,
         port,
     })
+}
+
+/// 思考档位的说明数据，供界面显示"最多 X token"。
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ThinkingTier {
+    pub value: String,
+    /// 该档的思考预算；`-1` 表示不限，`None` 表示不设置
+    pub budget_tokens: Option<i64>,
+}
+
+/// 列出所有思考档位。前端据此渲染，不在前端另抄一份数字。
+#[tauri::command]
+pub fn thinking_tiers() -> Vec<ThinkingTier> {
+    const ALL: [Thinking; 6] = [
+        Thinking::Default,
+        Thinking::Off,
+        Thinking::Low,
+        Thinking::Medium,
+        Thinking::High,
+        Thinking::Max,
+    ];
+
+    ALL.iter()
+        .map(|t| ThinkingTier {
+            value: t.as_str().to_string(),
+            budget_tokens: t.budget(),
+        })
+        .collect()
 }
 
 /// 模型目录里的一个文件，附带当前生效的参数，供设置抽屉直接渲染。

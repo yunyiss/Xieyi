@@ -1,7 +1,7 @@
-import { useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import type { UsagePayload } from "../lib/ipc";
 
-/** 1024 → 1.0K；参照 llama.cpp Web UI 的写法。 */
+/** 1024 → 1.0K；对齐 llama.cpp Web UI 的写法。 */
 function fmt(n: number): string {
   if (n < 1000) return String(n);
   if (n < 10_000) return `${(n / 1000).toFixed(2).replace(/\.?0+$/, "")}K`;
@@ -9,110 +9,214 @@ function fmt(n: number): string {
   return `${(n / 1_000_000).toFixed(2)}M`;
 }
 
+/** 圆环半径与周长（viewBox 24，按钮 30px）。 */
+const RADIUS = 9;
+const CIRCUMFERENCE = 2 * Math.PI * RADIUS;
+
 interface Props {
-  /** 最近一次补全的真实用量 */
-  usage: UsagePayload;
+  /** 最近一次补全的真实用量；还没发过请求时为 null */
+  usage: UsagePayload | null;
+  /** 当前模型的上下文上限（来自模型设置，不需要等请求） */
+  ctxSize: number;
   /** 本次会话累计（前端累加） */
   totals: { prompt: number; generated: number };
 }
 
 /**
- * 上下文用量面板，参照 llama.cpp Web UI：
- * 常驻显示一行进度，点开看本次/累计明细与平均速度。
- * 数据全部来自模型返回的真实 usage，不是估算。
+ * 上下文占用：一个圆环按钮，环本身就是进度条。
+ * 点开是浮层明细，排版照 llama.cpp Web UI 的 Token usage details。
  */
-export function ContextMeter({ usage, totals }: Props) {
+export function ContextMeter({ usage, ctxSize, totals }: Props) {
   const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
 
-  const used = usage.promptTokens + usage.completionTokens;
-  const pct = Math.min(100, (used / usage.ctxSize) * 100);
-  const remaining = Math.max(0, usage.ctxSize - used);
+  useEffect(() => {
+    if (!open) return;
+    const close = (e: MouseEvent) => {
+      if (!ref.current?.contains(e.target as Node)) setOpen(false);
+    };
+    window.addEventListener("mousedown", close);
+    return () => window.removeEventListener("mousedown", close);
+  }, [open]);
+
+  const ctx = usage?.ctxSize || ctxSize || 0;
+  const used = usage ? usage.promptTokens + usage.completionTokens : 0;
+  const pct = ctx > 0 ? Math.min(100, (used / ctx) * 100) : 0;
+  const remaining = Math.max(0, ctx - used);
   const speed =
-    usage.elapsedMs > 0
+    usage && usage.elapsedMs > 0
       ? usage.completionTokens / (usage.elapsedMs / 1000)
       : 0;
-
   const danger = pct > 85;
+  const color = danger ? "var(--danger)" : "var(--brand)";
 
   return (
-    <div className="shrink-0">
+    <div ref={ref} className="relative shrink-0">
       <button
-        className="flex w-full items-center gap-2 text-[11px]"
+        className="flex h-8 w-8 items-center justify-center rounded-full transition-colors"
+        style={{ background: open ? "var(--surface-muted)" : "transparent" }}
         onClick={() => setOpen((v) => !v)}
-        title="查看 token 用量明细"
+        title={
+          ctx > 0
+            ? `上下文已用 ${pct.toFixed(0)}%（${fmt(used)} / ${fmt(ctx)}）`
+            : "上下文用量"
+        }
+        aria-label="上下文用量"
+        aria-expanded={open}
       >
-        <span className="shrink-0 tabular-nums" style={{ color: "var(--text)" }}>
-          上下文 <strong>{fmt(used)}</strong> / {fmt(usage.ctxSize)}
-        </span>
-        <div
-          className="h-1 min-w-0 flex-1 overflow-hidden rounded-full"
-          style={{ background: "var(--surface-muted)" }}
+        {/* 环本身表示占用比例，中心显示百分比 */}
+        <svg
+          className="absolute h-[27px] w-[27px]"
+          viewBox="0 0 24 24"
+          aria-hidden
         >
-          <div
-            className="h-full rounded-full transition-[width] duration-200"
-            style={{
-              width: `${pct}%`,
-              background: danger ? "var(--danger)" : "var(--brand)",
-            }}
+          <circle
+            cx="12"
+            cy="12"
+            r={RADIUS}
+            fill="none"
+            stroke="var(--border)"
+            strokeWidth="2.2"
           />
-        </div>
+          {pct > 0 && (
+            <circle
+              cx="12"
+              cy="12"
+              r={RADIUS}
+              fill="none"
+              stroke={color}
+              strokeWidth="2.2"
+              strokeLinecap="round"
+              strokeDasharray={CIRCUMFERENCE}
+              strokeDashoffset={CIRCUMFERENCE * (1 - pct / 100)}
+              transform="rotate(-90 12 12)"
+              style={{ transition: "stroke-dashoffset 300ms" }}
+            />
+          )}
+        </svg>
         <span
-          className="shrink-0 tabular-nums"
-          style={{ color: danger ? "var(--danger)" : "var(--text-muted)" }}
+          className="relative text-[9px] font-medium leading-none tabular-nums"
+          style={{ color: pct > 0 ? color : "var(--text-muted)" }}
         >
-          {pct.toFixed(0)}%
-        </span>
-        <span className="shrink-0" style={{ color: "var(--text-muted)" }}>
-          {open ? "▾" : "▸"}
+          {pct.toFixed(0)}
         </span>
       </button>
 
       {open && (
         <div
-          className="mt-1.5 rounded-lg border p-2.5 text-[11px]"
+          className="absolute bottom-full right-0 z-30 mb-2 max-h-[70vh] w-[300px] max-w-[calc(100vw-24px)] overflow-y-auto rounded-xl border p-3 shadow-lg"
           style={{
             background: "var(--surface)",
             borderColor: "var(--border)",
-            color: "var(--text-muted)",
+            boxShadow: "0 16px 40px rgba(0,0,0,0.16)",
           }}
         >
-          <div className="flex justify-between">
-            <span>剩余</span>
-            <span className="tabular-nums" style={{ color: "var(--text)" }}>
-              {fmt(remaining)}
+          <div className="flex items-baseline gap-1.5 text-[13px]">
+            <span style={{ color: "var(--text)" }}>上下文</span>
+            <span style={{ color: "var(--text-muted)" }}>·</span>
+            <span className="font-mono" style={{ color: "var(--text)" }}>
+              {fmt(used)}
+            </span>
+            <span className="font-mono" style={{ color: "var(--text-muted)" }}>
+              / {ctx > 0 ? fmt(ctx) : "—"}
             </span>
           </div>
 
           <div
-            className="my-1.5 h-px"
-            style={{ background: "var(--border)" }}
-          />
+            className="mt-2 h-[3px] w-full overflow-hidden rounded-full"
+            style={{ background: "var(--surface-muted)" }}
+          >
+            <div
+              className="h-full rounded-full"
+              style={{ width: `${pct}%`, background: color }}
+            />
+          </div>
 
-          <div className="mb-1">本次</div>
-          <Row label="输入" value={`${usage.promptTokens} tok`} />
-          <Row label="输出" value={`${usage.completionTokens} tok`} />
-          <Row label="缓存命中" value={`${usage.cachedTokens} tok`} />
+          <div className="mt-2 flex items-baseline justify-between text-[11px]">
+            <span style={{ color: "var(--text-muted)" }}>{pct.toFixed(0)}% 已用</span>
+            <span className="font-mono" style={{ color: "var(--text-muted)" }}>
+              剩余 {fmt(remaining)}
+            </span>
+          </div>
 
-          <div className="mt-1.5 mb-1">本次会话累计</div>
-          <Row label="输入" value={`${totals.prompt} tok`} />
-          <Row label="输出" value={`${totals.generated} tok`} />
+          {!usage ? (
+            <p
+              className="m-0 mt-3 border-t pt-3 text-[12px]"
+              style={{ borderColor: "var(--border)", color: "var(--text-muted)" }}
+            >
+              还没有发起过请求，用量数据会在第一次回复后出现。
+            </p>
+          ) : (
+            <div
+              className="mt-3 border-t pt-3"
+              style={{ borderColor: "var(--border)" }}
+            >
+              <p className="m-0 text-[11px]" style={{ color: "var(--text-muted)" }}>
+                用量明细
+              </p>
 
-          <div
-            className="my-1.5 h-px"
-            style={{ background: "var(--border)" }}
-          />
-          <Row label="平均速度" value={`${speed.toFixed(1)} tok/s`} />
+              <div className="mt-3 flex flex-col gap-4">
+                <Section title="本次会话累计">
+                  <Detail label="输入已计算" value={`${totals.prompt} tok`} />
+                  <Detail label="输出已生成" value={`${totals.generated} tok`} />
+                </Section>
+
+                <Section title="本次 · KV 缓存">
+                  <Detail label="输入" value={`${usage.promptTokens} tok`} />
+                  <Detail label="输出" value={`${usage.completionTokens} tok`} />
+                  <Detail label="命中缓存" value={`${usage.cachedTokens} tok`} />
+                  <div
+                    className="mt-0.5 border-t pt-1"
+                    style={{ borderColor: "var(--border)" }}
+                  >
+                    <div className="flex justify-between text-[12px]">
+                      <span style={{ color: "var(--text-muted)" }}>KV 缓存合计</span>
+                      <span
+                        className="font-mono font-medium"
+                        style={{ color: "var(--text)" }}
+                      >
+                        {used} tok
+                      </span>
+                    </div>
+                  </div>
+                </Section>
+
+                <div
+                  className="mt-1 border-t pt-1.5"
+                  style={{ borderColor: "var(--border)" }}
+                >
+                  <Detail label="平均速度" value={`${speed.toFixed(1)} t/s`} />
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>
   );
 }
 
-function Row({ label, value }: { label: string; value: string }) {
+/** 分组：小号大写标题 + 2px 行距。 */
+function Section({ title, children }: { title: string; children: ReactNode }) {
   return (
-    <div className="flex justify-between">
-      <span>{label}</span>
-      <span className="tabular-nums" style={{ color: "var(--text)" }}>
+    <div>
+      <h3
+        className="m-0 mb-2 text-[11px] font-medium uppercase tracking-wide"
+        style={{ color: "var(--text-muted)", opacity: 0.7 }}
+      >
+        {title}
+      </h3>
+      <div className="flex flex-col gap-2">{children}</div>
+    </div>
+  );
+}
+
+/** 单行：标签在左，数值等宽字体右对齐。 */
+function Detail({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-baseline justify-between text-[12px]">
+      <span style={{ color: "var(--text-muted)" }}>{label}</span>
+      <span className="font-mono" style={{ color: "var(--text-muted)" }}>
         {value}
       </span>
     </div>

@@ -96,6 +96,7 @@ pub fn run() {
             service::get_settings,
             service::list_local_models,
             service::set_model_params,
+            service::thinking_tiers,
             service::restart_service,
             sessions::list_sessions,
             sessions::save_session,

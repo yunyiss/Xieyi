@@ -35,13 +35,13 @@ const LAYER_OPTIONS = [
 ];
 
 /** 思考档位，与 llama.cpp Web UI 的六档一一对应。 */
-const THINKING_OPTIONS: { value: ThinkingMode; label: string; needCtx: number }[] = [
-  { value: "default", label: "默认（模型决定）", needCtx: 0 },
-  { value: "off", label: "关闭", needCtx: 0 },
-  { value: "low", label: "低 · 最多 512", needCtx: 1024 },
-  { value: "medium", label: "中 · 最多 2048", needCtx: 4096 },
-  { value: "high", label: "高 · 最多 8192", needCtx: 16384 },
-  { value: "max", label: "不限", needCtx: 0 },
+const THINKING_OPTIONS: { value: ThinkingMode; label: string }[] = [
+  { value: "default", label: "默认（模型决定）" },
+  { value: "off", label: "关闭" },
+  { value: "low", label: "低 · 最多 512 token" },
+  { value: "medium", label: "中 · 最多 2,048 token" },
+  { value: "high", label: "高 · 最多 8,192 token" },
+  { value: "max", label: "不限" },
 ];
 
 /** 可选的上下文档位：不超过模型原生上限，且保留当前值。 */
@@ -576,9 +576,6 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
                       {THINKING_OPTIONS.map((o) => (
                         <option key={o.value} value={o.value}>
                           {o.label}
-                          {o.needCtx > 0 && m.ctxSize < o.needCtx
-                            ? "（上下文不足）"
-                            : ""}
                         </option>
                       ))}
                     </select>
