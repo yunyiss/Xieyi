@@ -369,11 +369,7 @@ export function Chat({
       </div>
 
       {/* 消息列表 */}
-      <section
-        ref={listRef}
-        className="min-h-0 flex-1 overflow-auto rounded-xl border p-3"
-        style={{ background: "var(--surface)", borderColor: "var(--border)" }}
-      >
+      <section ref={listRef} className="card min-h-0 flex-1 overflow-auto p-3.5">
         {messages.length === 0 && (
           <div className="flex h-full items-center justify-center px-4">
             {setupError ? (
@@ -523,10 +519,7 @@ export function Chat({
           </div>
         )}
 
-        <div
-          className="flex flex-col rounded-xl border px-2 py-2 transition-colors focus-within:border-[var(--brand)]"
-          style={{ background: "var(--surface)", borderColor: "var(--border)" }}
-        >
+        <div className="field flex flex-col px-2 py-2">
           <textarea
             className="min-h-[52px] w-full resize-none bg-transparent px-1 py-1 text-[13px] leading-relaxed outline-none"
             placeholder="输入消息…"

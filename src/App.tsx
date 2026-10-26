@@ -84,9 +84,17 @@ function App() {
     <div className="flex h-full flex-col">
       <header
         className="flex shrink-0 items-center gap-1 border-b px-4 py-2.5"
-        style={{ borderColor: "var(--border)", background: "var(--surface)" }}
+        style={{
+          borderColor: "var(--border)",
+          background: "var(--surface)",
+          boxShadow: "var(--shadow-1)",
+          zIndex: 20,
+        }}
       >
-        <span className="mr-4 text-[14px] font-semibold tracking-tight">
+        <span
+          className="mr-4 text-[14px] font-semibold tracking-tight"
+          style={{ letterSpacing: "-0.01em" }}
+        >
           LocalTranslate
         </span>
 
@@ -96,11 +104,17 @@ function App() {
             <button
               key={t.key}
               onClick={() => setTab(t.key)}
-              className="rounded-lg px-3 py-1.5 text-[13px] transition-colors"
+              className="btn rounded-lg px-3 py-1.5 text-[13px]"
               style={{
                 background: active ? "var(--brand-soft)" : "transparent",
                 color: active ? "var(--brand-text)" : "var(--text-muted)",
                 fontWeight: active ? 500 : 400,
+              }}
+              onMouseEnter={(e) => {
+                if (!active) e.currentTarget.style.background = "var(--surface-muted)";
+              }}
+              onMouseLeave={(e) => {
+                if (!active) e.currentTarget.style.background = "transparent";
               }}
             >
               {t.label}
@@ -110,7 +124,7 @@ function App() {
 
         <button
           onClick={() => setDrawerOpen(true)}
-          className="ml-auto flex h-8 shrink-0 items-center gap-1.5 rounded-lg border px-3 text-[12px] transition-colors"
+          className="btn ml-auto flex h-8 shrink-0 items-center gap-1.5 rounded-lg border px-3 text-[12px]"
           style={{
             background: "var(--surface)",
             borderColor: "var(--border)",

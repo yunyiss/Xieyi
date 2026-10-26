@@ -15,8 +15,11 @@ interface Props {
 function Dot({ on }: { on: boolean }) {
   return (
     <i
-      className="inline-block size-2 rounded-full"
-      style={{ background: on ? "var(--brand)" : "var(--border-strong)" }}
+      className="inline-block size-2 shrink-0 rounded-full transition-colors"
+      style={{
+        background: on ? "var(--brand)" : "var(--border-strong)",
+        boxShadow: on ? "0 0 0 3px color-mix(in srgb, var(--brand) 16%, transparent)" : "none",
+      }}
     />
   );
 }
@@ -46,8 +49,12 @@ export function StatusBar({ info, runtime, service, settings }: Props) {
 
   return (
     <footer
-      className="flex shrink-0 items-center gap-4 border-t px-4 py-2 text-[12px]"
-      style={{ borderColor: "var(--border)", color: "var(--text-muted)" }}
+      className="flex shrink-0 items-center gap-4 border-t px-4 py-2 text-[11px]"
+      style={{
+        borderColor: "var(--border)",
+        color: "var(--text-muted)",
+        background: "color-mix(in srgb, var(--surface) 70%, transparent)",
+      }}
     >
       <span className="flex items-center gap-1.5">
         <Dot on={Boolean(runtime?.installed)} />

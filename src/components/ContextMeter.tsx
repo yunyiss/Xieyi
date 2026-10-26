@@ -104,12 +104,8 @@ export function ContextMeter({ usage, ctxSize, totals }: Props) {
 
       {open && (
         <div
-          className="absolute bottom-full right-0 z-30 mb-2 max-h-[70vh] w-[300px] max-w-[calc(100vw-24px)] overflow-y-auto rounded-xl border p-3 shadow-lg"
-          style={{
-            background: "var(--surface)",
-            borderColor: "var(--border)",
-            boxShadow: "0 16px 40px rgba(0,0,0,0.16)",
-          }}
+          className="popover absolute bottom-full right-0 z-30 mb-2 max-h-[70vh] w-[300px] max-w-[calc(100vw-24px)] overflow-y-auto p-3"
+          style={{ animation: "pop-in-up var(--dur) var(--ease-out) both" }}
         >
           <div className="flex items-baseline gap-1.5 text-[13px]">
             <span style={{ color: "var(--text)" }}>上下文</span>

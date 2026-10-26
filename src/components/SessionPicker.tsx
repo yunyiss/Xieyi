@@ -106,15 +106,10 @@ export function SessionPicker({
 
       {open && (
         <div
-          className="absolute left-0 top-full z-30 mt-1.5 max-h-[60vh] w-[320px] max-w-[calc(100vw-24px)] overflow-y-auto rounded-xl border p-2 shadow-lg"
-          style={{
-            background: "var(--surface)",
-            borderColor: "var(--border)",
-            boxShadow: "0 16px 40px rgba(0,0,0,0.16)",
-          }}
+          className="popover absolute left-0 top-full z-30 mt-1.5 max-h-[60vh] w-[320px] max-w-[calc(100vw-24px)] overflow-y-auto p-1.5"
         >
           <button
-            className="flex min-h-10 w-full items-center gap-2 rounded-md px-3 text-left text-[13px] transition-colors hover:bg-[var(--surface-muted)]"
+            className="row flex min-h-10 w-full items-center gap-2 px-3 text-left text-[13px]"
             style={{ color: "var(--text)" }}
             onClick={() => {
               onNew();
@@ -140,14 +135,12 @@ export function SessionPicker({
                 return (
                   <div
                     key={s.id}
-                    className="group flex items-center rounded-md pr-1"
-                    style={{
-                      background: active ? "var(--surface-muted)" : "transparent",
-                    }}
+                    className="row group flex items-center pr-1"
+                    data-selected={active}
                   >
                     <button
                       className="flex min-w-0 flex-1 items-center gap-2 px-3 py-2 text-left text-[13px]"
-                      style={{ color: "var(--text)" }}
+                      style={{ color: "inherit" }}
                       onClick={() => {
                         onPick(s.id);
                         setOpen(false);
@@ -189,7 +182,7 @@ export function SessionPicker({
           <div className="my-1.5 h-px" style={{ background: "var(--border)" }} />
 
           <button
-            className="flex min-h-10 w-full items-center gap-2 rounded-md px-3 text-left text-[13px] transition-colors hover:bg-[var(--surface-muted)] disabled:opacity-40"
+            className="row flex min-h-10 w-full items-center gap-2 px-3 text-left text-[13px] disabled:opacity-40"
             style={{ color: "var(--danger)" }}
             disabled={sessions.length === 0}
             onClick={() => {

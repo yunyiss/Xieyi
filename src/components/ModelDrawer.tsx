@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   abort,
   getGlossary,
@@ -19,6 +19,7 @@ import {
   type Settings,
   type ThinkingMode,
 } from "../lib/ipc";
+import { Select } from "./Select";
 
 const TTL_OPTIONS = [
   { value: 60, label: "空闲 60 秒释放" },
@@ -52,15 +53,6 @@ function ctxOptions(model: LocalModel): number[] {
   return list.sort((a, b) => a - b);
 }
 
-const fieldStyle = {
-  background: "var(--surface)",
-  borderColor: "var(--border)",
-  color: "var(--text)",
-};
-
-const fieldClass =
-  "h-8 w-full rounded-lg border px-2 text-[12px] outline-none focus:border-[var(--brand)]";
-
 interface Props {
   open: boolean;
   onClose: () => void;
@@ -68,7 +60,7 @@ interface Props {
 }
 
 const btnClass =
-  "h-7 rounded-md border px-2 text-[11px] transition-colors disabled:opacity-50";
+  "btn h-7 rounded-md border px-2 text-[11px] transition-colors disabled:opacity-50";
 
 const btnStyle = {
   background: "var(--surface)",
@@ -95,6 +87,8 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
   const [freeVram, setFreeVram] = useState<number | null>(null);
   /** 改过上下文后需要重启引擎才生效 */
   const [needsRestart, setNeedsRestart] = useState(false);
+  /** 退场动画期间仍然渲染，动画结束后再卸载 */
+  const [closing, setClosing] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -128,7 +122,33 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
     return () => window.clearInterval(timer);
   }, [open, refresh]);
 
-  if (!open) return null;
+  // 关闭时先播 170ms 退场动画再卸载，避免"啪一下消失"。
+  // 用 wasOpen 记住"真的打开过"，否则首次挂载会误播一次退场。
+  const wasOpen = useRef(false);
+  useEffect(() => {
+    if (open) {
+      wasOpen.current = true;
+      setClosing(false);
+      return;
+    }
+    if (!wasOpen.current) return;
+    wasOpen.current = false;
+    setClosing(true);
+    const timer = window.setTimeout(() => setClosing(false), 170);
+    return () => window.clearTimeout(timer);
+  }, [open]);
+
+  // 按 Esc 关闭
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
+
+  if (!open && !closing) return null;
 
   const pinned = settings?.pinned ?? [];
 
@@ -278,17 +298,22 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
   return (
     <>
       <div
-        className="fixed inset-0 z-40"
-        style={{ background: "rgba(0,0,0,0.28)" }}
+        className="backdrop fixed inset-0 z-40"
+        style={{
+          background: "color-mix(in srgb, var(--text) 18%, transparent)",
+          backdropFilter: "blur(2px)",
+        }}
         onClick={onClose}
       />
       <aside
-        className="fixed right-0 top-0 z-50 flex h-full w-[380px] flex-col border-l"
+        className="drawer fixed bottom-2 right-2 top-2 z-50 flex w-[380px] flex-col overflow-hidden rounded-[16px]"
         style={{
           background: "var(--surface)",
-          borderColor: "var(--border)",
-          maxWidth: "92vw",
+          border: "1px solid var(--border)",
+          boxShadow: "var(--shadow-3)",
+          maxWidth: "calc(92vw - 16px)",
         }}
+        data-closing={closing && !open}
       >
         <header
           className="flex shrink-0 items-center gap-2 border-b px-4 py-3"
@@ -296,10 +321,11 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
         >
           <h2 className="m-0 text-[14px] font-medium">设置与模型</h2>
           <button
-            className="ml-auto h-7 w-7 rounded-md border text-[13px]"
+            className="btn ml-auto flex h-7 w-7 items-center justify-center rounded-lg border"
             style={btnStyle}
             onClick={onClose}
             aria-label="关闭"
+            title="关闭（Esc）"
           >
             ✕
           </button>
@@ -308,49 +334,36 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
         <div className="min-h-0 flex-1 overflow-auto px-4 py-3">
           {/* 引擎设置 */}
           <section className="mb-4">
-            <div
-              className="mb-1.5 text-[11px] font-medium"
-              style={{ color: "var(--text-muted)" }}
-            >
-              引擎设置
-            </div>
+            <div className="section-title mb-1.5">引擎设置</div>
 
             <div className="flex flex-col gap-2">
-              <label className="flex items-center gap-2 text-[12px]">
+              <div className="flex items-center gap-2 text-[12px]">
                 <span className="w-[64px] shrink-0" style={{ color: "var(--text-muted)" }}>
                   空闲释放
                 </span>
-                <select
-                  className={fieldClass}
-                  style={fieldStyle}
+                <Select
+                  className="min-w-0 flex-1"
+                  size="sm"
                   value={settings?.ttlSecs ?? 120}
-                  onChange={(e) => changeTtl(Number(e.target.value))}
-                >
-                  {TTL_OPTIONS.map((o) => (
-                    <option key={o.value} value={o.value}>
-                      {o.label}
-                    </option>
-                  ))}
-                </select>
-              </label>
+                  options={TTL_OPTIONS}
+                  onChange={(v) => changeTtl(v)}
+                  title="模型空闲多久后自动卸载，释放显存"
+                />
+              </div>
 
-              <label className="flex items-center gap-2 text-[12px]">
+              <div className="flex items-center gap-2 text-[12px]">
                 <span className="w-[64px] shrink-0" style={{ color: "var(--text-muted)" }}>
                   推理档位
                 </span>
-                <select
-                  className={fieldClass}
-                  style={fieldStyle}
+                <Select
+                  className="min-w-0 flex-1"
+                  size="sm"
                   value={settings?.gpuLayers ?? 1001}
-                  onChange={(e) => changeLayers(Number(e.target.value))}
-                >
-                  {LAYER_OPTIONS.map((o) => (
-                    <option key={o.value} value={o.value}>
-                      {o.label}
-                    </option>
-                  ))}
-                </select>
-              </label>
+                  options={LAYER_OPTIONS}
+                  onChange={(v) => changeLayers(v)}
+                  title="给 GPU 分配多少层，自动档按空闲显存估算"
+                />
+              </div>
             </div>
 
             <p className="m-0 mt-1 text-[11px]" style={{ color: "var(--text-muted)" }}>
@@ -386,20 +399,14 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
           {/* 术语表 */}
           <section className="mb-4">
             <div className="mb-1.5 flex items-baseline gap-2">
-              <span
-                className="text-[11px] font-medium"
-                style={{ color: "var(--text-muted)" }}
-              >
-                术语表
-              </span>
+              <span className="section-title">术语表</span>
               <span className="text-[10px]" style={{ color: "var(--text-muted)" }}>
                 每行一条：原文=译文
               </span>
             </div>
 
             <textarea
-              className="h-24 w-full resize-none rounded-lg border p-2 text-[12px] outline-none focus:border-[var(--brand)]"
-              style={fieldStyle}
+              className="field h-24 w-full resize-none p-2 text-[12px]"
               placeholder={"API=接口\nLLM=大语言模型"}
               value={glossaryText}
               onChange={(e) => {
@@ -422,9 +429,7 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
 
           {/* 模型目录 */}
           <div className="mb-3">
-            <div className="mb-1 text-[11px]" style={{ color: "var(--text-muted)" }}>
-              模型目录
-            </div>
+            <div className="section-title mb-1">模型目录</div>
             <div className="flex items-center gap-2">
               <span
                 className="min-w-0 flex-1 truncate text-[12px]"
@@ -475,7 +480,7 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
               return (
                 <li
                   key={m.id}
-                  className="rounded-lg border p-2.5"
+                  className="rounded-[10px] border p-2.5 transition-colors"
                   style={{
                     background: "var(--surface-muted)",
                     borderColor: isPinned
@@ -538,47 +543,35 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
                     <span className="shrink-0" style={{ color: "var(--text-muted)" }}>
                       上下文
                     </span>
-                    <select
-                      className="h-6 min-w-0 flex-1 rounded-md border px-1 text-[11px] outline-none focus:border-[var(--brand)]"
-                      style={fieldStyle}
+                    <Select
+                      className="min-w-0 flex-1"
+                      size="sm"
                       value={m.ctxSize}
-                      onChange={(e) => changeModelCtx(m, Number(e.target.value))}
+                      options={ctxOptions(m).map((v) => ({ value: v, label: String(v) }))}
+                      onChange={(v) => changeModelCtx(m, v)}
                       title={
                         m.trainedCtx
                           ? `模型原生上限 ${m.trainedCtx}`
                           : "未能从 GGUF 读出原生上限"
                       }
-                    >
-                      {ctxOptions(m).map((v) => (
-                        <option key={v} value={v}>
-                          {v}
-                        </option>
-                      ))}
-                    </select>
+                    />
 
                     <span className="shrink-0" style={{ color: "var(--text-muted)" }}>
                       思考
                     </span>
-                    <select
-                      className="h-6 shrink-0 rounded-md border px-1 text-[11px] outline-none focus:border-[var(--brand)] disabled:opacity-50"
-                      style={fieldStyle}
+                    <Select
+                      className="w-[92px] shrink-0"
+                      size="sm"
                       value={m.thinking}
+                      options={THINKING_OPTIONS}
                       disabled={!m.supportsThinking}
-                      onChange={(e) =>
-                        changeThinking(m, e.target.value as ThinkingMode)
-                      }
+                      onChange={(v) => changeThinking(m, v)}
                       title={
                         m.supportsThinking
                           ? "连接到 libllama 的思考预算；档位越高思考越久，正文配额也会同步放大"
                           : "该模型的对话模板不含思考指令，设置不会生效"
                       }
-                    >
-                      {THINKING_OPTIONS.map((o) => (
-                        <option key={o.value} value={o.value}>
-                          {o.label}
-                        </option>
-                      ))}
-                    </select>
+                    />
                   </div>
 
                   {!m.supportsThinking && (

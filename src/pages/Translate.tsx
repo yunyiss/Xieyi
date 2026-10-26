@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { LoadIndicator, toLoadState, type LoadState } from "../components/LoadIndicator";
-import { ModelStateBadge } from "../components/ModelStateBadge";
+import { ModelStateBadge, stateLabel } from "../components/ModelStateBadge";
 import { RunButton } from "../components/RunButton";
+import { Select } from "../components/Select";
 import {
   abort,
   getRuntimeStatus,
@@ -28,15 +29,15 @@ import {
 } from "../lib/ipc";
 
 const LANGUAGES = [
-  { code: "auto", label: "自动检测" },
-  { code: "zh", label: "中文" },
-  { code: "en", label: "英语" },
-  { code: "ja", label: "日语" },
-  { code: "ko", label: "韩语" },
-  { code: "fr", label: "法语" },
-  { code: "de", label: "德语" },
-  { code: "es", label: "西班牙语" },
-  { code: "ru", label: "俄语" },
+  { value: "auto", label: "自动检测" },
+  { value: "zh", label: "中文" },
+  { value: "en", label: "英语" },
+  { value: "ja", label: "日语" },
+  { value: "ko", label: "韩语" },
+  { value: "fr", label: "法语" },
+  { value: "de", label: "德语" },
+  { value: "es", label: "西班牙语" },
+  { value: "ru", label: "俄语" },
 ];
 
 const selectStyle = {
@@ -44,9 +45,6 @@ const selectStyle = {
   borderColor: "var(--border)",
   color: "var(--text)",
 };
-
-const selectClass =
-  "h-9 rounded-lg border px-2.5 text-[13px] outline-none transition-colors focus:border-[var(--brand)]";
 
 function stageLabel(stage: RuntimeProgress["stage"]): string {
   switch (stage) {
@@ -281,14 +279,19 @@ export function Translate({
     }
   };
 
+  const copyOutput = async (text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      setError("复制失败");
+    }
+  };
+
   return (
     <div className="flex h-full flex-col gap-3 p-4">
       {/* 运行时 / 引擎状态 */}
       {!runtime?.installed && (
-        <section
-          className="rounded-xl border p-3"
-          style={{ background: "var(--surface)", borderColor: "var(--border)" }}
-        >
+        <section className="card p-3.5">
           <div className="mb-2 flex items-center gap-2 text-[13px] font-medium">
             <span>首次使用：安装推理运行时</span>
             <span
@@ -333,7 +336,7 @@ export function Translate({
           ) : (
             <div className="flex items-center gap-2">
               <button
-                className="h-9 rounded-lg px-4 text-[13px] font-medium text-white"
+                className="btn h-9 rounded-lg px-4 text-[13px] font-medium text-white"
                 style={{ background: "var(--brand)" }}
                 onClick={() => handleInstall("vulkan")}
                 title="下载并解压到应用私有目录，约 31 MB"
@@ -341,7 +344,7 @@ export function Translate({
                 下载运行时（Vulkan · 约 31 MB）
               </button>
               <button
-                className="h-9 rounded-lg border px-3 text-[13px]"
+                className="btn h-9 rounded-lg border px-3 text-[13px]"
                 style={{ ...selectStyle }}
                 onClick={handleManual}
               >
@@ -369,15 +372,12 @@ export function Translate({
       )}
 
       {runtime?.installed && models.length === 0 && !engineError && (
-        <section
-          className="rounded-xl border p-3 text-[13px]"
-          style={{ background: "var(--surface)", borderColor: "var(--border)" }}
-        >
+        <section className="card p-3.5 text-[13px]">
           <span style={{ color: "var(--text-muted)" }}>
             模型目录为空，把 .gguf 文件放进去后重新扫描。
           </span>
           <button
-            className="ml-3 h-8 rounded-lg border px-3 text-[12px]"
+            className="btn ml-3 h-8 rounded-lg border px-3 text-[12px]"
             style={selectStyle}
             onClick={async () => {
               await openModelsDir();
@@ -389,7 +389,7 @@ export function Translate({
           </button>
 
           <button
-            className="ml-2 h-8 rounded-lg border px-3 text-[12px]"
+            className="btn ml-2 h-8 rounded-lg border px-3 text-[12px]"
             style={selectStyle}
             onClick={async () => {
               const dir = window.prompt(
@@ -413,56 +413,44 @@ export function Translate({
 
       {/* 工具栏：强制单行，窗口变窄时只压缩模型下拉，不换行 */}
       <div className="flex flex-nowrap items-center gap-2">
-        <select
-          className={`${selectClass} w-[104px] shrink-0`}
-          style={selectStyle}
+        <Select
+          className="w-[112px] shrink-0"
           value={source}
-          onChange={(e) => setSource(e.target.value)}
-        >
-          {LANGUAGES.map((l) => (
-            <option key={l.code} value={l.code}>
-              {l.label}
-            </option>
-          ))}
-        </select>
+          options={LANGUAGES}
+          onChange={setSource}
+          title="原文语言"
+        />
 
-        <span className="shrink-0" style={{ color: "var(--text-muted)" }}>
+        <span className="shrink-0 text-[12px]" style={{ color: "var(--text-muted)" }}>
           →
         </span>
 
-        <select
-          className={`${selectClass} w-[96px] shrink-0`}
-          style={selectStyle}
+        <Select
+          className="w-[104px] shrink-0"
           value={target}
-          onChange={(e) => setTarget(e.target.value)}
-        >
-          {LANGUAGES.filter((l) => l.code !== "auto").map((l) => (
-            <option key={l.code} value={l.code}>
-              {l.label}
-            </option>
-          ))}
-        </select>
+          options={LANGUAGES.filter((l) => l.value !== "auto")}
+          onChange={setTarget}
+          title="译文语言"
+        />
 
         <span
           className="mx-0.5 h-5 w-px shrink-0"
           style={{ background: "var(--border)" }}
         />
 
-        <select
-          className={`${selectClass} min-w-0 flex-1`}
-          style={selectStyle}
+        <Select
+          className="min-w-0 flex-1"
           value={model}
-          onChange={(e) => setModel(e.target.value)}
+          options={models.map((m) => ({
+            value: m.id,
+            label: m.id,
+            hint: stateLabel(m.state),
+          }))}
+          onChange={setModel}
           disabled={models.length === 0}
+          placeholder="未发现模型"
           title={model || "未发现模型"}
-        >
-          {models.length === 0 && <option value="">未发现模型</option>}
-          {models.map((m) => (
-            <option key={m.id} value={m.id}>
-              {m.id}
-            </option>
-          ))}
-        </select>
+        />
 
         <ModelStateBadge state={currentModelState} />
       </div>
@@ -471,37 +459,34 @@ export function Translate({
 
       {/* 输入 / 输出 */}
       <div className="grid min-h-0 flex-1 grid-cols-1 gap-3 lg:grid-cols-2">
-        <section
-          className="flex min-h-0 flex-col overflow-hidden rounded-xl border"
-          style={{ background: "var(--surface)", borderColor: "var(--border)" }}
-        >
-          <header
-            className="flex items-center justify-between border-b px-3 py-2 text-[12px]"
-            style={{ borderColor: "var(--border)", color: "var(--text-muted)" }}
-          >
+        <section className="card flex min-h-0 flex-col overflow-hidden">
+          <header className="panel-head">
             <span>原文</span>
-            <span>{input.length} 字</span>
+            <span className="tabular-nums opacity-80">{input.length} 字</span>
           </header>
           <textarea
-            className="min-h-0 flex-1 resize-none bg-transparent p-3 outline-none"
+            className="min-h-0 flex-1 resize-none bg-transparent px-3.5 py-3 text-[13px] leading-relaxed outline-none placeholder:opacity-40"
             placeholder="粘贴或输入要翻译的内容…"
             value={input}
             onChange={(e) => setInput(e.target.value)}
           />
         </section>
 
-        <section
-          className="flex min-h-0 flex-col overflow-hidden rounded-xl border"
-          style={{ background: "var(--surface)", borderColor: "var(--border)" }}
-        >
-          <header
-            className="flex items-center justify-between border-b px-3 py-2 text-[12px]"
-            style={{ borderColor: "var(--border)", color: "var(--text-muted)" }}
-          >
+        <section className="card flex min-h-0 flex-col overflow-hidden">
+          <header className="panel-head">
             <span>译文</span>
             <span className="flex min-w-0 items-center gap-2.5">
               {quality.length > 0 && <QualityNote reports={quality} />}
-              <span className="shrink-0">
+              {output && !busy && (
+                <button
+                  className="btn rounded px-1 text-[11px] opacity-70 hover:opacity-100"
+                  onClick={() => copyOutput(output)}
+                  title="复制译文"
+                >
+                  复制
+                </button>
+              )}
+              <span className="shrink-0 tabular-nums">
                 {busy
                   ? segmentProgress.total > 1
                     ? `翻译中 ${segmentProgress.done}/${segmentProgress.total}`
@@ -510,15 +495,17 @@ export function Translate({
               </span>
             </span>
           </header>
-          <div className="min-h-0 flex-1 overflow-auto p-3">
+          <div className="min-h-0 flex-1 overflow-auto px-3.5 py-3">
             {engineError && !output ? (
               <p className="m-0 text-[12px]" style={{ color: "var(--danger)" }}>
                 {engineError}
               </p>
             ) : output ? (
-              <p className="m-0 whitespace-pre-wrap">{output}</p>
+              <p className="m-0 whitespace-pre-wrap text-[13px] leading-relaxed">
+                {output}
+              </p>
             ) : (
-              <p className="m-0" style={{ color: "var(--text-muted)" }}>
+              <p className="m-0 text-[13px]" style={{ color: "var(--text-muted)" }}>
                 译文会显示在这里
               </p>
             )}
@@ -550,7 +537,7 @@ export function Translate({
 
         {output && onSendToChat && (
           <button
-            className="h-10 rounded-lg border px-4 text-[13px]"
+            className="btn h-10 rounded-lg border px-4 text-[13px]"
             style={selectStyle}
             onClick={() => onSendToChat(output)}
             title="把译文带到对话页，可以润色、改语意、增减内容"
@@ -560,7 +547,7 @@ export function Translate({
         )}
 
         <button
-          className="ml-auto h-10 rounded-lg border px-4 text-[13px]"
+          className="btn ml-auto h-10 rounded-lg border px-4 text-[13px]"
           style={selectStyle}
           onClick={() => {
             setInput("");

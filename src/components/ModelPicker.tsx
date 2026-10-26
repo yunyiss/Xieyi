@@ -166,12 +166,8 @@ export function ModelPicker({
 
       {open && (
         <div
-          className="absolute bottom-full right-0 z-30 mb-2 max-h-[70vh] w-[300px] max-w-[calc(100vw-24px)] overflow-y-auto rounded-xl border p-2 shadow-lg"
-          style={{
-            background: "var(--surface)",
-            borderColor: "var(--border)",
-            boxShadow: "0 16px 40px rgba(0,0,0,0.16)",
-          }}
+          className="popover absolute bottom-full right-0 z-30 mb-2 max-h-[70vh] w-[300px] max-w-[calc(100vw-24px)] overflow-y-auto p-2"
+          style={{ animation: "pop-in-up var(--dur) var(--ease-out) both" }}
         >
           {view === "root" && (
             <>
@@ -251,12 +247,8 @@ function Row({
 }) {
   return (
     <button
-      className="flex min-h-11 w-full items-center gap-3 rounded-md px-3 text-left text-[14px] transition-colors"
+      className="row flex min-h-11 w-full items-center gap-3 px-3 text-left text-[14px]"
       style={{ color: "var(--text)" }}
-      onMouseEnter={(e) =>
-        (e.currentTarget.style.background = "var(--surface-muted)")
-      }
-      onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
       onClick={onClick}
     >
       <span className="shrink-0">{label}</span>
@@ -285,17 +277,9 @@ function Item({
 }) {
   return (
     <button
-      className="flex min-h-11 w-full items-center gap-3 rounded-md px-3 text-left text-[14px] transition-colors"
-      style={{
-        background: selected ? "var(--surface-muted)" : "transparent",
-        color: "var(--text)",
-      }}
-      onMouseEnter={(e) => (e.currentTarget.style.background = "var(--surface-muted)")}
-      onMouseLeave={(e) =>
-        (e.currentTarget.style.background = selected
-          ? "var(--surface-muted)"
-          : "transparent")
-      }
+      className="row flex min-h-11 w-full items-center gap-3 px-3 text-left text-[14px]"
+      style={{ color: "var(--text)" }}
+      data-selected={selected}
       onClick={onClick}
     >
       <span className="flex w-3 shrink-0 justify-center">
@@ -326,10 +310,8 @@ function Item({
 function Back({ title, onClick }: { title: string; onClick: () => void }) {
   return (
     <button
-      className="flex min-h-9 w-full items-center gap-2 rounded-md px-2 text-left text-[12px] transition-colors"
+      className="row flex min-h-9 w-full items-center gap-2 px-2 text-left text-[12px]"
       style={{ color: "var(--text-muted)" }}
-      onMouseEnter={(e) => (e.currentTarget.style.background = "var(--surface-muted)")}
-      onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
       onClick={onClick}
     >
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden>

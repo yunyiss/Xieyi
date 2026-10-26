@@ -2,8 +2,9 @@ import { useCallback, useEffect, useState } from "react";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { LoadIndicator, toLoadState, type LoadState } from "../components/LoadIndicator";
-import { ModelStateBadge } from "../components/ModelStateBadge";
+import { ModelStateBadge, stateLabel } from "../components/ModelStateBadge";
 import { RunButton } from "../components/RunButton";
+import { Select } from "../components/Select";
 import {
   baseName,
   batchCancel,
@@ -22,25 +23,16 @@ import {
 } from "../lib/ipc";
 
 const LANGUAGES = [
-  { code: "auto", label: "自动检测" },
-  { code: "zh", label: "中文" },
-  { code: "en", label: "英语" },
-  { code: "ja", label: "日语" },
-  { code: "ko", label: "韩语" },
-  { code: "fr", label: "法语" },
-  { code: "de", label: "德语" },
-  { code: "es", label: "西班牙语" },
-  { code: "ru", label: "俄语" },
+  { value: "auto", label: "自动检测" },
+  { value: "zh", label: "中文" },
+  { value: "en", label: "英语" },
+  { value: "ja", label: "日语" },
+  { value: "ko", label: "韩语" },
+  { value: "fr", label: "法语" },
+  { value: "de", label: "德语" },
+  { value: "es", label: "西班牙语" },
+  { value: "ru", label: "俄语" },
 ];
-
-const selectStyle = {
-  background: "var(--surface)",
-  borderColor: "var(--border)",
-  color: "var(--text)",
-};
-
-const selectClass =
-  "h-9 rounded-lg border px-2.5 text-[13px] outline-none transition-colors focus:border-[var(--brand)]";
 
 const btnStyle = {
   background: "var(--surface)",
@@ -205,19 +197,25 @@ export function Batch({ refreshSignal = 0, active = true }: Props) {
     }
 
     let un: UnlistenFn | null = null;
-    getCurrentWebview()
-      .onDragDropEvent((event) => {
-        const payload = event.payload;
-        if (payload.type === "over") {
-          setDragging(true);
-        } else if (payload.type === "leave") {
-          setDragging(false);
-        } else if (payload.type === "drop") {
-          setDragging(false);
-          addPaths(payload.paths);
-        }
-      })
-      .then((fn) => (un = fn));
+    // 拖放走 Tauri 原生 API。在纯浏览器里跑（比如本地预览 UI）它不存在，
+    // 抛错会把整页打白，所以这里兜一层：没有原生拖放就退回只有「添加文件」。
+    try {
+      getCurrentWebview()
+        .onDragDropEvent((event) => {
+          const payload = event.payload;
+          if (payload.type === "over") {
+            setDragging(true);
+          } else if (payload.type === "leave") {
+            setDragging(false);
+          } else if (payload.type === "drop") {
+            setDragging(false);
+            addPaths(payload.paths);
+          }
+        })
+        .then((fn) => (un = fn));
+    } catch {
+      // 忽略：非 Tauri 环境没有拖放能力
+    }
     return () => {
       un?.();
     };
@@ -283,58 +281,46 @@ export function Batch({ refreshSignal = 0, active = true }: Props) {
     <div className="flex h-full flex-col gap-3 p-4">
       {/* 工具栏：与翻译页同构，强制单行 */}
       <div className="flex flex-nowrap items-center gap-2">
-        <select
-          className={`${selectClass} w-[104px] shrink-0`}
-          style={selectStyle}
+        <Select
+          className="w-[112px] shrink-0"
           value={source}
-          onChange={(e) => setSource(e.target.value)}
+          options={LANGUAGES}
+          onChange={setSource}
           disabled={running}
-        >
-          {LANGUAGES.map((l) => (
-            <option key={l.code} value={l.code}>
-              {l.label}
-            </option>
-          ))}
-        </select>
+          title="原文语言"
+        />
 
-        <span className="shrink-0" style={{ color: "var(--text-muted)" }}>
+        <span className="shrink-0 text-[12px]" style={{ color: "var(--text-muted)" }}>
           →
         </span>
 
-        <select
-          className={`${selectClass} w-[96px] shrink-0`}
-          style={selectStyle}
+        <Select
+          className="w-[104px] shrink-0"
           value={target}
-          onChange={(e) => setTarget(e.target.value)}
+          options={LANGUAGES.filter((l) => l.value !== "auto")}
+          onChange={setTarget}
           disabled={running}
-        >
-          {LANGUAGES.filter((l) => l.code !== "auto").map((l) => (
-            <option key={l.code} value={l.code}>
-              {l.label}
-            </option>
-          ))}
-        </select>
+          title="译文语言"
+        />
 
         <span
           className="mx-0.5 h-5 w-px shrink-0"
           style={{ background: "var(--border)" }}
         />
 
-        <select
-          className={`${selectClass} min-w-0 flex-1`}
-          style={selectStyle}
+        <Select
+          className="min-w-0 flex-1"
           value={model}
-          onChange={(e) => setModel(e.target.value)}
+          options={models.map((m) => ({
+            value: m.id,
+            label: m.id,
+            hint: stateLabel(m.state),
+          }))}
+          onChange={setModel}
           disabled={models.length === 0 || running}
+          placeholder="未发现模型"
           title={model || "未发现模型"}
-        >
-          {models.length === 0 && <option value="">未发现模型</option>}
-          {models.map((m) => (
-            <option key={m.id} value={m.id}>
-              {m.id}
-            </option>
-          ))}
-        </select>
+        />
 
         <ModelStateBadge state={currentModelState} />
       </div>
@@ -343,21 +329,20 @@ export function Batch({ refreshSignal = 0, active = true }: Props) {
 
       {/* 队列 */}
       <section
-        className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl border"
+        className="card flex min-h-0 flex-1 flex-col overflow-hidden"
         style={{
           background: dragging ? "var(--brand-soft)" : "var(--surface)",
           borderColor: dragging ? "var(--brand)" : "var(--border)",
+          boxShadow: dragging ? "var(--shadow-2)" : "var(--shadow-1)",
+          transition: "background var(--dur) var(--ease-out), border-color var(--dur) var(--ease-out)",
         }}
       >
-        <header
-          className="flex shrink-0 items-center justify-between border-b px-3 py-2 text-[12px]"
-          style={{ borderColor: "var(--border)", color: "var(--text-muted)" }}
-        >
+        <header className="panel-head">
           <span>
             队列 {queue.length} 个文件
             {queue.length > 0 && ` · 已完成 ${finished} · 失败 ${failed}`}
           </span>
-          <span>
+          <span className={dragging ? "" : "opacity-80"}>
             {dragging
               ? "松手即可加入队列"
               : "把 txt / md / srt 拖进来，或点「添加文件」"}
@@ -366,10 +351,34 @@ export function Batch({ refreshSignal = 0, active = true }: Props) {
 
         <div className="min-h-0 flex-1 overflow-auto p-2">
           {queue.length === 0 ? (
-            <div className="flex h-full items-center justify-center">
-              <p className="m-0 text-[13px]" style={{ color: "var(--text-muted)" }}>
-                队列是空的
-              </p>
+            // 空队列给一个"可以往里拖"的视觉暗示，而不是干巴巴一行字
+            <div className="flex h-full items-center justify-center p-4">
+              <button
+                className="btn flex w-full max-w-[420px] flex-col items-center gap-2 rounded-[14px] border border-dashed px-6 py-10 transition-colors"
+                style={{
+                  borderColor: dragging ? "var(--brand)" : "var(--border-strong)",
+                  background: dragging ? "var(--brand-soft)" : "transparent",
+                  color: "var(--text-muted)",
+                }}
+                onClick={pick}
+                disabled={running}
+              >
+                <svg width="28" height="28" viewBox="0 0 24 24" fill="none" aria-hidden>
+                  <path
+                    d="M12 16V6m0 0-3.5 3.5M12 6l3.5 3.5M5 16.5v1A2.5 2.5 0 0 0 7.5 20h9a2.5 2.5 0 0 0 2.5-2.5v-1"
+                    stroke="currentColor"
+                    strokeWidth="1.6"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                </svg>
+                <span className="text-[13px]">
+                  {dragging ? "松手即可加入队列" : "把文件拖到这里"}
+                </span>
+                <span className="text-[11px] opacity-70">
+                  支持 .txt / .md / .srt，也可以点这里选择文件
+                </span>
+              </button>
             </div>
           ) : (
             <ul className="m-0 flex list-none flex-col gap-1.5 p-0">
@@ -378,7 +387,7 @@ export function Batch({ refreshSignal = 0, active = true }: Props) {
                 return (
                   <li
                     key={item.path}
-                    className="rounded-lg border px-2.5 py-2"
+                    className="rounded-[10px] border px-2.5 py-2 transition-colors"
                     style={{
                       background: "var(--surface-muted)",
                       borderColor: active
@@ -406,7 +415,7 @@ export function Batch({ refreshSignal = 0, active = true }: Props) {
 
                       {!running && (
                         <button
-                          className="h-6 shrink-0 rounded-md border px-2 text-[11px]"
+                          className="btn h-6 shrink-0 rounded-md border px-2 text-[11px]"
                           style={btnStyle}
                           onClick={() =>
                             setQueue((prev) => prev.filter((i) => i.path !== item.path))
@@ -468,10 +477,11 @@ export function Batch({ refreshSignal = 0, active = true }: Props) {
       {/* 操作区 */}
       <div className="flex items-center gap-2">
         <button
-          className="h-10 rounded-lg border px-4 text-[13px] disabled:opacity-50"
+          className="btn h-10 rounded-lg border px-4 text-[13px] disabled:opacity-50"
           style={btnStyle}
           onClick={pick}
           disabled={running}
+          title="选择要翻译的 txt / md / srt 文件"
         >
           添加文件
         </button>
@@ -502,7 +512,7 @@ export function Batch({ refreshSignal = 0, active = true }: Props) {
         )}
 
         <button
-          className="ml-auto h-10 rounded-lg border px-4 text-[13px] disabled:opacity-50"
+          className="btn ml-auto h-10 rounded-lg border px-4 text-[13px] disabled:opacity-50"
           style={btnStyle}
           onClick={() => {
             setQueue([]);
