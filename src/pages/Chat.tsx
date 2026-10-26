@@ -26,36 +26,29 @@ import {
   type ThinkingMode,
   type UsagePayload,
 } from "../lib/ipc";
+import {
+  canRegenerateAt,
+  ensureMessageIds,
+  indexOfMessage,
+  makeMessage,
+  normalizeHistory,
+} from "../lib/chat";
 
-function newId(): string {
+/** 会话 id 与消息 id 用同一套生成方式，但两者互不相干。 */
+function newSessionId(): string {
   const c = globalThis.crypto as Crypto | undefined;
   if (c?.randomUUID) return c.randomUUID();
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
 /**
- * 合并相邻的同角色消息。
- *
- * 删掉某条回复后，上下文里可能出现连续两条 user（或连续 assistant）。
- * 不少对话模板（Qwen 一类）要求角色严格交替，遇到不交替会直接报错，
- * 所以发请求前把相邻同角色合并成一条，用空行分隔原文。
+ * 读入旧会话时补齐消息 id（旧文件没有这个字段）；
+ * 上次异常退出留下的 pending 不会再有后续事件，统一按 stopped 处理。
  */
-function normalizeHistory(messages: ChatMessage[]): ChatMessage[] {
-  const out: ChatMessage[] = [];
-  for (const m of messages) {
-    // 思维链只用于显示，不参与请求：这里顺便剥掉，别把大段思考塞进上下文
-    const clean: ChatMessage = { role: m.role, content: m.content };
-    const last = out[out.length - 1];
-    if (last && last.role === clean.role) {
-      out[out.length - 1] = {
-        ...last,
-        content: `${last.content}\n\n${clean.content}`.trim(),
-      };
-    } else {
-      out.push(clean);
-    }
-  }
-  return out;
+function hydrate(messages: ChatMessage[]): ChatMessage[] {
+  return ensureMessageIds(messages).map(
+    (m): ChatMessage => (m.status === "pending" ? { ...m, status: "stopped" } : m),
+  );
 }
 
 interface Props {
@@ -113,7 +106,7 @@ export function Chat({
   /** 环境类问题（运行时没装、引擎起不来、模型列表拉不到）：走空状态区，不当"报错"砸出来 */
   const [setupError, setSetupError] = useState("");
   const [sessions, setSessions] = useState<Session[]>([]);
-  const [sessionId, setSessionId] = useState(() => newId());
+  const [sessionId, setSessionId] = useState(() => newSessionId());
   const [load, setLoad] = useState<LoadState | null>(null);
   const [usage, setUsage] = useState<UsagePayload | null>(null);
   /** 本次会话累计用量 */
@@ -121,7 +114,7 @@ export function Chat({
   const [localModels, setLocalModels] = useState<LocalModel[]>([]);
   const [thinking, setThinking] = useState<ThinkingMode>("off");
   /** 正在编辑并准备重发的用户消息（只允许同时编辑一条） */
-  const [editing, setEditing] = useState<{ index: number; text: string } | null>(null);
+  const [editing, setEditing] = useState<{ id: string; text: string } | null>(null);
   /** 本次请求的思维链正文（只在思考型模型 + 思考开启时出现） */
   const [reasoning, setReasoning] = useState("");
   /** 本次发送要附加的快捷指令（不写进会话历史，只作用于这一轮） */
@@ -136,6 +129,8 @@ export function Chat({
   const streamedRef = useRef("");
   /** 当前正在进行的请求 id：思维链事件按它过滤 */
   const activeIdRef = useRef("");
+  /** 用户点了停止：请求失败时要区分"主动中断"与"真出错" */
+  const stoppedRef = useRef(false);
   /** 思维链正文的实时副本：请求结束时把它写进这条回复，之后还能回看 */
   const reasoningRef = useRef("");
 
@@ -273,10 +268,16 @@ export function Chat({
   };
 
   /**
-   * `display` 用于渲染与持久化，`outbound` 是真正发给模型的版本。
+   * `display` 用于渲染与持久化（已包含一条 pending 的助手占位消息），
+   * `outbound` 是真正发给模型的版本，`replyId` 指向那条占位消息。
+   *
    * 两者只在带了快捷指令时不同：指令作为系统消息只作用于这一轮，不写进会话历史。
    */
-  const sendWith = async (display: ChatMessage[], outbound: ChatMessage[]) => {
+  const sendWith = async (
+    display: ChatMessage[],
+    outbound: ChatMessage[],
+    replyId: string,
+  ) => {
     if (!model) {
       setError("请先选择模型");
       return;
@@ -284,6 +285,7 @@ export function Chat({
 
     setError("");
     setBusy(true);
+    stoppedRef.current = false;
     streamedRef.current = "";
     // 新请求的思维链重新开始，默认展开——要让用户看到"模型在想，没卡住"
     reasoningRef.current = "";
@@ -295,14 +297,12 @@ export function Chat({
     unlistenRef.current = await onToken((p) => {
       if (p.requestId !== id) return;
       streamedRef.current += p.token;
-      setMessages((prev) => {
-        if (prev.length === 0) return prev;
-        const last = prev[prev.length - 1];
-        return [
-          ...prev.slice(0, -1),
-          { ...last, content: last.content + p.token },
-        ];
-      });
+      // 按消息 id 更新，不再假设"最后一条就是回复"——重试/编辑时更稳
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === replyId ? { ...m, content: m.content + p.token } : m,
+        ),
+      );
     });
 
     try {
@@ -314,23 +314,34 @@ export function Chat({
       });
       // 思维链随这条回复一起存下来，之后还能点开回看
       const think = reasoningRef.current.trim();
-      const finalMessages: ChatMessage[] = [
-        ...display,
-        { role: "assistant", content: full, ...(think ? { reasoning: think } : {}) },
-      ];
+      const finalMessages: ChatMessage[] = display.map(
+        (m): ChatMessage =>
+          m.id === replyId
+            ? {
+                ...m,
+                content: full,
+                status: "ready",
+                ...(think ? { reasoning: think } : {}),
+              }
+            : m,
+      );
       setMessages(finalMessages);
       await persist(finalMessages, model, sessionId);
     } catch (e) {
-      setError(String(e));
-      // 已经流出一部分就留着，别因为报错把用户看到的内容一起抹掉；
-      // 一个字都没有时才收掉空回复气泡，只保留提问。
-      if (!streamedRef.current.trim()) {
-        setMessages((prev) => {
-          const last = prev[prev.length - 1];
-          if (last?.role === "assistant" && !last.content) return prev.slice(0, -1);
-          return prev;
-        });
-      }
+      // 主动停止不算错误：气泡自己会显示"已停止"，不再弹红条
+      const stopped = stoppedRef.current;
+      if (!stopped) setError(String(e));
+
+      // 已经流出一部分就留着，标成 error/stopped 让用户知道它不完整；
+      // 一个字都没有时收掉空回复气泡，只保留提问（操作条上的"重试"仍然可用）。
+      setMessages((prev) => {
+        if (!streamedRef.current.trim()) {
+          return prev.filter((m) => m.id !== replyId);
+        }
+        return prev.map((m) =>
+          m.id === replyId ? { ...m, status: stopped ? "stopped" : "error" } : m,
+        );
+      });
     } finally {
       unlistenRef.current?.();
       unlistenRef.current = null;
@@ -347,42 +358,43 @@ export function Chat({
     if (!text || busy) return;
 
     setInput("");
-    const history: ChatMessage[] = [
-      ...messages,
-      { role: "user", content: text },
-    ];
-    setMessages([...history, { role: "assistant", content: "" }]);
+    const history: ChatMessage[] = [...messages, makeMessage("user", text)];
+    // 先插入一条 pending 的占位回复：流式 token 按 id 往这条上追加
+    const reply = makeMessage("assistant", "", { status: "pending" });
+    setMessages([...history, reply]);
 
     // 快捷指令作为系统消息插入，只影响这一轮，不污染会话历史
     const outbound: ChatMessage[] = instruction
       ? [
-          ...messages,
-          { role: "system", content: instruction.prompt },
-          { role: "user", content: text },
+          ...history.slice(0, -1),
+          makeMessage("system", instruction.prompt),
+          history[history.length - 1],
         ]
       : history;
 
     setInstruction(null);
-    await sendWith(history, outbound);
+    await sendWith([...history, reply], outbound, reply.id);
   };
 
   /**
-   * 从第 `index` 条（助手回复）重新生成：保留它之前的全部上下文，
+   * 从某条助手回复重新生成：保留它之前的全部上下文，
    * 丢掉这条及之后的所有消息，相当于"把对话回滚到这里再问一次"。
    */
-  const regenerateAt = async (index: number) => {
+  const regenerateAt = async (id: string) => {
     if (busy) return;
-    const before = messagesRef.current.slice(0, index);
+    const at = indexOfMessage(messagesRef.current, id);
+    const before = at > 0 ? messagesRef.current.slice(0, at) : [];
     if (before.length === 0 || before[before.length - 1].role !== "user") return;
 
-    setMessages([...before, { role: "assistant", content: "" }]);
-    await sendWith(before, before);
+    const reply = makeMessage("assistant", "", { status: "pending" });
+    setMessages([...before, reply]);
+    await sendWith([...before, reply], before, reply.id);
   };
 
   /** 删掉单条消息（用户提问或助手回复都可以），其余上下文保持不变。 */
-  const deleteAt = async (index: number) => {
+  const deleteAt = async (id: string) => {
     if (busy) return;
-    const next = messagesRef.current.filter((_, i) => i !== index);
+    const next = messagesRef.current.filter((m) => m.id !== id);
     setMessages(next);
     // 全删光了就把会话文件一起删掉，别在列表里留一条空壳
     if (next.length === 0) {
@@ -399,20 +411,23 @@ export function Chat({
   };
 
   /** 进入"编辑并重发"：只允许改用户消息。 */
-  const startEdit = (index: number) => {
-    const target = messagesRef.current[index];
+  const startEdit = (id: string) => {
+    const target = messagesRef.current.find((m) => m.id === id);
     if (!target || target.role !== "user") return;
-    setEditing({ index, text: target.content });
+    setEditing({ id, text: target.content });
   };
 
   /** 重试：最后一条提问没有拿到回复时（失败/中断），原样再发一次。 */
-  const resendAt = async (index: number) => {
-    const target = messagesRef.current[index];
-    if (busy || !target || target.role !== "user") return;
+  const resendAt = async (id: string) => {
+    if (busy) return;
+    const at = indexOfMessage(messagesRef.current, id);
+    const target = at >= 0 ? messagesRef.current[at] : undefined;
+    if (!target || target.role !== "user") return;
 
-    const history = messagesRef.current.slice(0, index + 1);
-    setMessages([...history, { role: "assistant", content: "" }]);
-    await sendWith(history, history);
+    const history = messagesRef.current.slice(0, at + 1);
+    const reply = makeMessage("assistant", "", { status: "pending" });
+    setMessages([...history, reply]);
+    await sendWith([...history, reply], history, reply.id);
   };
 
   /**
@@ -426,11 +441,14 @@ export function Chat({
     if (!text) return;
 
     setEditing(null);
-    const before = messagesRef.current.slice(0, draft.index);
-    const history: ChatMessage[] = [...before, { role: "user", content: text }];
+    const at = indexOfMessage(messagesRef.current, draft.id);
+    if (at < 0) return;
+    const before = messagesRef.current.slice(0, at);
+    const history: ChatMessage[] = [...before, makeMessage("user", text)];
+    const reply = makeMessage("assistant", "", { status: "pending" });
 
-    setMessages([...history, { role: "assistant", content: "" }]);
-    await sendWith(history, history);
+    setMessages([...history, reply]);
+    await sendWith([...history, reply], history, reply.id);
   };
 
   const switchSession = (id: string) => {
@@ -438,7 +456,7 @@ export function Chat({
     if (!target) return;
 
     setSessionId(id);
-    setMessages(target.messages);
+    setMessages(hydrate(target.messages));
     if (target.model) setModel(target.model);
     setTotals({ prompt: 0, generated: 0 });
     setError("");
@@ -446,7 +464,7 @@ export function Chat({
   };
 
   const newSession = () => {
-    setSessionId(newId());
+    setSessionId(newSessionId());
     setMessages([]);
     setTotals({ prompt: 0, generated: 0 });
     setError("");
@@ -537,10 +555,10 @@ export function Chat({
           {messages.map((m, i) => {
             const isUser = m.role === "user";
             const isLast = i === messages.length - 1;
-            const isEditing = editing?.index === i;
+            const isEditing = editing?.id === m.id;
 
             return (
-              <div key={i} className="group flex flex-col gap-1">
+              <div key={m.id} className="group flex flex-col gap-1">
                 <div className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
                   {isEditing ? (
                     // 编辑态：换成可改的输入框，保存即"替换这条并重发"
@@ -615,6 +633,12 @@ export function Chat({
                       >
                         {m.content || (busy && isLast && !reasoning ? "…" : "")}
                       </div>
+                      {/* 失败/中断时明确标出来，半截回复不会被误当成完整答案 */}
+                      {(m.status === "error" || m.status === "stopped") && (
+                        <span className="px-0.5 text-[11px]" style={{ color: "var(--text-muted)" }}>
+                          {m.status === "stopped" ? "已停止，回复可能不完整" : "生成中断，回复可能不完整"}
+                        </span>
+                      )}
                     </div>
                   )}
                 </div>
@@ -628,16 +652,16 @@ export function Chat({
                   >
                     {isUser ? (
                       <>
-                        <MsgAction onClick={() => startEdit(i)} title="改这条并重新请求回答">
+                        <MsgAction onClick={() => startEdit(m.id)} title="改这条并重新请求回答">
                           编辑
                         </MsgAction>
                         {/* 最后一条提问没有回复（失败/中断）时，给一个原样重试 */}
                         {isLast && (
-                          <MsgAction onClick={() => resendAt(i)} title="原样再发一次">
+                          <MsgAction onClick={() => resendAt(m.id)} title="原样再发一次">
                             重试
                           </MsgAction>
                         )}
-                        <MsgAction onClick={() => deleteAt(i)} title="从上下文里移除这条提问">
+                        <MsgAction onClick={() => deleteAt(m.id)} title="从上下文里移除这条提问">
                           删除
                         </MsgAction>
                       </>
@@ -648,17 +672,20 @@ export function Chat({
                             复制
                           </MsgAction>
                         )}
-                        {i > 0 && m.content && (
-                          <MsgAction
-                            onClick={() => regenerateAt(i)}
-                            title="从这条之前重新生成，之后的对话会丢弃"
-                          >
-                            重新生成
-                          </MsgAction>
-                        )}
+                        {canRegenerateAt(messages, m.id) &&
+                          (m.content || m.status === "error" || m.status === "stopped") && (
+                            <MsgAction
+                              onClick={() => regenerateAt(m.id)}
+                              title="从这条之前重新生成，之后的对话会丢弃"
+                            >
+                              {m.status === "error" || m.status === "stopped"
+                                ? "重试"
+                                : "重新生成"}
+                            </MsgAction>
+                          )}
                         <MsgAction
                           danger
-                          onClick={() => deleteAt(i)}
+                          onClick={() => deleteAt(m.id)}
                           title="从上下文里移除这条回复"
                         >
                           删除
@@ -788,7 +815,15 @@ export function Chat({
               <button
                 className="flex h-9 w-9 items-center justify-center rounded-full text-white transition-colors disabled:opacity-40"
                 style={{ background: busy ? "var(--text-muted)" : "var(--brand)" }}
-                onClick={() => (busy ? abort(model) : send())}
+                onClick={() => {
+                  if (!busy) {
+                    send();
+                    return;
+                  }
+                  // 标记为主动停止：失败路径据此关掉红条、把消息标成 stopped
+                  stoppedRef.current = true;
+                  abort(model).catch((e) => setError(String(e)));
+                }}
                 disabled={!busy && !model}
                 aria-label={busy ? "停止" : "发送"}
                 title={busy ? (load ? "停止加载" : "停止生成") : "发送（Enter）"}

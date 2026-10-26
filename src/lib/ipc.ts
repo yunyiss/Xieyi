@@ -110,10 +110,14 @@ export interface TranslateRequest {
 }
 
 export interface ChatMessage {
+  /** 消息唯一 id。动作定位与 React key 都用它，不再依赖数组下标。 */
+  id: string;
   role: "user" | "assistant" | "system";
   content: string;
   /** 思考型模型的思维链：只用于显示，发请求时会被忽略 */
   reasoning?: string;
+  /** 消息状态；旧会话没有这个字段，读入时按 ready 处理 */
+  status?: "ready" | "pending" | "error" | "stopped";
 }
 
 export interface ChatRequest {

@@ -7,11 +7,17 @@ use crate::paths;
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionMessage {
+    /// 消息唯一 id。旧会话文件没有这个字段，读入时前端会补。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub role: String,
     pub content: String,
     /// 思考型模型的思维链。只在对话页展示用，永远不参与请求上下文。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+    /// ready / pending / error / stopped。后端只做透明存储，语义由前端决定。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -122,6 +128,9 @@ mod tests {
         let session: Session = serde_json::from_str(raw).expect("旧格式应能解析");
         assert_eq!(session.messages.len(), 1);
         assert_eq!(session.messages[0].reasoning, None);
+        // 老消息既没有 id 也没有 status，前端读入时会补
+        assert_eq!(session.messages[0].id, None);
+        assert_eq!(session.messages[0].status, None);
     }
 
     #[test]
@@ -133,24 +142,32 @@ mod tests {
             updated_at: 1,
             messages: vec![
                 SessionMessage {
+                    id: Some("m1".into()),
                     role: "user".into(),
                     content: "问".into(),
                     reasoning: None,
+                    status: Some("ready".into()),
                 },
                 SessionMessage {
+                    id: Some("m2".into()),
                     role: "assistant".into(),
                     content: "答".into(),
                     reasoning: Some("想了一下".into()),
+                    status: Some("stopped".into()),
                 },
             ],
         };
 
         let json = serde_json::to_string(&session).unwrap();
         assert!(json.contains("\"reasoning\":\"想了一下\""));
+        assert!(json.contains("\"id\":\"m1\""));
+        assert!(json.contains("\"status\":\"stopped\""));
 
         let back: Session = serde_json::from_str(&json).unwrap();
         assert_eq!(back.messages[1].reasoning.as_deref(), Some("想了一下"));
         assert_eq!(back.messages[0].reasoning, None);
+        assert_eq!(back.messages[0].id.as_deref(), Some("m1"));
+        assert_eq!(back.messages[1].status.as_deref(), Some("stopped"));
         // 没有思维链的消息不该写出这个字段，避免会话文件臃肿
         assert!(!json.contains("\"reasoning\":null"));
     }
