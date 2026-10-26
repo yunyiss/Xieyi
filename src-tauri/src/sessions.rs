@@ -9,6 +9,9 @@ use crate::paths;
 pub struct SessionMessage {
     pub role: String,
     pub content: String,
+    /// 思考型模型的思维链。只在对话页展示用，永远不参与请求上下文。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -100,4 +103,55 @@ pub fn delete_all_sessions(app: AppHandle) -> Result<usize, String> {
         }
     }
     Ok(removed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_session_without_reasoning_still_loads() {
+        // 加字段之前写下的会话文件必须还能读：这是兼容性的底线
+        let raw = r#"{
+            "id": "abc",
+            "title": "旧对话",
+            "model": "m.gguf",
+            "updatedAt": 1,
+            "messages": [{ "role": "user", "content": "hi" }]
+        }"#;
+        let session: Session = serde_json::from_str(raw).expect("旧格式应能解析");
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.messages[0].reasoning, None);
+    }
+
+    #[test]
+    fn reasoning_round_trips_and_is_omitted_when_empty() {
+        let session = Session {
+            id: "abc".into(),
+            title: "带思考".into(),
+            model: "m.gguf".into(),
+            updated_at: 1,
+            messages: vec![
+                SessionMessage {
+                    role: "user".into(),
+                    content: "问".into(),
+                    reasoning: None,
+                },
+                SessionMessage {
+                    role: "assistant".into(),
+                    content: "答".into(),
+                    reasoning: Some("想了一下".into()),
+                },
+            ],
+        };
+
+        let json = serde_json::to_string(&session).unwrap();
+        assert!(json.contains("\"reasoning\":\"想了一下\""));
+
+        let back: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.messages[1].reasoning.as_deref(), Some("想了一下"));
+        assert_eq!(back.messages[0].reasoning, None);
+        // 没有思维链的消息不该写出这个字段，避免会话文件臃肿
+        assert!(!json.contains("\"reasoning\":null"));
+    }
 }

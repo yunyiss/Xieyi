@@ -43,14 +43,16 @@ function newId(): string {
 function normalizeHistory(messages: ChatMessage[]): ChatMessage[] {
   const out: ChatMessage[] = [];
   for (const m of messages) {
+    // 思维链只用于显示，不参与请求：这里顺便剥掉，别把大段思考塞进上下文
+    const clean: ChatMessage = { role: m.role, content: m.content };
     const last = out[out.length - 1];
-    if (last && last.role === m.role) {
+    if (last && last.role === clean.role) {
       out[out.length - 1] = {
         ...last,
-        content: `${last.content}\n\n${m.content}`.trim(),
+        content: `${last.content}\n\n${clean.content}`.trim(),
       };
     } else {
-      out.push({ ...m });
+      out.push(clean);
     }
   }
   return out;
@@ -122,8 +124,6 @@ export function Chat({
   const [editing, setEditing] = useState<{ index: number; text: string } | null>(null);
   /** 本次请求的思维链正文（只在思考型模型 + 思考开启时出现） */
   const [reasoning, setReasoning] = useState("");
-  /** 思维链面板是否展开；正文开始输出后自动收起 */
-  const [thinkOpen, setThinkOpen] = useState(true);
   /** 本次发送要附加的快捷指令（不写进会话历史，只作用于这一轮） */
   const [instruction, setInstruction] = useState<typeof QUICK_ACTIONS[number] | null>(
     null,
@@ -136,8 +136,8 @@ export function Chat({
   const streamedRef = useRef("");
   /** 当前正在进行的请求 id：思维链事件按它过滤 */
   const activeIdRef = useRef("");
-  /** 用户手动展开过思维链，就别在正文开始输出时自动收起 */
-  const thinkTouchedRef = useRef(false);
+  /** 思维链正文的实时副本：请求结束时把它写进这条回复，之后还能回看 */
+  const reasoningRef = useRef("");
 
   useEffect(() => {
     messagesRef.current = messages;
@@ -190,6 +190,7 @@ export function Chat({
     let un: UnlistenFn | null = null;
     onReasoning((p) => {
       if (p.requestId !== activeIdRef.current) return;
+      reasoningRef.current += p.token;
       setReasoning((prev) => prev + p.token);
     }).then((fn) => (un = fn));
     return () => {
@@ -285,9 +286,8 @@ export function Chat({
     setBusy(true);
     streamedRef.current = "";
     // 新请求的思维链重新开始，默认展开——要让用户看到"模型在想，没卡住"
+    reasoningRef.current = "";
     setReasoning("");
-    setThinkOpen(true);
-    thinkTouchedRef.current = false;
 
     const id = newRequestId();
     activeIdRef.current = id;
@@ -295,8 +295,6 @@ export function Chat({
     unlistenRef.current = await onToken((p) => {
       if (p.requestId !== id) return;
       streamedRef.current += p.token;
-      // 正文开始了就自动把思维链收起来，别让长思考挡着答案
-      if (!thinkTouchedRef.current) setThinkOpen(false);
       setMessages((prev) => {
         if (prev.length === 0) return prev;
         const last = prev[prev.length - 1];
@@ -314,9 +312,11 @@ export function Chat({
         messages: normalizeHistory(outbound),
         thinking,
       });
+      // 思维链随这条回复一起存下来，之后还能点开回看
+      const think = reasoningRef.current.trim();
       const finalMessages: ChatMessage[] = [
         ...display,
-        { role: "assistant", content: full },
+        { role: "assistant", content: full, ...(think ? { reasoning: think } : {}) },
       ];
       setMessages(finalMessages);
       await persist(finalMessages, model, sessionId);
@@ -335,7 +335,8 @@ export function Chat({
       unlistenRef.current?.();
       unlistenRef.current = null;
       activeIdRef.current = "";
-      // 请求结束就收掉思维链：它属于"等待中的进度提示"，不是历史内容
+      // 清掉"进行中"的副本；已完成的思维链已经挂在消息上了
+      reasoningRef.current = "";
       setReasoning("");
       setBusy(false);
     }
@@ -596,17 +597,18 @@ export function Chat({
                     </div>
                   ) : (
                     <div className="flex max-w-[94%] flex-col gap-1.5">
-                      {/* 思维链：只在本次请求进行中显示，告诉用户"模型还在想" */}
-                      {isLast && busy && reasoning && (
-                        <ThinkingPanel
-                          text={reasoning}
-                          open={thinkOpen}
-                          onToggle={() => {
-                            thinkTouchedRef.current = true;
-                            setThinkOpen((v) => !v);
-                          }}
-                        />
-                      )}
+                      {/* 思维链：思考中实时显示；答完之后仍折叠保留，可以点开回看 */}
+                      {(() => {
+                        const think = isLast && busy ? reasoning : m.reasoning;
+                        if (!think) return null;
+                        return (
+                          <ThinkingPanel
+                            text={think}
+                            live={Boolean(busy && isLast)}
+                            collapse={Boolean(m.content)}
+                          />
+                        );
+                      })()}
                       <div
                         className="whitespace-pre-wrap px-0.5 text-[13px] leading-relaxed"
                         style={{ color: "var(--text)" }}
@@ -817,20 +819,37 @@ export function Chat({
 }
 
 /**
- * 思维链面板：模型在"想"的时候显示，让人知道它没卡住。
+ * 思维链面板：模型在"想"的时候显示，让人知道它没卡住；
+ * 答完之后折叠保留（挂在消息上），随时可以点开回看。
  *
  * 展开时最多占 180px 高度、内部滚动——思考可能很长，不能把答案挤出视野；
- * 正文一开始输出就自动收起（除非用户手动展开过）。
+ * 正文一开始输出就自动收起（除非用户自己点开过）。
  */
 function ThinkingPanel({
   text,
-  open,
-  onToggle,
+  live,
+  collapse,
 }: {
   text: string;
-  open: boolean;
-  onToggle: () => void;
+  /** 正在思考中：标题转成"模型正在思考"并带脉冲点 */
+  live: boolean;
+  /** 正文已经开始输出：自动收起（用户手动展开过则不收） */
+  collapse: boolean;
 }) {
+  const [open, setOpen] = useState(live);
+  const touched = useRef(false);
+
+  useEffect(() => {
+    if (live) {
+      setOpen(true);
+      touched.current = false;
+    }
+  }, [live]);
+
+  useEffect(() => {
+    if (collapse && !touched.current) setOpen(false);
+  }, [collapse]);
+
   return (
     <div
       className="rounded-[10px] border"
@@ -842,15 +861,18 @@ function ThinkingPanel({
       <button
         className="row flex w-full items-center gap-2 px-2.5 py-1.5 text-left text-[11px]"
         style={{ color: "var(--text-muted)" }}
-        onClick={onToggle}
+        onClick={() => {
+          touched.current = true;
+          setOpen((v) => !v);
+        }}
         title={open ? "收起思考过程" : "展开思考过程"}
         aria-expanded={open}
       >
         <span
-          className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full"
-          style={{ background: "var(--brand)" }}
+          className={`h-1.5 w-1.5 shrink-0 rounded-full ${live ? "animate-pulse" : ""}`}
+          style={{ background: live ? "var(--brand)" : "var(--border-strong)" }}
         />
-        <span className="shrink-0">模型正在思考</span>
+        <span className="shrink-0">{live ? "模型正在思考" : "思考过程"}</span>
         <span className="min-w-0 flex-1 truncate opacity-70">
           {open ? "" : text.slice(-40)}
         </span>

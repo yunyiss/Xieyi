@@ -112,6 +112,8 @@ export interface TranslateRequest {
 export interface ChatMessage {
   role: "user" | "assistant" | "system";
   content: string;
+  /** 思考型模型的思维链：只用于显示，发请求时会被忽略 */
+  reasoning?: string;
 }
 
 export interface ChatRequest {
