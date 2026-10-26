@@ -47,6 +47,70 @@ struct TokenPayload {
 struct ModelStatePayload {
     model: String,
     state: String,
+    /// 加载阶段的可读描述（如「装填权重」「预热」）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    elapsed_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    estimate_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    percent: Option<u8>,
+}
+
+impl ModelStatePayload {
+    fn simple(model: &str, state: &str) -> Self {
+        Self {
+            model: model.to_string(),
+            state: state.to_string(),
+            phase: None,
+            elapsed_ms: None,
+            estimate_ms: None,
+            percent: None,
+        }
+    }
+
+    /// 加载中：llama.cpp 不提供真实进度，这里按体积估算并附带已耗时。
+    fn loading(model: &str, elapsed_ms: u64, estimate_ms: u64) -> Self {
+        let ratio = elapsed_ms as f64 / estimate_ms.max(1) as f64;
+        let percent = (ratio * 92.0).clamp(0.0, 92.0) as u8;
+
+        Self {
+            model: model.to_string(),
+            state: "loading".into(),
+            phase: Some("装填权重".into()),
+            elapsed_ms: Some(elapsed_ms),
+            estimate_ms: Some(estimate_ms),
+            percent: Some(percent),
+        }
+    }
+
+    /// 预热中：首推理开销（Vulkan 着色器编译约 3 秒）已挪到这一阶段。
+    fn warming(model: &str, estimate_ms: u64) -> Self {
+        Self {
+            model: model.to_string(),
+            state: "warming".into(),
+            phase: Some("预热".into()),
+            elapsed_ms: Some(0),
+            estimate_ms: Some(estimate_ms),
+            percent: Some(94),
+        }
+    }
+}
+
+/// 按模型体积估算加载耗时。实测基线：1.1GB ≈ 2.5s，5.5GB ≈ 7s。
+/// 仅用于展示预计剩余，不是精确值。
+fn estimate_load_ms(size_mb: u64) -> u64 {
+    1200 + size_mb * 12 / 10
+}
+
+/// 从本地模型目录查体积；只读文件元数据，开销很小。
+fn model_size_mb(app: &AppHandle, model: &str) -> u64 {
+    models::scan(app)
+        .into_iter()
+        .find(|m| m.id == model)
+        .map(|m| m.size_mb)
+        .unwrap_or(0)
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -249,14 +313,20 @@ impl Service {
 
     /// 加载专用等待：除了等 loaded，还要识别"加载中途回到 unloaded"
     /// —— 这通常意味着该 GGUF 不被当前 llama.cpp 构建支持，会立刻失败而不是干等超时。
+    ///
+    /// 期间按 500ms 节流上报 loading 状态（已耗时 + 估算总时长），
+    /// 让前端能显示进度而不是一片空白。这里的百分比是按体积估算的，不等于真实进度。
     async fn wait_loaded(
         &self,
+        app: &AppHandle,
         model: &str,
         timeout: Duration,
         cancel: &std::sync::atomic::AtomicBool,
+        estimate_ms: u64,
     ) -> Result<(), String> {
         let started = Instant::now();
         let mut seen_loading = false;
+        let mut last_emit = Duration::ZERO;
 
         loop {
             if cancel.load(Ordering::Relaxed) {
@@ -266,7 +336,21 @@ impl Service {
             let state = self.state_of(model).await?;
             match state.as_str() {
                 "loaded" => return Ok(()),
-                "loading" => seen_loading = true,
+                "loading" => {
+                    seen_loading = true;
+                    let elapsed = started.elapsed();
+                    if elapsed.saturating_sub(last_emit) >= Duration::from_millis(500) {
+                        last_emit = elapsed;
+                        let _ = app.emit(
+                            "model://state-changed",
+                            ModelStatePayload::loading(
+                                model,
+                                elapsed.as_millis() as u64,
+                                estimate_ms,
+                            ),
+                        );
+                    }
+                }
                 "unloaded" | "failed" if seen_loading => {
                     return Err(format!(
                         "模型加载失败（{model}）。可能是该 GGUF 的量化格式不受当前 llama.cpp 版本支持，或显存不足。"
@@ -280,6 +364,31 @@ impl Service {
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
+    }
+
+    /// 预热：跑一次极短推理，把首推理开销（Vulkan 着色器编译约 3 秒）
+    /// 从"用户看到的第一句话"挪到"加载阶段"。失败不影响使用，直接忽略。
+    async fn warmup(&self, model: &str, cancel: &std::sync::atomic::AtomicBool) -> Result<(), String> {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("已取消".into());
+        }
+
+        let body = serde_json::json!({
+            "model": model,
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 1,
+            "stream": false
+        });
+
+        self.client
+            .post(self.url("/v1/chat/completions"))
+            .bearer_auth(&self.key)
+            .json(&body)
+            .timeout(Duration::from_secs(60))
+            .send()
+            .await
+            .map_err(|e| format!("预热失败: {e}"))?;
+        Ok(())
     }
 
     pub async fn load(
@@ -296,18 +405,16 @@ impl Service {
             return Ok(());
         }
 
+        let estimate_ms = estimate_load_ms(model_size_mb(app, model));
         let _ = app.emit(
             "model://state-changed",
-            ModelStatePayload {
-                model: model.to_string(),
-                state: "loading".into(),
-            },
+            ModelStatePayload::loading(model, 0, estimate_ms),
         );
         self.post_json("/models/load", serde_json::json!({ "model": model }))
             .await?;
 
         let outcome = self
-            .wait_loaded(model, Duration::from_secs(180), cancel)
+            .wait_loaded(app, model, Duration::from_secs(180), cancel, estimate_ms)
             .await;
 
         if outcome.is_err() {
@@ -318,13 +425,17 @@ impl Service {
             self.loaded.lock().await.retain(|m| m != model);
             let _ = app.emit(
                 "model://state-changed",
-                ModelStatePayload {
-                    model: model.to_string(),
-                    state: "cold".into(),
-                },
+                ModelStatePayload::simple(model, "cold"),
             );
             return outcome;
         }
+
+        // 权重已就位，接着把首推理开销消化掉，用户的第一句话就不会卡在着色器编译上
+        let _ = app.emit(
+            "model://state-changed",
+            ModelStatePayload::warming(model, estimate_ms),
+        );
+        let _ = self.warmup(model, cancel).await;
 
         let mut loaded = self.loaded.lock().await;
         if !loaded.iter().any(|m| m == model) {
@@ -334,10 +445,7 @@ impl Service {
 
         let _ = app.emit(
             "model://state-changed",
-            ModelStatePayload {
-                model: model.to_string(),
-                state: "warm".into(),
-            },
+            ModelStatePayload::simple(model, "warm"),
         );
         Ok(())
     }
@@ -345,10 +453,7 @@ impl Service {
     pub async fn unload(&self, app: &AppHandle, model: &str) -> Result<(), String> {
         let _ = app.emit(
             "model://state-changed",
-            ModelStatePayload {
-                model: model.to_string(),
-                state: "unloading".into(),
-            },
+            ModelStatePayload::simple(model, "unloading"),
         );
         let no_cancel = std::sync::atomic::AtomicBool::new(false);
         self.post_json("/models/unload", serde_json::json!({ "model": model }))
@@ -359,10 +464,7 @@ impl Service {
         self.loaded.lock().await.retain(|m| m != model);
         let _ = app.emit(
             "model://state-changed",
-            ModelStatePayload {
-                model: model.to_string(),
-                state: "cold".into(),
-            },
+            ModelStatePayload::simple(model, "cold"),
         );
         Ok(())
     }

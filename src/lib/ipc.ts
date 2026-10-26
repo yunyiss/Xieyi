@@ -62,6 +62,19 @@ export interface TranslateProgress {
   total: number;
 }
 
+/**
+ * 模型状态事件。`loading` / `warming` 时附带加载阶段信息，用于显示进度。
+ * `percent` 是按模型体积估算的，不是 llama.cpp 的真实进度。
+ */
+export interface ModelStatePayload {
+  model: string;
+  state: string;
+  phase?: string;
+  elapsedMs?: number;
+  estimateMs?: number;
+  percent?: number;
+}
+
 export interface TranslateRequest {
   requestId: string;
   model: string;
@@ -148,11 +161,9 @@ export const onTranslateProgress = (
   listen<TranslateProgress>("translate://progress", (e) => cb(e.payload));
 
 export const onModelState = (
-  cb: (p: { model: string; state: string }) => void,
+  cb: (p: ModelStatePayload) => void,
 ): Promise<UnlistenFn> =>
-  listen<{ model: string; state: string }>("model://state-changed", (e) =>
-    cb(e.payload),
-  );
+  listen<ModelStatePayload>("model://state-changed", (e) => cb(e.payload));
 
 /** 生成一次请求的标识，用于把流式 token 归属到具体请求。 */
 export function newRequestId(): string {

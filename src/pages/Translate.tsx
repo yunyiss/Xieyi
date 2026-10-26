@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { ModelDrawer } from "../components/ModelDrawer";
+import { LoadIndicator, toLoadState, type LoadState } from "../components/LoadIndicator";
 import { ModelStateBadge } from "../components/ModelStateBadge";
 import {
   abort,
@@ -75,6 +76,7 @@ export function Translate() {
   const [progress, setProgress] = useState<RuntimeProgress | null>(null);
   const [engineError, setEngineError] = useState("");
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [load, setLoad] = useState<LoadState | null>(null);
   const [segmentProgress, setSegmentProgress] = useState({
     done: 0,
     total: 0,
@@ -129,6 +131,7 @@ export function Translate() {
       setModels((prev) =>
         prev.map((m) => (m.id === p.model ? { ...m, state: mapped } : m)),
       );
+      setLoad(toLoadState(p));
     }).then((fn) => (un = fn));
     return () => {
       un?.();
@@ -428,6 +431,8 @@ export function Translate() {
         </button>
       </div>
 
+      {load && <LoadIndicator load={load} />}
+
       {/* 输入 / 输出 */}
       <div className="grid min-h-0 flex-1 grid-cols-1 gap-3 lg:grid-cols-2">
         <section
@@ -496,7 +501,13 @@ export function Translate() {
           disabled={!ready || busy}
           onClick={handleRun}
         >
-          {busy ? "翻译中…" : "运行翻译"}
+          {load?.state === "warming"
+            ? "预热中…"
+            : load
+              ? "加载模型中…"
+              : busy
+                ? "翻译中…"
+                : "运行翻译"}
         </button>
 
         {busy && (
@@ -505,7 +516,7 @@ export function Translate() {
             style={selectStyle}
             onClick={handleStop}
           >
-            停止
+            {load ? "停止加载" : "停止"}
           </button>
         )}
 

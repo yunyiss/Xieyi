@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { UnlistenFn } from "@tauri-apps/api/event";
+import { LoadIndicator, toLoadState, type LoadState } from "../components/LoadIndicator";
 import { ModelStateBadge } from "../components/ModelStateBadge";
 import {
   abort,
@@ -44,6 +45,7 @@ export function Chat() {
   const [error, setError] = useState("");
   const [sessions, setSessions] = useState<Session[]>([]);
   const [sessionId, setSessionId] = useState(() => newId());
+  const [load, setLoad] = useState<LoadState | null>(null);
 
   const listRef = useRef<HTMLDivElement>(null);
   const unlistenRef = useRef<UnlistenFn | null>(null);
@@ -87,6 +89,7 @@ export function Chat() {
       setModels((prev) =>
         prev.map((m) => (m.id === p.model ? { ...m, state: mapped } : m)),
       );
+      setLoad(toLoadState(p));
     }).then((fn) => (un = fn));
     return () => {
       un?.();
@@ -273,6 +276,8 @@ export function Chat() {
         </span>
       </div>
 
+      {load && <LoadIndicator load={load} />}
+
       {/* 会话栏 */}
       <div className="flex flex-nowrap items-center gap-2">
         <select
@@ -391,7 +396,7 @@ export function Chat() {
           onClick={send}
           disabled={busy || !model}
         >
-          {busy ? "生成中…" : "发送"}
+          {load ? "加载中…" : busy ? "生成中…" : "发送"}
         </button>
 
         {busy && (
@@ -400,7 +405,7 @@ export function Chat() {
             style={controlStyle}
             onClick={() => abort(model)}
           >
-            停止
+            {load ? "停止加载" : "停止"}
           </button>
         )}
       </div>

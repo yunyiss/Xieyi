@@ -7,6 +7,7 @@ export function ModelStateBadge({ state }: Props) {
   const mapping: Record<string, { text: string; hot: boolean }> = {
     loaded: { text: "已加载", hot: true },
     loading: { text: "加载中", hot: true },
+    warming: { text: "预热中", hot: true },
     unloading: { text: "卸载中", hot: true },
     unloaded: { text: "未加载", hot: false },
     missing: { text: "未加载", hot: false },
