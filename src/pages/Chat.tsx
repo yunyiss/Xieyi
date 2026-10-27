@@ -334,8 +334,19 @@ export function Chat({
 
       // 已经流出一部分就留着，标成 error/stopped 让用户知道它不完整；
       // 一个字都没有时收掉空回复气泡，只保留提问（操作条上的"重试"仍然可用）。
+      //
+      // 例外：正在重新生成的那条（branchFrom 非空）本来就有旧版本，
+      // 更不能删——它的 id 被新占位复用了，删掉等于把用户之前的译文也抹了。
       setMessages((prev) => {
         if (!streamedRef.current.trim()) {
+          if (branchFrom) {
+            // 恢复成发起重新生成之前的样子：旧内容与旧版本都在
+            return prev.map((m) =>
+              m.id === replyId
+                ? { ...branchFrom, status: stopped ? "stopped" : "error" }
+                : m,
+            );
+          }
           return prev.filter((m) => m.id !== replyId);
         }
         return prev.map((m) =>

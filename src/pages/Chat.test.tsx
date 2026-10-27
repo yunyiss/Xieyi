@@ -229,6 +229,30 @@ describe("Chat", () => {
   });
 
   /**
+   * 重新生成失败时，旧版必须原样留着。
+   *
+   * 这里踩过一个坑：重新生成沿用了原消息 id，于是失败清理路径
+   * （"一个字都没流出就把这条气泡收掉"）会把带着旧版本的同一条消息一起删掉，
+   * 用户点一次重新生成、赶上请求失败，之前辛苦调出来的译文就没了。
+   */
+  it("重新生成失败时不会丢掉旧版译文", async () => {
+    chatMock.mockResolvedValue("珍贵的第一版");
+
+    await renderReady();
+    await sendText("翻译这段");
+    expect(await screen.findByText("珍贵的第一版")).toBeInTheDocument();
+
+    // 第二次请求直接失败，且没有任何内容流出
+    chatMock.mockRejectedValueOnce(new Error("模型未加载"));
+    const user = userEvent.setup();
+    await user.click(screen.getByText("重新生成"));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("模型未加载");
+    // 旧译文还在
+    expect(screen.getByText("珍贵的第一版")).toBeInTheDocument();
+  });
+
+  /**
    * 思维链曾被重复显示：StrictMode 会「挂载→卸载→再挂载」，
    * 而 listen() 是异步的，cleanup 拿不到注销函数，于是留下两个监听器，
    * 每个 token 被累加两次（`Thinking` 变成 `ThinkingThinking`）。
