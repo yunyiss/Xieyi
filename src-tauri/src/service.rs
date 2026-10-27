@@ -1245,6 +1245,95 @@ mod tests {
         }
     }
 
+    fn msg(role: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            role: role.to_string(),
+            content: content.to_string(),
+        }
+    }
+
+    /// 预算是按 ctx 算的，不是写死的字符数。
+    #[test]
+    fn history_budget_scales_with_context() {
+        assert!(history_budget(8192) > history_budget(4096));
+        // 极小 ctx 也要留一点，不能算出 0
+        assert!(history_budget(512) >= HISTORY_BUDGET_MIN);
+    }
+
+    /// 裁剪必须按轮次对齐：不能留下"没有提问的回答"。
+    ///
+    /// 用"一轮 = 短提问 + 长回答"来构造：如果按单条消息丢，
+    /// 长回答会先撞上预算被丢掉、短提问却被留下，正好制造出一段
+    /// 没有回答的孤儿提问；按轮次丢则整轮一起进出。
+    #[test]
+    fn trim_history_keeps_turns_aligned() {
+        let short = "问".repeat(100);
+        let long = "答".repeat(2000);
+
+        let messages = vec![
+            msg("user", &short),
+            msg("assistant", &long), // 第 1 轮：短问 + 长答
+            msg("user", &short),
+            msg("assistant", &long), // 第 2 轮
+            msg("user", "最后一句"),
+        ];
+
+        // 预算只够装最后一轮的多半，装不下完整的第 2 轮
+        let trimmed = trim_history(&messages, 1200);
+
+        // 按轮次丢：第 2 轮整轮被丢弃，不会留下孤零零的 user
+        assert_eq!(trimmed.last().unwrap().content, "最后一句");
+        assert_eq!(
+            trimmed.len(),
+            1,
+            "装不下整轮就该整轮丢掉，实际保留了：{:?}",
+            trimmed.iter().map(|m| m.role.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    /// 相邻消息成对进出：绝不以 assistant 开头。
+    #[test]
+    fn trim_history_never_starts_with_assistant() {
+        let long = "字".repeat(800);
+        let messages = vec![
+            msg("user", &long),
+            msg("assistant", &long),
+            msg("user", &long),
+            msg("assistant", &long),
+        ];
+
+        for budget_ctx in [700, 1000, 1500, 2000, 3000] {
+            let trimmed = trim_history(&messages, budget_ctx);
+            if let Some(first) = trimmed.first() {
+                assert_eq!(
+                    first.role, "user",
+                    "ctx={budget_ctx} 时裁出了 assistant 开头的历史"
+                );
+            }
+        }
+    }
+
+    /// 最后一条无论多长都要带上——用户刚说的话不能丢。
+    #[test]
+    fn trim_history_always_keeps_the_latest_message() {
+        let huge = "字".repeat(50_000);
+        let messages = vec![msg("user", &huge)];
+
+        let trimmed = trim_history(&messages, 4096);
+        assert_eq!(trimmed.len(), 1);
+        assert_eq!(trimmed[0].content.len(), huge.len());
+    }
+
+    #[test]
+    fn trim_history_passes_short_conversations_through() {
+        let messages = vec![
+            msg("user", "你好"),
+            msg("assistant", "你好！有什么可以帮你？"),
+        ];
+        assert_eq!(trim_history(&messages, 4096).len(), 2);
+        assert!(trim_history(&[], 4096).is_empty());
+    }
+
     /// 取消时必须拦住缓存写入：半截译文一旦进缓存就再也翻不掉了。
     #[test]
     fn cancelled_segment_is_never_cached() {
@@ -1406,25 +1495,79 @@ pub fn set_glossary(
     paths::set_config_value(&app, "glossary", serde_json::json!(entries))
 }
 
-/// 对话历史的字符预算（约 3000 tokens）。
-/// 超出时从最早的消息开始丢弃，避免把上下文窗口撑爆。
-const CHAT_HISTORY_CHARS: usize = 6000;
+/// 对话历史的内容预算（字符）。
+///
+/// 按默认 ctx 4096 算：输出预算最多 2048，留给输入约 2048 token ≈ 4000 字符。
+/// 之前写 6000 是按 8192 ctx 拍的，对 4096 的模型其实已经超了；
+/// 现在按"当前模型的 ctx"动态算，见 [`history_budget`]。
+const HISTORY_BUDGET_RATIO: f64 = 0.45;
 
-fn trim_history(messages: &[ChatMessage]) -> Vec<ChatMessage> {
-    let mut total = 0usize;
-    let mut keep: Vec<ChatMessage> = Vec::new();
+/// 至少给对话历史留这么多字符，免得极小 ctx 下一点上下文都带不上。
+const HISTORY_BUDGET_MIN: usize = 1200;
 
-    for message in messages.iter().rev() {
-        let len = message.content.chars().count();
-        if !keep.is_empty() && total + len > CHAT_HISTORY_CHARS {
-            break;
-        }
-        total += len;
-        keep.push(message.clone());
+/// 按模型上下文算出给"历史消息"用的字符预算。
+///
+/// 中英混排下大致 1 token ≈ 2 个中文字符（英文更省），这里取偏保守的换算，
+/// 并且只把 ctx 的一小部分分给历史——剩下的要留给输出和本轮提问。
+fn history_budget(ctx: u64) -> usize {
+    let tokens = (ctx as f64 * HISTORY_BUDGET_RATIO) as usize;
+    // 1 token ≈ 2 字符（中文为主时的经验值）
+    (tokens * 2).max(HISTORY_BUDGET_MIN)
+}
+
+/// 裁剪对话历史，使其落在预算内。
+///
+/// 两条规则，都来自"对话是成对出现的"这个事实：
+/// 1. **按轮次丢**：一轮 = 一条用户提问 + 它后面的一条助手回复。只按字符丢会把
+///    一轮砍成半截（比如留下 assistant 却丢掉它回答的那条 user），模型看到一段
+///    没有提问的回答会莫名其妙。
+/// 2. **保留最后一条**：哪怕它自己就超预算，也要带上——用户刚说的话不能丢。
+///
+/// 与旧实现的差别：旧版从后往前累加字符、遇到超限就 `break`，同样会切出
+/// "assistant 开头"的残缺历史。
+fn trim_history(messages: &[ChatMessage], ctx: u64) -> Vec<ChatMessage> {
+    if messages.is_empty() {
+        return Vec::new();
     }
 
-    keep.reverse();
-    keep
+    let budget = history_budget(ctx);
+
+    // 先按轮次分组：以 user 为界，把紧随其后的 assistant 归进同一轮。
+    // 开头若有不属于任何 user 的消息（历史遗留的 system / 孤立的 assistant），
+    // 单独成一组，这类通常优先级最低。
+    let mut turns: Vec<Vec<ChatMessage>> = Vec::new();
+    for message in messages {
+        let starts_turn = message.role == "user" || turns.is_empty();
+        if starts_turn {
+            turns.push(vec![message.clone()]);
+        } else if let Some(last) = turns.last_mut() {
+            last.push(message.clone());
+        }
+        // 变异：每条消息单独成组（旧的"按字符硬丢"等效行为）
+    }
+
+    // 从最新的轮次往回装，装不下就停。最后一条无论如何都要保留。
+    let mut kept: Vec<Vec<ChatMessage>> = Vec::new();
+    let mut used = 0usize;
+
+    for (index, turn) in turns.iter().enumerate().rev() {
+        let size: usize = turn.iter().map(|m| m.content.chars().count()).sum();
+        let is_last = index == turns.len() - 1;
+
+        if !is_last && used + size > budget {
+            break;
+        }
+        used += size;
+        kept.push(turn.clone());
+
+        // 已经装超了就别再往前加（最后一条超预算的情况）
+        if used > budget {
+            break;
+        }
+    }
+
+    kept.reverse();
+    kept.into_iter().flatten().collect()
 }
 
 #[tauri::command]
@@ -1443,11 +1586,12 @@ pub async fn chat(
     let _busy = InflightGuard::new(&state.inflight);
     state.cancel.store(false, Ordering::Relaxed);
 
-    let trimmed = trim_history(&request.messages);
-    let messages = serde_json::to_value(&trimmed).map_err(|e| e.to_string())?;
-
     // 对话允许按模型（或按这次会话）选择思考档位
     let model_params = params::get(&app, &request.model);
+
+    // 历史预算跟着该模型的 ctx 走：同一段对话换到小 ctx 模型时不能还按大预算裁
+    let trimmed = trim_history(&request.messages, model_params.ctx);
+    let messages = serde_json::to_value(&trimmed).map_err(|e| e.to_string())?;
     let thinking = request
         .thinking
         .as_deref()
