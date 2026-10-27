@@ -34,6 +34,9 @@ vi.mock("../lib/ipc", async (importOriginal) => {
         trainedCtx: 8192,
         supportsThinking: false,
         thinking: "off" as const,
+        chatCapable: true,
+        family: "通用",
+        unsupportedReason: null,
       },
     ]),
     newRequestId: vi.fn(() => "req-1"),
@@ -69,6 +72,27 @@ const chatMock = vi.mocked(ipc.chat);
 const compactMock = vi.mocked(ipc.compactHistory);
 const saveMock = vi.mocked(ipc.saveSession);
 const abortMock = vi.mocked(ipc.abort);
+const listLocalMock = vi.mocked(ipc.listLocalModels);
+const listRouterMock = vi.mocked(ipc.listRouterModels);
+
+/** 默认的"一个通用对话模型"环境；个别用例会覆盖它。 */
+function useDefaultModels() {
+  listRouterMock.mockResolvedValue([{ id: "demo.gguf", state: "loaded" }]);
+  listLocalMock.mockResolvedValue([
+    {
+      id: "demo.gguf",
+      path: "C:/models/demo.gguf",
+      sizeMb: 1024,
+      ctxSize: 4096,
+      trainedCtx: 8192,
+      supportsThinking: false,
+      thinking: "off" as const,
+      chatCapable: true,
+      family: "通用",
+      unsupportedReason: null,
+    },
+  ]);
+}
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -77,6 +101,9 @@ beforeEach(() => {
   compactMock.mockResolvedValue("压缩后的要点");
   abortMock.mockReset();
   abortMock.mockResolvedValue(undefined);
+  // 模型列表是模块级 mock，被某个用例改过之后会影响后续用例，
+  // 所以每条用例开跑前都恢复默认。
+  useDefaultModels();
   streams.token = null;
   streams.reasoning = null;
 });
@@ -102,6 +129,77 @@ async function sendText(text: string) {
 }
 
 describe("Chat", () => {
+  /**
+   * 翻译专用模型不能出现在对话页的模型列表里。
+   *
+   * 实测这类模型（translategemma、LMT-60）会把用户的问题本身翻译掉，
+   * 或者编造身份，放在对话页只会让用户以为工具坏了。
+   */
+  it("翻译专用模型不出现在对话页的模型列表", async () => {
+    listRouterMock.mockResolvedValue([
+      { id: "qwen.gguf", state: "unloaded" },
+      { id: "hy-mt2.gguf", state: "unloaded" },
+    ]);
+    listLocalMock.mockResolvedValue([
+      {
+        id: "qwen.gguf",
+        path: "C:/models/qwen.gguf",
+        sizeMb: 4000,
+        ctxSize: 8192,
+        trainedCtx: 32768,
+        supportsThinking: true,
+        thinking: "off" as const,
+        chatCapable: true,
+        family: "通用",
+        unsupportedReason: null,
+      },
+      {
+        id: "hy-mt2.gguf",
+        path: "C:/models/hy-mt2.gguf",
+        sizeMb: 1100,
+        ctxSize: 4096,
+        trainedCtx: 32768,
+        supportsThinking: false,
+        thinking: "off" as const,
+        chatCapable: false,
+        family: "Hy-MT2",
+        unsupportedReason: null,
+      },
+    ]);
+
+    await renderReady();
+
+    // 打开模型选择器：只应看到通用模型，翻译模型被过滤掉。
+    // 注意两点：界面会把 ".gguf" 去掉再显示；选中项在触发器和列表里各出现一次，
+    // 所以按"至少出现一次"断言。
+    const user = userEvent.setup();
+    await user.click(screen.getByLabelText("模型与思考强度"));
+    expect(screen.queryByText("hy-mt2")).not.toBeInTheDocument();
+    expect(screen.getAllByText("qwen").length).toBeGreaterThan(0);
+  });
+
+  /** 目录里只有翻译模型时，要明确告诉用户为什么对话页用不了。 */
+  it("只有翻译模型时给出明确说明", async () => {
+    listRouterMock.mockResolvedValue([{ id: "hy-mt2.gguf", state: "unloaded" }]);
+    listLocalMock.mockResolvedValue([
+      {
+        id: "hy-mt2.gguf",
+        path: "C:/models/hy-mt2.gguf",
+        sizeMb: 1100,
+        ctxSize: 4096,
+        trainedCtx: 32768,
+        supportsThinking: false,
+        thinking: "off" as const,
+        chatCapable: false,
+        family: "Hy-MT2",
+        unsupportedReason: null,
+      },
+    ]);
+
+    render(<Chat />);
+    expect(await screen.findByText(/只有翻译专用模型/)).toBeInTheDocument();
+  });
+
   /**
    * 快捷指令曾经完全无效：它被当成独立的 system 消息插在对话中间，
    * 而多数本地模型的对话模板只认开头那条 system，中途的会被忽略，
@@ -368,6 +466,9 @@ describe("Chat", () => {
         trainedCtx: 4096,
         supportsThinking: false,
         thinking: "off" as const,
+        chatCapable: true,
+        family: "通用",
+        unsupportedReason: null,
       },
     ]);
     chatMock.mockResolvedValue("好的");
@@ -406,6 +507,9 @@ describe("Chat", () => {
         trainedCtx: 4096,
         supportsThinking: false,
         thinking: "off" as const,
+        chatCapable: true,
+        family: "通用",
+        unsupportedReason: null,
       },
     ]);
     compactMock.mockRejectedValue(new Error("摘要请求失败"));

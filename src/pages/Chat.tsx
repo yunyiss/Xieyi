@@ -206,12 +206,27 @@ export function Chat({
 
   const refresh = useCallback(async () => {
     try {
-      const list = await listRouterModels();
-      setModels(list);
-      setModel((prev) => prev || list[0]?.id || "");
+      const [list, local] = await Promise.all([
+        listRouterModels(),
+        listLocalModels(),
+      ]);
+
+      // 翻译专用模型不进对话页：实测它们会把用户的问题本身翻译掉、
+      // 或者编造身份（"我叫阿琳，23岁"），放在这里只会让人以为工具坏了。
+      // 判定依据是后端读 GGUF 元数据得到的 chatCapable，不是靠名字猜。
+      const usable = new Set(
+        local.filter((m) => m.chatCapable).map((m) => m.id),
+      );
+      const chatModels = list.filter((m) => usable.has(m.id));
+
+      setModels(chatModels);
+      setLocalModels(local);
+      // 选中的模型必须也是能对话的，否则切到本页会带着一个翻译模型
+      setModel((prev) =>
+        prev && usable.has(prev) ? prev : chatModels[0]?.id || "",
+      );
 
       setSessions(await listSessions());
-      setLocalModels(await listLocalModels());
       setSetupError("");
     } catch (e) {
       // 运行时未安装 / 引擎未启动属于"还没准备好"，不是"出错了"：
@@ -668,6 +683,21 @@ export function Chat({
                 >
                   到「翻译」页安装推理运行时，或在右上角「设置」里确认模型目录已放入
                   .gguf 模型。就绪后这里会自动出现模型。
+                </p>
+              </div>
+            ) : models.length === 0 && localModels.length > 0 ? (
+              // 目录里有模型，但没有一个能用来说话——这种情况必须说清楚，
+              // 否则用户会以为对话页坏了。
+              <div className="max-w-[460px] text-center">
+                <p className="m-0 text-[13px]" style={{ color: "var(--text-muted)" }}>
+                  当前模型目录里只有翻译专用模型，对话页用不了
+                </p>
+                <p
+                  className="m-0 mt-1.5 text-[12px] leading-relaxed"
+                  style={{ color: "var(--text-muted)", opacity: 0.75 }}
+                >
+                  翻译模型会把你的问题本身翻译掉，无法正常对话。
+                  请放一个通用对话模型（如 Qwen、Llama、Gemma）到模型目录，或继续用「翻译」页做译后加工。
                 </p>
               </div>
             ) : (

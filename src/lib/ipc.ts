@@ -58,6 +58,17 @@ export interface LocalModel {
   /** 对话模板是否支持思考（读 GGUF 里的 chat_template 判断） */
   supportsThinking: boolean;
   thinking: ThinkingMode;
+  /**
+   * 能否在对话页使用。
+   *
+   * 翻译专用模型为 false——实测它们会把用户的问题本身翻译掉、或编造身份，
+   * 放进对话页只会让人以为工具坏了。判定依据来自后端读取 GGUF 元数据。
+   */
+  chatCapable: boolean;
+  /** 家族名，用于徽章（"Hy-MT2"、"TranslateGemma"…） */
+  family: string;
+  /** 完全用不了时的原因；为空表示可用 */
+  unsupportedReason: string | null;
 }
 
 /**
