@@ -309,16 +309,19 @@ pub fn model_caps(path: &Path) -> ModelCaps {
         return hit;
     }
 
-    // 模型名也参与家族判定：有些模型（如 Seed-X）的 chat_template 看着正常，
-    // 只有名字能说明它到底是哪个家族的。
-    let name = read_string_meta(path, "general.name")
+    // 名字用于家族判定。**优先用文件名**：GGUF 里的 `general.name` 完全不可靠，
+    // 实测 Hy-MT2-1.8B 写着 "Global_Step_300"（训练检查点残留）、
+    // Index-Translate-9B 只写 "9b"。文件名才是用户真正下载的那个模型。
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let meta_name = read_string_meta(path, "general.name")
         .or_else(|| read_string_meta(path, "general.basename"))
-        .or_else(|| {
-            path.file_stem()
-                .and_then(|s| s.to_str())
-                .map(|s| s.to_string())
-        })
         .unwrap_or_default();
+    // 两个都试：文件名抓主流情况，元数据名兜底（有些模型文件名被改过）
+    let name = format!("{stem} {meta_name}");
 
     let template = read_chat_template(path);
     let caps = ModelCaps {
@@ -702,9 +705,24 @@ mod tests {
         assert!(reason.contains("对话模板"), "原因要说清楚: {reason}");
     }
 
+    /// GGUF 的 `general.name` 不可靠，家族判定必须能吃到文件名。
+    ///
+    /// 实测：Hy-MT2-1.8B 的 general.name 是 `Global_Step_300`（训练检查点残留），
+    /// Index-Translate-9B 只写 `9b`。只看元数据名会把它们全判成"通用"，
+    /// 于是翻译专用模型混进对话页、Index-Translate 也用不上中文提示。
     #[test]
-    fn prompt_style_wire_names_are_stable() {
-        // 线格式名一旦改了，前端与日志都得跟着改，所以钉住
+    fn family_detection_survives_useless_metadata_names() {
+        // 文件名 + 无意义的元数据名拼在一起，仍要识别出家族
+        let p = profile_of("Hy-MT2-1.8B-Q8_0 Global_Step_300", Some("<|startoftext|>{{ x }}"));
+        assert_eq!(p.family, "Hy-MT2");
+
+        let p = profile_of("Index-Translate-9B 9b", Some("<|im_start|>{{ x }}"));
+        assert_eq!(p.family, "Index-Translate");
+        assert_eq!(p.style, PromptStyle::ChineseText);
+    }
+
+    #[test]
+    fn prompt_style_wire_names_are_stable() {        // 线格式名一旦改了，前端与日志都得跟着改，所以钉住
         assert_eq!(PromptStyle::EnglishSystem.as_str(), "english-system");
         assert_eq!(PromptStyle::ChineseText.as_str(), "chinese-text");
         assert_eq!(PromptStyle::TemplateKwargs.as_str(), "template-kwargs");
