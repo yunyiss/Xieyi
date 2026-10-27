@@ -143,11 +143,144 @@ pub fn read_context_length(path: &Path) -> Option<u64> {
     read_numeric_meta(path, "context_length")
 }
 
+/// 一个模型该用哪种**调用机制**（而不是"它是什么型号"）。
+///
+/// 不同翻译模型的接口差异很大：有的直接用英文 system prompt，有的要求中文
+/// 文本提示，有的把语言码放在 `chat_template_kwargs`，还有的把语言对写进
+/// system 消息。用错机制不一定报错——更糟，它会**静默给出错误结果**
+/// （例如 translategemma 不传语言码就把一切翻成 en-GB）。
+///
+/// 判定依据全部来自 GGUF 元数据里的 `chat_template` 特征词与模型名，
+/// 不维护型号名单：新模型一个月出好几个，名单必然滞后。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum PromptStyle {
+    /// 英文 system prompt。现有实现，通用 chat 模型与 Hy-MT2 都走这条。
+    #[default]
+    EnglishSystem,
+    /// 中文文本提示、不发 system。Index-Translate 官方模型卡给的格式。
+    ChineseText,
+    /// 语言码走 `chat_template_kwargs`（translategemma 原版）。
+    TemplateKwargs,
+    /// 内容里拼 `<<<source>>>zh<<<target>>>en<<<text>>>`（translategemma 的 vLLM 优化版）。
+    Delimiter,
+    /// system 消息写 `zh-en` 这类语言对代码（NVIDIA Riva-Translate）。
+    LanguagePair,
+}
+
+impl PromptStyle {
+    /// 线格式名称，前端与服务日志共用。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PromptStyle::EnglishSystem => "english-system",
+            PromptStyle::ChineseText => "chinese-text",
+            PromptStyle::TemplateKwargs => "template-kwargs",
+            PromptStyle::Delimiter => "delimiter",
+            PromptStyle::LanguagePair => "language-pair",
+        }
+    }
+}
+
+/// 模型的调用画像：怎么发请求、能不能拿来对话、用不了时为什么。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelProfile {
+    pub style: PromptStyle,
+    /// 能否进对话页。翻译专用模型为 false——实测它们会把问题本身翻成英文，
+    /// 或者编造身份，放在对话页只会让用户以为工具坏了。
+    pub chat_capable: bool,
+    /// 面向用户的家族名（"Hy-MT2"、"TranslateGemma"…），用于界面徽章。
+    pub family: String,
+    /// 完全用不了时的原因；为空表示可用。
+    pub unsupported: Option<String>,
+}
+
+impl Default for ModelProfile {
+    fn default() -> Self {
+        Self {
+            style: PromptStyle::EnglishSystem,
+            chat_capable: true,
+            family: "通用".into(),
+            unsupported: None,
+        }
+    }
+}
+
 /// 模型自带的元数据能力，供界面显示与禁用控件。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelCaps {
     pub supports_thinking: bool,
     pub trained_ctx: Option<u64>,
+    pub profile: ModelProfile,
+}
+
+/// 从模型名与对话模板推断调用画像。
+///
+/// 顺序有讲究：先判"完全用不了"，再判"需要特殊参数"，最后才回落到通用。
+/// 最后一步的兜底是 `EnglishSystem` + 可对话——**绝不能误伤用户自选的
+/// Qwen / Llama 等通用模型**，那是这个工具最常见的用法。
+pub fn profile_of(name: &str, template: Option<&str>) -> ModelProfile {
+    let lower = name.to_lowercase();
+    let tpl = template.unwrap_or("");
+
+    // ① Seed-X：官方模型卡明确写了没有 chat 模板、不要把对话格式喂给它，
+    //    并且不建议使用非官方量化版。实测确实会输出幻觉与乱码。
+    //    注意 GGUF 里的 general.name 常写成 "Seed X PPO 7B"（空格分隔），
+    //    所以要先把空格/下划线归一化再匹配。
+    let squashed = lower.replace([' ', '_'], "");
+    if squashed.contains("seed-x") || squashed.contains("seedx") {
+        return ModelProfile {
+            style: PromptStyle::EnglishSystem,
+            chat_capable: false,
+            family: "Seed-X".into(),
+            unsupported: Some(
+                "该模型没有官方对话模板，且官方不建议使用非官方量化版；\
+                 实测会输出与原文无关的内容。请换用 Hy-MT2、Index-Translate 或通用 chat 模型。"
+                    .into(),
+            ),
+        };
+    }
+
+    // ② 翻译专用家族：能翻译，但没有对话能力。
+    let translate_only = |family: &str, style: PromptStyle| ModelProfile {
+        style,
+        chat_capable: false,
+        family: family.into(),
+        unsupported: None,
+    };
+
+    // translategemma：语言码必须走 chat_template_kwargs，否则默认 en-GB，
+    // 把任何输入都翻成英式英语。它的 vLLM 优化版改用文本分隔符。
+    if tpl.contains("source_lang_code") || tpl.contains("target_lang_code") {
+        return translate_only("TranslateGemma", PromptStyle::TemplateKwargs);
+    }
+    if tpl.contains("<<<source>>>") || tpl.contains("<<<text>>>") {
+        return translate_only("TranslateGemma", PromptStyle::Delimiter);
+    }
+    // NVIDIA Riva-Translate：模板内嵌 language_pairs，system 写 "zh-en"。
+    if tpl.contains("language_pairs") {
+        return translate_only("Riva-Translate", PromptStyle::LanguagePair);
+    }
+    if squashed.contains("translategemma") || squashed.contains("translate-gemma") {
+        // 名字像但模板没特征：仍按 translategemma 处理，宁可多传参数
+        return translate_only("TranslateGemma", PromptStyle::TemplateKwargs);
+    }
+
+    // Index-Translate（B 站）：官方用中文文本提示，并支持术语/格式硬约束。
+    if squashed.contains("index-translate") || squashed.contains("indextranslate") {
+        return translate_only("Index-Translate", PromptStyle::ChineseText);
+    }
+
+    // ③ Hy-MT2：翻译专用，但指令服从度好，英文 system prompt 就能用。
+    if squashed.contains("hy-mt") || squashed.contains("hymt") || squashed.contains("hunyuan-mt") {
+        return translate_only("Hy-MT2", PromptStyle::EnglishSystem);
+    }
+
+    // ④ 兜底：通用对话模型。宁可当作"能对话"，也不要误判。
+    ModelProfile {
+        style: PromptStyle::EnglishSystem,
+        chat_capable: true,
+        family: "通用".into(),
+        unsupported: None,
+    }
 }
 
 /// 读 GGUF 元数据要扫过十几万条词汇表，几十毫秒量级；
@@ -172,15 +305,26 @@ pub fn model_caps(path: &Path) -> ModelCaps {
         None => path.display().to_string(),
     };
 
-    if let Some(hit) = cache().lock().ok().and_then(|c| c.get(&key).copied()) {
+    if let Some(hit) = cache().lock().ok().and_then(|c| c.get(&key).cloned()) {
         return hit;
     }
 
+    // 模型名也参与家族判定：有些模型（如 Seed-X）的 chat_template 看着正常，
+    // 只有名字能说明它到底是哪个家族的。
+    let name = read_string_meta(path, "general.name")
+        .or_else(|| read_string_meta(path, "general.basename"))
+        .or_else(|| {
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_default();
+
+    let template = read_chat_template(path);
     let caps = ModelCaps {
-        supports_thinking: read_chat_template(path)
-            .map(|t| supports_thinking(&t))
-            .unwrap_or(false),
+        supports_thinking: template.as_deref().map(supports_thinking).unwrap_or(false),
         trained_ctx: read_context_length(path),
+        profile: profile_of(&name, template.as_deref()),
     };
 
     if let Ok(mut guard) = cache().lock() {
@@ -188,7 +332,7 @@ pub fn model_caps(path: &Path) -> ModelCaps {
         if guard.len() > 128 {
             guard.clear();
         }
-        guard.insert(key, caps);
+        guard.insert(key, caps.clone());
     }
 
     caps
@@ -470,5 +614,101 @@ mod tests {
             "{%- if reasoning_effort is defined %}high{%- endif %}"
         ));
         assert!(!supports_thinking("You are a professional translator."));
+    }
+
+    // ---- 调用机制识别 ----
+
+    /// **最重要的一条**：认不出来的必须当通用模型，绝不能误判成翻译专用。
+    /// 用户放个 Qwen / Llama 进来是常态，误判会让他的对话页直接空掉。
+    #[test]
+    fn unknown_models_fall_back_to_generic_chat() {
+        for (name, template) in [
+            ("Qwen3.5-9B", Some("<|im_start|>{{ message.role }}\n{{ message.content }}<|im_end|>")),
+            ("llama-3.1-8b", Some("{{ bos_token }}{% for m in messages %}...")),
+            ("gemma-3-4b", None),
+            ("", None),
+        ] {
+            let p = profile_of(name, template);
+            assert_eq!(p.style, PromptStyle::EnglishSystem, "{name} 不该被特殊对待");
+            assert!(p.chat_capable, "{name} 应当能在对话页使用");
+            assert_eq!(p.family, "通用");
+            assert!(p.unsupported.is_none());
+        }
+    }
+
+    /// translategemma 必须靠 kwargs 传语言码，否则默认 en-GB 把一切翻成英语。
+    #[test]
+    fn translategemma_detected_by_template() {
+        let tpl = "{%- set languages = {...} -%}{{ content['source_lang_code'] }}";
+        let p = profile_of("translategemma-4b-it", Some(tpl));
+        assert_eq!(p.style, PromptStyle::TemplateKwargs);
+        assert_eq!(p.family, "TranslateGemma");
+        // 它没有对话能力：喂任何问题都会被翻译成英语
+        assert!(!p.chat_capable);
+    }
+
+    #[test]
+    fn translategemma_delimiter_variant_detected() {
+        let tpl = "content = '<<<source>>>' + src + '<<<target>>>' + tgt + '<<<text>>>' + text";
+        let p = profile_of("vllm-translategemma-4b-it", Some(tpl));
+        assert_eq!(p.style, PromptStyle::Delimiter);
+    }
+
+    /// 名字像但模板没特征词时，仍按 translategemma 处理——
+    /// 宁可多传一个用不上的参数，也不要它把内容翻错语言。
+    #[test]
+    fn translategemma_detected_by_name_when_template_plain() {
+        let p = profile_of("translategemma-12b-it", Some("{{ messages[0].content }}"));
+        assert_eq!(p.style, PromptStyle::TemplateKwargs);
+    }
+
+    #[test]
+    fn riva_translate_uses_language_pair_system() {
+        let tpl = "{%- set language_pairs = {'en-zh': {...}} -%}";
+        let p = profile_of("Riva-Translate-4B-Instruct-v2", Some(tpl));
+        assert_eq!(p.style, PromptStyle::LanguagePair);
+        assert_eq!(p.family, "Riva-Translate");
+        assert!(!p.chat_capable);
+    }
+
+    #[test]
+    fn index_translate_uses_chinese_prompt() {
+        let p = profile_of("Index-Translate-9B", Some("<|im_start|>{{ message.content }}"));
+        assert_eq!(p.style, PromptStyle::ChineseText);
+        assert_eq!(p.family, "Index-Translate");
+        // 能翻译，但不是对话模型
+        assert!(!p.chat_capable);
+    }
+
+    /// Hy-MT2 用现有英文 system prompt 就够，但要挡住对话页。
+    #[test]
+    fn hy_mt2_keeps_english_prompt_but_not_chat() {
+        for name in ["Hy-MT2-1.8B", "Hy-MT2-7B", "Hunyuan-MT-7B"] {
+            let p = profile_of(name, Some("<|startoftext|>{{ message.content }}"));
+            assert_eq!(p.style, PromptStyle::EnglishSystem, "{name}");
+            assert_eq!(p.family, "Hy-MT2", "{name}");
+            assert!(!p.chat_capable, "{name} 是翻译模型，不该进对话页");
+        }
+    }
+
+    /// Seed-X 官方没有对话模板、且不建议用非官方量化版，实测输出幻觉。
+    /// 必须明确标成不可用，而不是让它跑出乱码。
+    #[test]
+    fn seed_x_is_marked_unsupported() {
+        let p = profile_of("Seed X PPO 7B", Some("<|im_start|>{{ message.content }}"));
+        assert_eq!(p.family, "Seed-X");
+        assert!(!p.chat_capable);
+        let reason = p.unsupported.as_deref().unwrap_or_default();
+        assert!(reason.contains("对话模板"), "原因要说清楚: {reason}");
+    }
+
+    #[test]
+    fn prompt_style_wire_names_are_stable() {
+        // 线格式名一旦改了，前端与日志都得跟着改，所以钉住
+        assert_eq!(PromptStyle::EnglishSystem.as_str(), "english-system");
+        assert_eq!(PromptStyle::ChineseText.as_str(), "chinese-text");
+        assert_eq!(PromptStyle::TemplateKwargs.as_str(), "template-kwargs");
+        assert_eq!(PromptStyle::Delimiter.as_str(), "delimiter");
+        assert_eq!(PromptStyle::LanguagePair.as_str(), "language-pair");
     }
 }

@@ -537,17 +537,39 @@ impl Service {
             })
             .collect();
 
-        let prompt = prompts::system_prompt(style, source, target, glossary);
-        let first = stream_completion(
+        // 按模型的调用机制生成请求：不同翻译模型的接口差异很大，
+        // 用错不一定报错，而是静默给出错误结果（如把一切翻成英语）。
+        // 认不出来的模型走 EnglishSystem，与改造前逐字一致。
+        let profile = model_profile(app, model);
+        // 用错调用机制不会报错、只会静默给出错误结果，所以留一行痕迹方便排查
+        eprintln!(
+            "翻译 [{}] 家族={} 机制={} 对话能力={}",
+            model,
+            profile.family,
+            profile.style.as_str(),
+            profile.chat_capable
+        );
+        let request = prompts::build_request(
+            profile.style,
+            style,
+            source,
+            target,
+            glossary,
+            text,
+            None,
+        );
+
+        let first = stream_completion_with(
             app,
             self,
             request_id.unwrap_or_default(),
             model,
-            segment_messages(&prompt, text),
+            request.messages,
             0.2,
             1024,
             // 翻译不让模型思考：既慢又容易把输出预算吃光
             Thinking::Off,
+            request.template_kwargs,
             cancel,
         )
         .await?;
@@ -565,16 +587,26 @@ impl Service {
         // 再流一遍会在输出框里重复一遍；翻译页最后会用返回值整体覆盖显示。
         // 已经被取消就不重试了，那只会白跑一次请求。
         if !best_report.is_ok() && !cancel.load(Ordering::Relaxed) {
-            let hinted = prompts::system_prompt_with_hint(style, source, target, glossary, &best_report);
-            let second = stream_completion(
+            // 重试沿用同一个模型的调用机制，只把纠正提示塞进对应位置
+            let retry = prompts::build_request(
+                profile.style,
+                style,
+                source,
+                target,
+                glossary,
+                text,
+                best_report.retry_hint().as_deref(),
+            );
+            let second = stream_completion_with(
                 app,
                 self,
                 "",
                 model,
-                segment_messages(&hinted, text),
+                retry.messages,
                 0.2,
                 1024,
                 Thinking::Off,
+                retry.template_kwargs,
                 cancel,
             )
             .await;
@@ -950,6 +982,18 @@ pub struct CompactRequest {
 
 /// 通用的流式补全：负责加载模型、发请求、解析 SSE 并把 token 推给前端。
 ///
+/// 取某个模型的调用画像。模型 id 就是 GGUF 文件名主干，据此反查路径。
+///
+/// 查不到（比如模型刚被移走）时按通用模型处理——宁可走现有逻辑，
+/// 也不要因为读不到元数据就让翻译直接失败。
+fn model_profile(app: &AppHandle, model: &str) -> models::ModelProfile {
+    models::scan(app)
+        .into_iter()
+        .find(|m| m.id == model)
+        .map(|m| models::model_caps(std::path::Path::new(&m.path)).profile)
+        .unwrap_or_default()
+}
+
 /// `thinking` 决定是否让思考型模型先输出思维链。翻译固定关闭：
 /// 界面不展示思维链，它只会吃光 `max_tokens` 并拖慢首字。
 async fn stream_completion(
@@ -961,6 +1005,27 @@ async fn stream_completion(
     temperature: f64,
     max_tokens: u32,
     thinking: Thinking,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<String, String> {
+    stream_completion_with(app, s, request_id, model, messages, temperature, max_tokens, thinking, None, cancel).await
+}
+
+/// 同 [`stream_completion`]，但允许附加 `chat_template_kwargs`。
+///
+/// 有些翻译模型（translategemma）的语言方向完全由模板参数决定，
+/// 不传就默认 en-GB，把任何输入都翻成英式英语。这类模型的参数
+/// 必须和思考参数合并进同一个对象——llama.cpp 只认一个 `chat_template_kwargs`。
+#[allow(clippy::too_many_arguments)]
+async fn stream_completion_with(
+    app: &AppHandle,
+    s: &Service,
+    request_id: &str,
+    model: &str,
+    messages: serde_json::Value,
+    temperature: f64,
+    max_tokens: u32,
+    thinking: Thinking,
+    extra_template_kwargs: Option<serde_json::Value>,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<String, String> {
     s.load(app, model, cancel).await?;
@@ -977,18 +1042,37 @@ async fn stream_completion(
         "stream_options": { "include_usage": true }
     });
 
+    // chat_template_kwargs 只有一个槽位：思考控制和模型专属参数必须合并，
+    // 后写覆盖先写会把思考控制弄丢。
+    let mut kwargs = serde_json::Map::new();
+
     // 思考控制：与 llama.cpp Web UI 的请求体保持一致
     //   - enable_thinking 走对话模板
     //   - thinking_budget_tokens 由服务端硬限制思考长度（实测生效）
     //   - reasoning_control 表示预算由客户端掌控
     if thinking != Thinking::Default {
-        body["chat_template_kwargs"] =
-            serde_json::json!({ "enable_thinking": thinking.enabled() });
+        kwargs.insert(
+            "enable_thinking".into(),
+            serde_json::json!(thinking.enabled()),
+        );
         body["reasoning_control"] = serde_json::json!(true);
 
         if let Some(budget) = thinking.budget() {
             body["thinking_budget_tokens"] = serde_json::json!(budget);
         }
+    }
+
+    // 模型专属参数（如 translategemma 的 source/target_lang_code）
+    if let Some(extra) = extra_template_kwargs {
+        if let Some(obj) = extra.as_object() {
+            for (k, v) in obj {
+                kwargs.insert(k.clone(), v.clone());
+            }
+        }
+    }
+
+    if !kwargs.is_empty() {
+        body["chat_template_kwargs"] = serde_json::Value::Object(kwargs);
     }
 
     let resp = s
@@ -1195,11 +1279,20 @@ mod tests {
 
     #[test]
     fn segment_messages_shapes_system_then_user() {
-        let messages = segment_messages("SYS", "TEXT");
-        assert_eq!(messages[0]["role"], "system");
-        assert_eq!(messages[0]["content"], "SYS");
-        assert_eq!(messages[1]["role"], "user");
-        assert_eq!(messages[1]["content"], "TEXT");
+        // 消息形状现在由 prompts::build_request 统一产出，
+        // 这里只保留一条最小断言，防止回归到"system+user"之外的结构。
+        let req = prompts::build_request(
+            models::PromptStyle::EnglishSystem,
+            Style::General,
+            "en",
+            "zh",
+            &[],
+            "TEXT",
+            None,
+        );
+        assert_eq!(req.messages[0]["role"], "system");
+        assert_eq!(req.messages[1]["role"], "user");
+        assert_eq!(req.messages[1]["content"], "TEXT");
     }
 
     /// 推理期间 `inflight` 必须大于 0，TTL 才不会误杀正在用的模型。
@@ -1385,14 +1478,6 @@ pub(crate) fn load_glossary(app: &AppHandle) -> Vec<GlossaryEntry> {
     paths::config_value(app, "glossary")
         .and_then(|v| serde_json::from_value::<Vec<GlossaryEntry>>(v).ok())
         .unwrap_or_default()
-}
-
-/// 拼一次翻译请求的消息体。
-fn segment_messages(prompt: &str, text: &str) -> serde_json::Value {
-    serde_json::json!([
-        { "role": "system", "content": prompt },
-        { "role": "user", "content": text }
-    ])
 }
 
 fn cache_key(
@@ -1845,6 +1930,13 @@ pub struct LocalModelInfo {
     /// 对话模板是否支持思考开关（读 GGUF 里的 chat_template 判断）。
     /// 为 false 时界面应禁用思考档位，而不是让用户白设。
     pub supports_thinking: bool,
+    /// 能否在对话页使用。翻译专用模型为 false——它们会把问题本身翻译掉，
+    /// 或者编造身份，放进对话页只会让用户以为工具坏了。
+    pub chat_capable: bool,
+    /// 家族名，用于界面徽章（"Hy-MT2"、"TranslateGemma"…）。
+    pub family: String,
+    /// 完全用不了时的原因；为空表示可用。
+    pub unsupported_reason: Option<String>,
 }
 
 #[tauri::command]
@@ -1861,6 +1953,9 @@ pub fn list_local_models(app: AppHandle) -> Vec<LocalModelInfo> {
                 supports_thinking: caps.supports_thinking,
                 ctx_size: p.ctx,
                 thinking: p.thinking.as_str().to_string(),
+                chat_capable: caps.profile.chat_capable,
+                family: caps.profile.family,
+                unsupported_reason: caps.profile.unsupported,
                 id: m.id,
                 path: m.path,
                 size_mb: m.size_mb,
