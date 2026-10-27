@@ -206,24 +206,31 @@ export function Chat({
 
   const refresh = useCallback(async () => {
     try {
-      const [list, local] = await Promise.all([
-        listRouterModels(),
-        listLocalModels(),
-      ]);
+      const list = await listRouterModels();
 
-      // 翻译专用模型不进对话页：实测它们会把用户的问题本身翻译掉、
-      // 或者编造身份（"我叫阿琳，23岁"），放在这里只会让人以为工具坏了。
+      // 模型画像只用于过滤与提示，读失败不该把整页拖垮：
+      // 拿不到就当作"都能对话"，让用户至少能继续用现有模型。
+      let local: LocalModel[] = [];
+      try {
+        local = await listLocalModels();
+      } catch (e) {
+        console.error("读取模型画像失败，本次不过滤", e);
+      }
+
+      // 翻译专用模型不进对话页：实测它们会把用户的问题本身翻译掉。
       // 判定依据是后端读 GGUF 元数据得到的 chatCapable，不是靠名字猜。
-      const usable = new Set(
-        local.filter((m) => m.chatCapable).map((m) => m.id),
-      );
-      const chatModels = list.filter((m) => usable.has(m.id));
+      // 画像是空的时候（读取失败）放行全部，避免"一个模型都没有"。
+      const usable =
+        local.length > 0
+          ? new Set(local.filter((m) => m.chatCapable).map((m) => m.id))
+          : null;
+      const chatModels = usable ? list.filter((m) => usable.has(m.id)) : list;
 
       setModels(chatModels);
       setLocalModels(local);
       // 选中的模型必须也是能对话的，否则切到本页会带着一个翻译模型
       setModel((prev) =>
-        prev && usable.has(prev) ? prev : chatModels[0]?.id || "",
+        prev && (!usable || usable.has(prev)) ? prev : chatModels[0]?.id || "",
       );
 
       setSessions(await listSessions());
@@ -599,7 +606,11 @@ export function Chat({
 
     setSessionId(id);
     setMessages(hydrate(target.messages));
-    if (target.model) setModel(target.model);
+    // 会话里记的模型可能是翻译模型（或早已被移除），直接 setModel 会把
+    // 一个不能对话的模型塞回输入区。只在它确实可用时才恢复。
+    if (target.model && models.some((m) => m.id === target.model)) {
+      setModel(target.model);
+    }
     setTotals({ prompt: 0, generated: 0 });
     setError("");
     setEditing(null);

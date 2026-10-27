@@ -339,16 +339,25 @@ pub fn model_caps(path: &Path) -> ModelCaps {
         .and_then(|s| s.to_str())
         .unwrap_or_default()
         .to_string();
-    let meta_name = read_string_meta(path, "general.name")
-        .or_else(|| read_string_meta(path, "general.basename"))
+
+    // 一次扫描取全部需要的元数据（分四次调用要重扫四遍文件头）
+    let meta = read_meta_many(
+        path,
+        &["general.name", "general.basename", "chat_template"],
+        &["context_length"],
+    );
+    let meta_name = meta
+        .get("general.name")
+        .or_else(|| meta.get("general.basename"))
+        .cloned()
         .unwrap_or_default();
     // 两个都试：文件名抓主流情况，元数据名兜底（有些模型文件名被改过）
     let name = format!("{stem} {meta_name}");
 
-    let template = read_chat_template(path);
+    let template = meta.get("chat_template").cloned();
     let caps = ModelCaps {
         supports_thinking: template.as_deref().map(supports_thinking).unwrap_or(false),
-        trained_ctx: read_context_length(path),
+        trained_ctx: meta.get("context_length").and_then(|v| v.parse().ok()),
         profile: profile_of(&name, template.as_deref()),
     };
 
@@ -404,6 +413,88 @@ fn template_references(template: &str, name: &str) -> bool {
     }
 
     false
+}
+
+/// 一次扫描读出多个字符串/数字元数据。
+///
+/// `read_string_meta` 每调用一次都要重新打开文件、从头部扫过整个 KV 区；
+/// 而判定模型画像要看 name / basename / chat_template / context_length 四项，
+/// 分开调用就是四趟。这里合并成一趟，模型多时差别很明显。
+///
+/// 返回的 map 里键是**传入的 suffix 本身**（不是 GGUF 里的完整键名），
+/// 值统一用字符串表示，数字键由调用方自己解析。
+fn read_meta_many(path: &Path, string_suffixes: &[&str], numeric_suffixes: &[&str]) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let Ok(file) = std::fs::File::open(path) else {
+        return out;
+    };
+    let mut reader = BufReader::new(file);
+
+    let mut magic = [0u8; 4];
+    if reader.read_exact(&mut magic).is_err() || &magic != b"GGUF" {
+        return out;
+    }
+    let Some(version) = read_u32(&mut reader) else {
+        return out;
+    };
+    if version < 2 {
+        return out;
+    }
+    let Some(_tensor_count) = read_u64(&mut reader) else {
+        return out;
+    };
+    let Some(kv_count) = read_u64(&mut reader) else {
+        return out;
+    };
+
+    let want_string = |k: &str| string_suffixes.iter().find(|s| k.ends_with(**s)).copied();
+    let want_number = |k: &str| numeric_suffixes.iter().find(|s| k.ends_with(**s)).copied();
+
+    for _ in 0..kv_count {
+        let Some(key) = read_string(&mut reader) else {
+            break;
+        };
+        let Some(vtype) = read_u32(&mut reader) else {
+            break;
+        };
+
+        // 字符串键：直接把值读出来
+        if let Some(suffix) = want_string(&key) {
+            if vtype == 8 {
+                if let Some(value) = read_string(&mut reader) {
+                    out.entry(suffix.to_string()).or_insert(value);
+                }
+                continue;
+            }
+        }
+
+        // 数字键：读成字符串存（调用方自己 parse）
+        if let Some(suffix) = want_number(&key) {
+            match vtype {
+                4 => {
+                    if let Some(v) = read_u32(&mut reader) {
+                        out.entry(suffix.to_string()).or_insert(v.to_string());
+                        continue;
+                    }
+                    return out;
+                }
+                10 => {
+                    if let Some(v) = read_u64(&mut reader) {
+                        out.entry(suffix.to_string()).or_insert(v.to_string());
+                        continue;
+                    }
+                    return out;
+                }
+                _ => {}
+            }
+        }
+
+        if skip_value(&mut reader, vtype, 0).is_none() {
+            break;
+        }
+    }
+
+    out
 }
 
 fn read_string_meta(path: &Path, key_suffix: &str) -> Option<String> {
@@ -744,6 +835,38 @@ mod tests {
         let p = profile_of("Index-Translate-9B 9b", Some("<|im_start|>{{ x }}"));
         assert_eq!(p.family, "Index-Translate");
         assert_eq!(p.style, PromptStyle::ChineseText);
+    }
+
+    /// **防误判**：名字里带关键词、但实际是通用模型的，不能被判定成翻译模型。
+    ///
+    /// 这条是给"以后加新模型"准备的。用户目录里会不断出现新模型，
+    /// 一旦某个通用模型的文件名恰好含 translate / index / seed / hy，
+    /// 误判会让它在对话页凭空消失——比不认识更糟。
+    #[test]
+    fn generic_models_with_suspicious_names_stay_generic() {
+        let cases = [
+            ("Qwen3.5-9B-UD-Q4_K_XL Qwen3.5-9B", "<|im_start|>{{ x }}"),
+            ("Meta-Llama-3.1-8B-Instruct Llama 3.1", "{{ bos_token }}"),
+            ("gemma-4-E4B-it gemma-4", "<start_of_turn>user"),
+            ("DeepSeek-R1-Distill-Qwen-7B deepseek", "{{ x }}"),
+            // 文件名带关键词但都不是对应家族
+            ("translation-helper-chat-v1 assistant", "{{ x }}"),
+            ("index-embedding-bge-m3 bge", "{{ x }}"),
+            ("hy3-preview hy3", "{{ x }}"),
+            ("Seed-OSS-36B seed-oss", "{{ x }}"),
+        ];
+
+        for (name, tpl) in cases {
+            let p = profile_of(name, Some(tpl));
+            assert_eq!(p.family, "通用", "{name} 被误判成 {}", p.family);
+            assert!(p.chat_capable, "{name} 被误判成不可对话");
+            assert_eq!(
+                p.style,
+                PromptStyle::EnglishSystem,
+                "{name} 用了错误的调用机制"
+            );
+            assert!(p.unsupported.is_none(), "{name} 不该被标成不可用");
+        }
     }
 
     #[test]

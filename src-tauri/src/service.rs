@@ -541,14 +541,9 @@ impl Service {
         // 用错不一定报错，而是静默给出错误结果（如把一切翻成英语）。
         // 认不出来的模型走 EnglishSystem，与改造前逐字一致。
         let profile = model_profile(app, model);
-        // 用错调用机制不会报错、只会静默给出错误结果，所以留一行痕迹方便排查
-        eprintln!(
-            "翻译 [{}] 家族={} 机制={} 对话能力={}",
-            model,
-            profile.family,
-            profile.style.as_str(),
-            profile.chat_capable
-        );
+        // 用错调用机制不会报错、只会静默给出错误结果，所以留一行痕迹方便排查。
+        // 只在机制变化时打印：批量翻译有几十上百段，逐段刷屏没有意义。
+        log_profile_once(model, &profile);
         let request = prompts::build_request(
             profile.style,
             style,
@@ -984,14 +979,69 @@ pub struct CompactRequest {
 ///
 /// 取某个模型的调用画像。模型 id 就是 GGUF 文件名主干，据此反查路径。
 ///
+/// **带进程内缓存**：这个函数在 `translate_segment` 里被逐段调用，
+/// 而 `models::scan` 要递归读目录、逐个 stat。批量翻译 100 段就是 100 次扫描，
+/// 白白拖慢任务。缓存按「模型 id + 目录」失效——换模型目录时会重新扫。
+///
 /// 查不到（比如模型刚被移走）时按通用模型处理——宁可走现有逻辑，
 /// 也不要因为读不到元数据就让翻译直接失败。
 fn model_profile(app: &AppHandle, model: &str) -> models::ModelProfile {
-    models::scan(app)
+    fn cache() -> &'static std::sync::Mutex<HashMap<String, models::ModelProfile>> {
+        static CACHE: std::sync::OnceLock<
+            std::sync::Mutex<HashMap<String, models::ModelProfile>>,
+        > = std::sync::OnceLock::new();
+        CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+    }
+
+    // 模型目录也算进键里：用户换目录后同名模型可能是完全不同的文件
+    let dir = paths::models_dir(app)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let key = format!("{dir}\u{1}{model}");
+
+    if let Some(hit) = cache().lock().ok().and_then(|c| c.get(&key).cloned()) {
+        return hit;
+    }
+
+    let profile = models::scan(app)
         .into_iter()
         .find(|m| m.id == model)
         .map(|m| models::model_caps(std::path::Path::new(&m.path)).profile)
-        .unwrap_or_default()
+        .unwrap_or_default();
+
+    if let Ok(mut guard) = cache().lock() {
+        // 键里带目录，旧条目留着也只是占点内存，简单限一下
+        if guard.len() > 64 {
+            guard.clear();
+        }
+        guard.insert(key, profile.clone());
+    }
+
+    profile
+}
+
+/// 同一个模型的机制只在首次使用时打印一次，避免批量翻译刷屏。
+fn log_profile_once(model: &str, profile: &models::ModelProfile) {
+    fn logged() -> &'static std::sync::Mutex<HashSet<String>> {
+        static LOGGED: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> =
+            std::sync::OnceLock::new();
+        LOGGED.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+    }
+
+    let key = format!("{}\u{1}{}", model, profile.style.as_str());
+    let first = logged()
+        .lock()
+        .map(|mut s| s.insert(key))
+        .unwrap_or(false);
+    if first {
+        eprintln!(
+            "翻译 [{}] 家族={} 机制={} 可对话={}",
+            model,
+            profile.family,
+            profile.style.as_str(),
+            profile.chat_capable
+        );
+    }
 }
 
 /// `thinking` 决定是否让思考型模型先输出思维链。翻译固定关闭：
@@ -1788,7 +1838,23 @@ pub async fn chat(
     // 规则与界面提示"上下文不足"用的是同一个函数，避免两边漂移。
     let max_tokens = thinking.output_budget(model_params.ctx);
 
-    let result = stream_completion(
+    // 对话页**不重建消息**：这里的 messages 就是用户的对话本身，
+    // 塞进翻译提示词会污染上下文。真正需要适配的只有模板参数——
+    // translategemma 如果被强行用在对话页（比如改了文件名绕过过滤），
+    // 不传语言码它会默认 en-GB。正常流程下它已被过滤，这里只是兜底。
+    let profile = model_profile(&app, &request.model);
+    log_profile_once(&request.model, &profile);
+    let template_kwargs = if profile.style == models::PromptStyle::TemplateKwargs {
+        Some(serde_json::json!({
+            "source_lang_code": "en-GB",
+            "target_lang_code": "zh-Hans",
+            "enable_thinking": thinking.enabled()
+        }))
+    } else {
+        None
+    };
+
+    let result = stream_completion_with(
         &app,
         &s,
         &request.request_id,
@@ -1797,6 +1863,7 @@ pub async fn chat(
         0.7,
         max_tokens,
         thinking,
+        template_kwargs,
         &state.cancel,
     )
     .await;
