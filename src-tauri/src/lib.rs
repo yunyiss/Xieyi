@@ -41,10 +41,21 @@ fn app_info(app: tauri::AppHandle) -> Result<AppInfo, String> {
 }
 
 #[tauri::command]
+/// 在系统文件管理器里打开模型目录。
+///
+/// 注意这里必须**真的去打开**：早先的实现只是把路径返回给前端，
+/// 前端拿到的字符串没人用，于是"打开"按钮点了毫无反应。
 fn open_models_dir(app: tauri::AppHandle) -> Result<String, String> {
     let dir = paths::models_dir(&app)?;
     paths::ensure(&dir)?;
-    Ok(dir.to_string_lossy().to_string())
+    let path = dir.to_string_lossy().to_string();
+
+    // 用 opener 插件交给系统处理：Windows 上是资源管理器。
+    // 打不开时把原因带回去，别让用户面对一个没反应的按钮。
+    tauri_plugin_opener::open_path(&path, None::<&str>)
+        .map_err(|e| format!("无法打开目录 {path}：{e}"))?;
+
+    Ok(path)
 }
 
 #[tauri::command]

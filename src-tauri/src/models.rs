@@ -139,6 +139,10 @@ pub fn read_layer_count(path: &Path) -> Option<u32> {
 }
 
 /// 模型原生上下文长度（`*.context_length`），用于给用户提示"还能开多大"。
+///
+/// 生产路径已改走 [`read_meta_many`]（一次扫描取多项），
+/// 这里保留给测试与后续按需单读使用。
+#[cfg(test)]
 pub fn read_context_length(path: &Path) -> Option<u64> {
     read_numeric_meta(path, "context_length")
 }
@@ -374,6 +378,9 @@ pub fn model_caps(path: &Path) -> ModelCaps {
 
 /// 读取模型自带的对话模板（`tokenizer.chat_template`）。
 /// 用它判断模型到底支不支持思考，而不是靠模型名字猜。
+///
+/// 生产路径已改走 [`read_meta_many`]，这里保留给测试使用。
+#[cfg(test)]
 pub fn read_chat_template(path: &Path) -> Option<String> {
     read_string_meta(path, "chat_template")
 }
@@ -497,6 +504,9 @@ fn read_meta_many(path: &Path, string_suffixes: &[&str], numeric_suffixes: &[&st
     out
 }
 
+/// 读单个字符串元数据（重开文件、从头扫一遍）。
+/// 需要多项时请用 [`read_meta_many`]，别连着调这个。
+#[cfg(test)]
 fn read_string_meta(path: &Path, key_suffix: &str) -> Option<String> {
     let file = std::fs::File::open(path).ok()?;
     let mut reader = BufReader::new(file);
