@@ -69,6 +69,10 @@ export interface LocalModel {
   family: string;
   /** 完全用不了时的原因；为空表示可用 */
   unsupportedReason: string | null;
+  /** 自动识别的结果（不受手动覆盖影响），用于在界面上说明"自动判定为…" */
+  chatAuto: boolean;
+  /** 用户是否手动改过「能不能对话」 */
+  chatOverridden: boolean;
 }
 
 /**
@@ -200,6 +204,14 @@ export const setModelParams = (model: string, ctx: number, thinking: ThinkingMod
     ctx,
     thinking,
   });
+/**
+ * 手动指定某个模型能不能用在对话页。传 `null` 恢复自动识别。
+ *
+ * 自动识别靠读 GGUF 特征，改了文件名或遇到冷门模型时会认错，
+ * 这个开关就是给用户兜底的——不用去改模型文件。
+ */
+export const setModelChatCapable = (model: string, capable: boolean | null) =>
+  invoke<void>("set_model_chat_capable", { model, capable });
 export const setPinned = (model: string, pinned: boolean) =>
   invoke<string[]>("set_pinned", { model, pinned });
 export const getSettings = () => invoke<Settings>("get_settings");

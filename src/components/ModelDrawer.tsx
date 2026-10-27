@@ -11,6 +11,7 @@ import {
   setGlossary,
   setGpuLayers,
   setModelParams,
+  setModelChatCapable,
   setModelsDir,
   setPinned,
   setTtl,
@@ -68,6 +69,8 @@ function stateLabel(state: string): { text: string; hot: boolean } {
 export function ModelDrawer({ open, onClose, onChanged }: Props) {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [local, setLocal] = useState<LocalModel[]>([]);
+  /** 当前页签：engines 类参数与模型分开，避免一页塞太多。 */
+  const [tab, setTab] = useState<"general" | "models">("general");
   const [states, setStates] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
@@ -146,6 +149,26 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
     try {
       const list = await setPinned(id, next);
       setSettings((prev) => (prev ? { ...prev, pinned: list } : prev));
+      onChanged();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  /**
+   * 切换"能不能用在对话页"。
+   *
+   * 勾回去"自动"是没有单独按钮的——用户再点一次就得到与自动相反的结果，
+   * 那反而是"手动"。所以这里只在值等于自动判定时清掉覆盖，
+   * 让"手动改回原值"自然地恢复成自动。
+   */
+  const toggleChat = async (id: string, next: boolean) => {
+    setError("");
+    try {
+      const m = local.find((x) => x.id === id);
+      // 改回与自动一致的值，等于恢复自动识别，避免留下无意义的覆盖记录
+      await setModelChatCapable(id, m && next === m.chatAuto ? null : next);
+      await refresh();
       onChanged();
     } catch (e) {
       setError(String(e));
@@ -295,7 +318,7 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
           className="flex shrink-0 items-center gap-2 border-b px-4 py-3"
           style={{ borderColor: "var(--border)" }}
         >
-          <h2 className="m-0 text-[14px] font-medium">设置与模型</h2>
+          <h2 className="m-0 text-[14px] font-medium">设置</h2>
           <button
             className="btn ml-auto flex h-7 w-7 items-center justify-center rounded-lg border"
             style={btnStyle}
@@ -307,8 +330,48 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
           </button>
         </header>
 
+        {/* 两个页签：引擎这类进程级参数放「通用」，模型与术语放「模型」。
+            全都堆一页时已经要滚半天，再加能力开关就彻底找不着了。 */}
+        <div
+          className="flex shrink-0 items-center gap-1 border-b px-3 py-1.5"
+          style={{ borderColor: "var(--border)" }}
+          role="tablist"
+        >
+          {(
+            [
+              { key: "general", label: "通用" },
+              { key: "models", label: "模型与术语" },
+            ] as const
+          ).map((t) => {
+            const active = tab === t.key;
+            return (
+              <button
+                key={t.key}
+                role="tab"
+                aria-selected={active}
+                className="btn rounded-lg px-2.5 py-1 text-[12px]"
+                style={{
+                  background: active ? "var(--brand-soft)" : "transparent",
+                  color: active ? "var(--brand-text)" : "var(--text-muted)",
+                  fontWeight: active ? 500 : 400,
+                }}
+                onClick={() => setTab(t.key)}
+              >
+                {t.label}
+              </button>
+            );
+          })}
+          <span
+            className="ml-auto text-[11px]"
+            style={{ color: "var(--text-muted)" }}
+          >
+            {local.length} 个模型
+          </span>
+        </div>
+
         <div className="min-h-0 flex-1 overflow-auto px-4 py-3">
           {/* 引擎设置 */}
+          {tab === "general" && (
           <section className="mb-4">
             <div className="section-title mb-1.5">引擎设置</div>
 
@@ -371,7 +434,10 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
               </span>
             </div>
           </section>
+          )}
 
+          {tab === "models" && (
+          <>
           {/* 术语表 */}
           <section className="mb-4">
             <div className="mb-1.5 flex items-baseline gap-2">
@@ -531,7 +597,29 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
                       {m.sizeMb} MB
                     </span>
 
-                    <label className="ml-auto flex cursor-pointer items-center gap-1 text-[11px]">
+                    {/* 能力开关：勾上就能进对话页。自动识别不准时用它改，
+                        不必去动模型文件名——这是识别的兜底。 */}
+                    <label
+                      className="ml-auto flex cursor-pointer items-center gap-1 text-[11px]"
+                      title={
+                        m.chatOverridden
+                          ? `已手动设置（自动判定为${m.chatAuto ? "可用" : "不可用"}），点击恢复自动`
+                          : `自动判定为${m.chatAuto ? "可用" : "不可用"}；手动改过之后以你为准`
+                      }
+                    >
+                      <input
+                        type="checkbox"
+                        checked={m.chatCapable}
+                        onChange={(e) => toggleChat(m.id, e.target.checked)}
+                        className="accent-[var(--brand)]"
+                      />
+                      对话
+                      {m.chatOverridden && (
+                        <span style={{ color: "var(--brand-text)" }}>·手动</span>
+                      )}
+                    </label>
+
+                    <label className="flex cursor-pointer items-center gap-1 text-[11px]">
                       <input
                         type="checkbox"
                         checked={isPinned}
@@ -598,6 +686,8 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
               );
             })}
           </ul>
+          </>
+          )}
 
           {error && (
             <p className="m-0 mt-3 text-[12px]" style={{ color: "var(--danger)" }}>

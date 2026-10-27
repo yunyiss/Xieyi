@@ -37,6 +37,8 @@ vi.mock("../lib/ipc", async (importOriginal) => {
         chatCapable: true,
         family: "通用",
         unsupportedReason: null,
+        chatAuto: true,
+        chatOverridden: false,
       },
     ]),
     newRequestId: vi.fn(() => "req-1"),
@@ -90,6 +92,8 @@ function useDefaultModels() {
       chatCapable: true,
       family: "通用",
       unsupportedReason: null,
+        chatAuto: true,
+        chatOverridden: false,
     },
   ]);
 }
@@ -152,6 +156,8 @@ describe("Chat", () => {
         chatCapable: true,
         family: "通用",
         unsupportedReason: null,
+        chatAuto: true,
+        chatOverridden: false,
       },
       {
         id: "hy-mt2.gguf",
@@ -164,6 +170,8 @@ describe("Chat", () => {
         chatCapable: false,
         family: "Hy-MT2",
         unsupportedReason: null,
+        chatAuto: false,
+        chatOverridden: false,
       },
     ]);
 
@@ -193,12 +201,67 @@ describe("Chat", () => {
         chatCapable: false,
         family: "Hy-MT2",
         unsupportedReason: null,
+        chatAuto: false,
+        chatOverridden: false,
       },
     ]);
 
     render(<Chat />);
     expect(await screen.findByText(/只有翻译专用模型/)).toBeInTheDocument();
   });
+
+  /**
+   * 手动把某个模型改成"可对话"后，它应当出现在对话页。
+   *
+   * 这是"自动识别猜错了"的兜底：用户不需要去改模型文件名，
+   * 在设置里打个勾就行。
+   */
+  it("手动放开能力限制后，翻译模型也能进对话页", async () => {
+    listRouterMock.mockResolvedValue([
+      { id: "qwen.gguf", state: "unloaded" },
+      { id: "tg.gguf", state: "unloaded" },
+    ]);
+    listLocalMock.mockResolvedValue([
+      {
+        id: "qwen.gguf",
+        path: "C:/models/qwen.gguf",
+        sizeMb: 4000,
+        ctxSize: 8192,
+        trainedCtx: 32768,
+        supportsThinking: true,
+        thinking: "off" as const,
+        chatCapable: true,
+        family: "通用",
+        unsupportedReason: null,
+        chatAuto: true,
+        chatOverridden: false,
+      },
+      {
+        // 自动判为不可对话，但用户手动开了
+        id: "tg.gguf",
+        path: "C:/models/tg.gguf",
+        sizeMb: 3800,
+        ctxSize: 4096,
+        trainedCtx: 131072,
+        supportsThinking: false,
+        thinking: "off" as const,
+        chatCapable: true,
+        family: "TranslateGemma",
+        unsupportedReason: null,
+        chatAuto: false,
+        chatOverridden: true,
+      },
+    ]);
+
+    await renderReady();
+
+    const user = userEvent.setup();
+    await user.click(screen.getByLabelText("模型与思考强度"));
+    // 选择器是两级菜单：先点开，再进「模型」这一层才是模型列表
+    await user.click(screen.getByText("模型"));
+    // 手动放开的那个也出现了（列表里会把 .gguf 后缀去掉）
+    expect(screen.getAllByText("tg").length).toBeGreaterThan(0);
+  }, 20000);
 
   /**
    * 快捷指令曾经完全无效：它被当成独立的 system 消息插在对话中间，
@@ -469,6 +532,8 @@ describe("Chat", () => {
         chatCapable: true,
         family: "通用",
         unsupportedReason: null,
+        chatAuto: true,
+        chatOverridden: false,
       },
     ]);
     chatMock.mockResolvedValue("好的");
@@ -510,6 +575,8 @@ describe("Chat", () => {
         chatCapable: true,
         family: "通用",
         unsupportedReason: null,
+        chatAuto: true,
+        chatOverridden: false,
       },
     ]);
     compactMock.mockRejectedValue(new Error("摘要请求失败"));
