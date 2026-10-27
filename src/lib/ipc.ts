@@ -17,6 +17,25 @@ export interface RuntimeStatus {
   backend: string | null;
   serverPath: string | null;
   modelsDir: string;
+  /** 自检结果；只有显式「切换引擎」时才返回 */
+  probe?: RuntimeProbe | null;
+}
+
+/** 对某个 llama-server 的自检结果。 */
+export interface RuntimeProbe {
+  ok: boolean;
+  /** 版本行（成功时）或失败原因 */
+  detail: string;
+}
+
+/** 磁盘上已发现、可直接切换过去的引擎。 */
+export interface DiscoveredRuntime {
+  path: string;
+  /** 目录名，便于辨认 */
+  label: string;
+  /** cuda / vulkan / cpu / unknown */
+  backend: string;
+  version: string;
 }
 
 export interface ServiceStatus {
@@ -186,6 +205,12 @@ export const installRuntime = (backend: string) =>
   invoke<RuntimeStatus>("install_runtime", { backend });
 export const setManualRuntime = (serverPath: string) =>
   invoke<RuntimeStatus>("set_manual_runtime", { serverPath });
+/** 只自检、不改配置。用于界面上"先试试这个文件行不行"。 */
+export const probeRuntime = (serverPath: string) =>
+  invoke<RuntimeProbe>("probe_runtime", { serverPath });
+/** 扫一遍磁盘，找现成可切换的 llama-server。 */
+export const discoverRuntimes = () =>
+  invoke<DiscoveredRuntime[]>("discover_runtimes");
 
 export const getServiceStatus = () => invoke<ServiceStatus>("service_status");
 export const startService = () => invoke<ServiceStatus>("start_service");

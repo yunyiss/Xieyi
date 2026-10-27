@@ -92,6 +92,8 @@ pub fn run() {
             runtime::runtime_status,
             runtime::install_runtime,
             runtime::set_manual_runtime,
+            runtime::probe_runtime,
+            runtime::discover_runtimes,
             service::service_status,
             service::start_service,
             service::stop_service,

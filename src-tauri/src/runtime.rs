@@ -40,6 +40,22 @@ pub struct RuntimeStatus {
     pub backend: Option<String>,
     pub server_path: Option<String>,
     pub models_dir: String,
+    /// 自检结果：能否实际跑起来、报什么版本。
+    ///
+    /// 只判断"文件存在"是不够的——用户可能选了个改名后的别的程序，
+    /// 或者版本不匹配的 llama-server。这里把 `--version` 的输出带上来，
+    /// 界面上能直接看到"这个引擎到底是什么"。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probe: Option<RuntimeProbe>,
+}
+
+/// 对某个 llama-server 可执行文件做一次自检。
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeProbe {
+    pub ok: bool,
+    /// `--version` 输出的第一行（成功时），或失败原因
+    pub detail: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -58,7 +74,7 @@ pub fn read_info(app: &AppHandle) -> Option<RuntimeInfo> {
 
 pub fn status(app: &AppHandle) -> RuntimeStatus {
     let info = read_info(app);
-    let models_dir = paths::models_dir(app)
+    let models_dir = paths::models_dir(&app)
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
 
@@ -71,6 +87,74 @@ pub fn status(app: &AppHandle) -> RuntimeStatus {
         backend: info.as_ref().map(|i| i.backend.clone()),
         server_path: info.as_ref().map(|i| i.server_path.clone()),
         models_dir,
+        // 状态查询要保持轻量：每次 2.5 秒轮询都跑一次 --version 太重，
+        // 自检只在"切换引擎"这种显式操作时做。
+        probe: None,
+    }
+}
+
+/// 对指定路径的 llama-server 跑一次 `--version` 自检。
+///
+/// 只判断"文件存在"不够：用户可能选成别的程序，或者版本不匹配。
+/// 这里真的去执行一次，把版本行带回来——既是校验，也是给人看的信息。
+fn probe_exe(path: &Path) -> RuntimeProbe {
+    if !path.exists() {
+        return RuntimeProbe {
+            ok: false,
+            detail: "文件不存在".into(),
+        };
+    }
+
+    let output = std::process::Command::new(path)
+        .arg("--version")
+        .creation_flags_no_window()
+        .output();
+
+    match output {
+        Ok(out) => {
+            // llama-server 把版本打在 stdout，个别构建打 stderr
+            let text = if out.stdout.is_empty() {
+                String::from_utf8_lossy(&out.stderr).to_string()
+            } else {
+                String::from_utf8_lossy(&out.stdout).to_string()
+            };
+            let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+
+            if out.status.success() && !first.is_empty() {
+                RuntimeProbe {
+                    ok: true,
+                    detail: first.trim().to_string(),
+                }
+            } else {
+                RuntimeProbe {
+                    ok: false,
+                    detail: format!(
+                        "无法执行（{}）。可能不是 llama-server，或缺少 VC++ 运行库",
+                        out.status
+                    ),
+                }
+            }
+        }
+        Err(e) => RuntimeProbe {
+            ok: false,
+            detail: format!("启动失败：{e}"),
+        },
+    }
+}
+
+/// Windows 上不弹黑框；其他平台是空操作。
+trait NoWindow {
+    fn creation_flags_no_window(&mut self) -> &mut Self;
+}
+
+impl NoWindow for std::process::Command {
+    fn creation_flags_no_window(&mut self) -> &mut Self {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            self.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        self
     }
 }
 
@@ -257,12 +341,25 @@ pub async fn install_runtime(app: AppHandle, backend: String) -> Result<RuntimeS
 }
 
 /// 高级选项：直接指定已有的 llama-server，跳过下载。
+///
+/// **必须真的能跑起来才算数**：只判断文件存在的话，用户选错一个同名程序
+/// （或者选了个损坏的副本）也会被记成"已安装"，直到真正翻译时才炸。
+/// 这里先跑一次 `--version`，失败就拒绝并说明原因。
 #[tauri::command]
 pub fn set_manual_runtime(app: AppHandle, server_path: String) -> Result<RuntimeStatus, String> {
     let path = PathBuf::from(&server_path);
     if !path.exists() {
-        return Err(format!("路径不存在: {}", path.display()));
+        return Err(format!("路径不存在：{}", path.display()));
     }
+    if !path.is_file() {
+        return Err("请选择 llama-server 可执行文件，而不是目录".into());
+    }
+
+    let probe = probe_exe(&path);
+    if !probe.ok {
+        return Err(format!("这个文件不能用作推理引擎：{}", probe.detail));
+    }
+
     let info = RuntimeInfo {
         version: "manual".into(),
         backend: "manual".into(),
@@ -272,5 +369,167 @@ pub fn set_manual_runtime(app: AppHandle, server_path: String) -> Result<Runtime
     };
     let json = serde_json::to_string_pretty(&info).map_err(|e| e.to_string())?;
     std::fs::write(paths::runtime_json(&app)?, json).map_err(|e| e.to_string())?;
-    Ok(status(&app))
+
+    let mut st = status(&app);
+    // 把自检结果一起带回去，界面上能直接看到"切换后的引擎到底是哪个版本"
+    st.probe = Some(probe);
+    Ok(st)
+}
+
+/// 只做自检、不改配置。用于界面上"先试试这个文件行不行"。
+#[tauri::command]
+pub fn probe_runtime(server_path: String) -> RuntimeProbe {
+    probe_exe(Path::new(&server_path))
+}
+
+/// 磁盘上已有、可直接切换过去的引擎。
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveredRuntime {
+    pub path: String,
+    /// 目录名（`llama-b11714-bin-win-cuda-13.4-x64` 这种），便于用户辨认
+    pub label: String,
+    /// 推断的后端：cuda / vulkan / cpu / unknown
+    pub backend: String,
+    pub version: String,
+}
+
+/// 在常见位置找现成的 llama-server。
+///
+/// 用户手里往往已经有一份（比如自己下的 CUDA 版），没必要再让人
+/// 去文件对话框里翻路径——扫一遍列出来点一下就能换。
+#[tauri::command]
+pub fn discover_runtimes(app: AppHandle) -> Vec<DiscoveredRuntime> {
+    let exe_name = if cfg!(windows) {
+        "llama-server.exe"
+    } else {
+        "llama-server"
+    };
+
+    // 扫描位置：应用自己的 runtime 目录 + 用户常见的下载位置
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Ok(root) = paths::runtime_root(&app) {
+        roots.push(root);
+    }
+    for key in ["USERPROFILE", "HOME"] {
+        if let Ok(home) = std::env::var(key) {
+            let home = PathBuf::from(home);
+            for sub in ["Downloads", "Desktop", "Documents"] {
+                let p = home.join(sub);
+                if p.is_dir() {
+                    roots.push(p);
+                }
+            }
+        }
+    }
+    // D 盘根目录也常被用来放这类绿色包
+    #[cfg(windows)]
+    {
+        for drive in ["D:\\", "E:\\"] {
+            let p = PathBuf::from(drive);
+            if p.is_dir() {
+                roots.push(p);
+            }
+        }
+    }
+
+    let mut found: Vec<DiscoveredRuntime> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for root in roots {
+        // 只看两层：`<root>/llama-xxx/llama-server.exe` 或 `<root>/llama-server.exe`
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&root) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_file() && p.file_name().and_then(|n| n.to_str()) == Some(exe_name) {
+                    candidates.push(p.clone());
+                }
+                if p.is_dir() {
+                    let direct = p.join(exe_name);
+                    if direct.is_file() {
+                        candidates.push(direct);
+                    }
+                }
+            }
+        }
+
+        for path in candidates {
+            let key = path.to_string_lossy().to_lowercase();
+            if !seen.insert(key) {
+                continue;
+            }
+            let label = path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("llama.cpp")
+                .to_string();
+            let lower = label.to_lowercase();
+            let backend = if lower.contains("cuda") {
+                "cuda"
+            } else if lower.contains("vulkan") {
+                "vulkan"
+            } else if lower.contains("cpu") {
+                "cpu"
+            } else {
+                "unknown"
+            }
+            .to_string();
+
+            // 版本信息从 --version 拿；拿不到就标成未知，不阻断列表
+            let probe = probe_exe(&path);
+            found.push(DiscoveredRuntime {
+                path: path.to_string_lossy().to_string(),
+                label,
+                backend,
+                version: if probe.ok {
+                    probe.detail
+                } else {
+                    "（无法执行）".into()
+                },
+            });
+        }
+    }
+
+    found.sort_by(|a, b| a.label.cmp(&b.label));
+    found
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_path_is_rejected() {
+        let probe = probe_exe(Path::new(r"D:\definitely-not-here\llama-server.exe"));
+        assert!(!probe.ok);
+        assert!(probe.detail.contains("不存在"), "{}", probe.detail);
+    }
+
+    /// 目录不能被当成可执行文件——用户很容易选错。
+    #[test]
+    fn directory_is_rejected() {
+        let dir = std::env::temp_dir();
+        let probe = probe_exe(&dir);
+        assert!(!probe.ok, "目录不该通过自检");
+    }
+
+    /// 真实引擎的自检：版本信息在 stderr 里，不是 stdout。
+    ///
+    /// 这条用 LT_LLAMA_SERVER 指定路径才会跑（CI 上没装引擎）。
+    /// 顺带锁住"stdout 为空时改读 stderr"这个容易写错的分支。
+    #[test]
+    fn real_engine_probe_reads_version_from_stderr() {
+        let Ok(exe) = std::env::var("LT_LLAMA_SERVER") else {
+            return;
+        };
+        let probe = probe_exe(Path::new(&exe));
+        assert!(probe.ok, "真实引擎应当通过自检：{}", probe.detail);
+        assert!(
+            probe.detail.to_lowercase().contains("version"),
+            "应带回版本行：{}",
+            probe.detail
+        );
+    }
 }

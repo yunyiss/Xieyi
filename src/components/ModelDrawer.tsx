@@ -1,7 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+// 这个组件的 props 里已经有 `open`（抽屉是否展开），
+// 所以文件对话框的函数要改个名字，避免遮蔽。
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
   abort,
+  discoverRuntimes,
   getGlossary,
+  getRuntimeStatus,
   getSettings,
   listLocalModels,
   listRouterModels,
@@ -10,13 +15,17 @@ import {
   restartService,
   setGlossary,
   setGpuLayers,
+  setManualRuntime,
   setModelParams,
   setModelChatCapable,
   setModelsDir,
   setPinned,
   setTtl,
+  type DiscoveredRuntime,
   type GlossaryEntry,
   type LocalModel,
+  type RuntimeProbe,
+  type RuntimeStatus,
   type Settings,
 } from "../lib/ipc";
 import { Select } from "./Select";
@@ -71,6 +80,12 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
   const [local, setLocal] = useState<LocalModel[]>([]);
   /** 当前页签：engines 类参数与模型分开，避免一页塞太多。 */
   const [tab, setTab] = useState<"general" | "models">("general");
+  /** 当前推理引擎状态，用于「推理引擎」那一块。 */
+  const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
+  /** 引擎切换后的自检结果（成功显示版本，失败显示原因）。 */
+  const [probeMsg, setProbeMsg] = useState<RuntimeProbe | null>(null);
+  /** 扫描到的可切换引擎。 */
+  const [discovered, setDiscovered] = useState<DiscoveredRuntime[]>([]);
   const [states, setStates] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
@@ -88,6 +103,7 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
       setSettings(s);
       setLocal(await listLocalModels());
       setFreeVram(await probeVram());
+      setRuntime(await getRuntimeStatus());
 
       const terms = await getGlossary();
       setGlossaryText(
@@ -143,6 +159,68 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
   if (!open && !closing) return null;
 
   const pinned = settings?.pinned ?? [];
+
+  /**
+   * 切换推理引擎。
+   *
+   * 后端会先跑 `--version` 自检，跑不起来的文件直接拒绝——
+   * 否则会被记成"已安装"，直到真正翻译时才炸。
+   * 成功后要把引擎重启，否则旧进程还在用旧的可执行文件。
+   */
+  const useEngine = async (path: string) => {
+    setError("");
+    setProbeMsg(null);
+    setBusy("engine");
+    try {
+      const st = await setManualRuntime(path);
+      setRuntime(st);
+      setProbeMsg(st.probe ?? null);
+      // 换引擎必须重启，否则推理还在跑旧的那个
+      await restartService();
+      await refresh();
+      onChanged();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  /** 用系统文件对话框挑一个 llama-server 可执行文件。 */
+  const pickEngineFile = async () => {
+    setError("");
+    setProbeMsg(null);
+    try {
+      const picked = await openDialog({
+        multiple: false,
+        directory: false,
+        title: "选择 llama-server 可执行文件",
+        filters: [
+          {
+            name: "可执行文件",
+            extensions: ["exe"],
+          },
+        ],
+      });
+      if (typeof picked !== "string") return;
+      await useEngine(picked);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  /** 扫一遍磁盘，列出可以一键切换的引擎。 */
+  const scanEngines = async () => {
+    setError("");
+    setBusy("engine");
+    try {
+      setDiscovered(await discoverRuntimes());
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy("");
+    }
+  };
 
   const togglePin = async (id: string, next: boolean) => {
     setError("");
@@ -432,6 +510,120 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
               <span className="text-[11px]" style={{ color: "var(--text-muted)" }}>
                 {needsRestart ? "上下文已改，重启后生效" : "档位改动后需重启生效"}
               </span>
+            </div>
+          </section>
+          )}
+
+          {tab === "general" && (
+          <section className="mb-4">
+            <div className="flex items-baseline gap-2">
+              <span className="section-title">推理引擎</span>
+              <span className="text-[10px]" style={{ color: "var(--text-muted)" }}>
+                换成自己的 llama-server，不必重新下载
+              </span>
+            </div>
+
+            <div
+              className="mt-1.5 rounded-[10px] border p-2.5"
+              style={{
+                background: "var(--surface-muted)",
+                borderColor: "var(--border)",
+              }}
+            >
+              <p
+                className="m-0 truncate text-[12px]"
+                title={runtime?.serverPath ?? ""}
+                style={{ color: "var(--text)" }}
+              >
+                {runtime?.installed
+                  ? (runtime.serverPath ?? "").split(/[\\/]/).slice(-2).join(" / ")
+                  : "尚未安装推理引擎"}
+              </p>
+              <p className="m-0 mt-0.5 text-[11px]" style={{ color: "var(--text-muted)" }}>
+                {runtime?.installed
+                  ? `${runtime.backend ?? "未知"} · ${runtime.version ?? "未知版本"}`
+                  : "到「翻译」页安装，或用下方按钮指定已有文件"}
+              </p>
+
+              {probeMsg && (
+                <p
+                  className="m-0 mt-1.5 text-[11px] leading-relaxed"
+                  style={{
+                    color: probeMsg.ok ? "var(--brand-text)" : "var(--danger)",
+                  }}
+                >
+                  {probeMsg.ok ? "✓ " : "✗ "}
+                  {probeMsg.detail}
+                </p>
+              )}
+
+              <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                <button
+                  className={btnClass}
+                  style={btnStyle}
+                  onClick={pickEngineFile}
+                  disabled={busy === "engine"}
+                >
+                  选择文件…
+                </button>
+                <button
+                  className={btnClass}
+                  style={btnStyle}
+                  onClick={scanEngines}
+                  disabled={busy === "engine"}
+                >
+                  {busy === "engine" ? "扫描中…" : "扫描已安装"}
+                </button>
+              </div>
+
+              {/* 扫出来的候选：点一下就能换，省得去文件对话框翻路径 */}
+              {discovered.length > 0 && (
+                <ul className="m-0 mt-2 flex list-none flex-col gap-1 p-0">
+                  {discovered.map((d) => {
+                    const current = d.path === runtime?.serverPath;
+                    return (
+                      <li key={d.path}>
+                        <button
+                          className="row w-full rounded-lg px-2 py-1.5 text-left"
+                          data-selected={current}
+                          disabled={busy === "engine" || current}
+                          onClick={() => useEngine(d.path)}
+                          title={d.path}
+                        >
+                          <span className="flex items-center gap-1.5">
+                            <span className="min-w-0 flex-1 truncate text-[12px]">
+                              {d.label}
+                            </span>
+                            <span
+                              className="shrink-0 rounded px-1 py-0.5 text-[10px]"
+                              style={{
+                                background: "var(--brand-soft)",
+                                color: "var(--brand-text)",
+                              }}
+                            >
+                              {d.backend}
+                            </span>
+                            {current && (
+                              <span
+                                className="shrink-0 text-[10px]"
+                                style={{ color: "var(--brand-text)" }}
+                              >
+                                当前
+                              </span>
+                            )}
+                          </span>
+                          <span
+                            className="mt-0.5 block truncate text-[10px]"
+                            style={{ color: "var(--text-muted)" }}
+                          >
+                            {d.version}
+                          </span>
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
             </div>
           </section>
           )}
