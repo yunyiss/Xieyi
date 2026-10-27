@@ -61,16 +61,20 @@ vi.mock("../lib/ipc", async (importOriginal) => {
     }),
     onUsage: vi.fn(async () => () => {}),
     onModelState: vi.fn(async () => () => {}),
+    compactHistory: vi.fn(async () => "压缩后的要点"),
   };
 });
 
 const chatMock = vi.mocked(ipc.chat);
+const compactMock = vi.mocked(ipc.compactHistory);
 const saveMock = vi.mocked(ipc.saveSession);
 const abortMock = vi.mocked(ipc.abort);
 
 beforeEach(() => {
   vi.clearAllMocks();
   chatMock.mockReset();
+  compactMock.mockReset();
+  compactMock.mockResolvedValue("压缩后的要点");
   abortMock.mockReset();
   abortMock.mockResolvedValue(undefined);
   streams.token = null;
@@ -81,6 +85,13 @@ beforeEach(() => {
 async function renderReady() {
   render(<Chat />);
   await waitFor(() => expect(screen.getByLabelText("发送")).toBeEnabled());
+  // `refresh()` 里 listRouterModels / listSessions / listLocalModels 是三个
+  // 独立 await，发送按钮只依赖第一个。localModels 决定 ctxSize（进而决定
+  // 是否压缩），所以要把剩余两个也等完——用一个微任务轮次即可。
+  await act(async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+  });
 }
 
 /** 输入一条消息并用 Enter 发送。 */
@@ -284,4 +295,76 @@ describe("Chat", () => {
     expect(await screen.findByText("2 字")).toBeInTheDocument();
     expect(screen.getAllByText("分析")).toHaveLength(1);
   });
+
+  /**
+   * 历史超过 ctx 的 60% 时，发送前应先压缩；且压缩结果要写回会话，
+   * 否则每发一句都会把同样几轮再压一遍，白烧模型调用。
+   *
+   * 用 512 的小 ctx 模型，200 字左右就能触发，避免在测试里敲长文本。
+   */
+  it("历史过长时先压缩，且压过之后不重复压缩", async () => {
+    const smallCtx = vi.mocked(ipc.listLocalModels);
+    smallCtx.mockResolvedValue([
+      {
+        id: "demo.gguf",
+        path: "C:/models/demo.gguf",
+        sizeMb: 512,
+        ctxSize: 512, // 阈值 0.6×512 ≈ 307 token ≈ 614 字符
+        trainedCtx: 4096,
+        supportsThinking: false,
+        thinking: "off" as const,
+      },
+    ]);
+    chatMock.mockResolvedValue("好的");
+
+    await renderReady();
+
+    // 需要超过 keepTurns(3) 轮才切得出可压缩片段，且要越过触发阈值。
+    // 每轮用"发送按钮重新可用"作为完成信号，别用文本查找——
+    // 多轮回复文本相同时会命中多个元素。
+    const chunk = "字".repeat(250);
+    for (let i = 0; i < 5; i++) {
+      await sendText(`${i}${chunk}`);
+      await waitFor(() =>
+        expect(screen.getByLabelText("发送")).toBeEnabled(),
+      );
+    }
+
+    const firstRound = compactMock.mock.calls.length;
+    expect(firstRound).toBeGreaterThan(0);
+
+    // 再发一句：上一轮已经压缩并写回，历史变短，不该再压
+    await sendText("再来");
+    await waitFor(() => expect(screen.getByLabelText("发送")).toBeEnabled());
+    expect(compactMock.mock.calls.length).toBe(firstRound);
+  }, 30000);
+
+  /** 压缩失败不能挡住对话——退回让后端按轮次裁。 */
+  it("压缩失败时对话照常继续", async () => {
+    const smallCtx = vi.mocked(ipc.listLocalModels);
+    smallCtx.mockResolvedValue([
+      {
+        id: "demo.gguf",
+        path: "C:/models/demo.gguf",
+        sizeMb: 512,
+        ctxSize: 512,
+        trainedCtx: 4096,
+        supportsThinking: false,
+        thinking: "off" as const,
+      },
+    ]);
+    compactMock.mockRejectedValue(new Error("摘要请求失败"));
+    chatMock.mockResolvedValue("照样能答");
+
+    await renderReady();
+    const chunk = "字".repeat(250);
+    for (let i = 0; i < 3; i++) {
+      await sendText(`${i}${chunk}`);
+      await screen.findAllByText("照样能答");
+    }
+
+    expect(compactMock).toHaveBeenCalled();
+    // 摘要挂了，但对话仍然正常完成
+    expect(screen.getAllByText("照样能答").length).toBeGreaterThan(0);
+  }, 30000);
 });

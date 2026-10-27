@@ -91,6 +91,7 @@ pub fn run() {
             service::get_glossary,
             service::set_glossary,
             service::chat,
+            service::compact_history,
             service::abort,
             service::set_ttl,
             service::set_gpu_layers,

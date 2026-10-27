@@ -7,6 +7,7 @@ import { SessionPicker } from "../components/SessionPicker";
 import {
   abort,
   chat,
+  compactHistory,
   deleteAllSessions,
   deleteSession,
   listLocalModels,
@@ -29,12 +30,14 @@ import {
 import {
   activeVersion,
   appendVersion,
+  applyCompaction,
   canRegenerateAt,
   ensureMessageIds,
   indexOfMessage,
   makeMessage,
   neighborVersion,
   normalizeHistory,
+  planCompaction,
   switchVersion,
   versionCount,
 } from "../lib/chat";
@@ -299,15 +302,45 @@ export function Chat({
     });
 
     try {
+      // 历史太长时先压缩：把最早的几轮换成一份摘要，避免后端的硬裁剪
+      // 把关键信息（定好的译法、术语）整段丢掉。
+      // 压缩失败不该挡住这次对话——退回让后端按轮次裁，至少还能用。
+      // 取不到模型参数时按 4096 兜底：宁可压缩得早一点，
+      // 也不要因为"本地还没读到 ctx"就把整段历史直接甩给后端硬裁。
+      const ctx = localModels.find((m) => m.id === model)?.ctxSize ?? 4096;
+      let outboundFinal = outbound;
+      // 摘要也要写回会话，否则下一次发送会把同样几轮再压一遍，
+      // 每次对话都白烧一次模型调用。
+      let compactedDisplay: ChatMessage[] | null = null;
+
+      const plan = planCompaction(outbound, ctx);
+      if (plan) {
+        try {
+          const summary = await compactHistory(model, plan.toCompact);
+          outboundFinal = applyCompaction(plan.toKeep, summary);
+          // 注意：toKeep 不含那条 pending 占位（占位只存在于 display 里），
+          // 所以要把占位单独接回来，否则下面的 replyId 匹配不上、回复会丢。
+          const pending = display.find((m) => m.id === replyId);
+          compactedDisplay = [
+            ...applyCompaction(plan.toKeep, summary),
+            ...(pending ? [pending] : []),
+          ];
+        } catch (e) {
+          console.error("压缩历史失败，本次按原样发送", e);
+        }
+      }
+
       const full = await chat({
         requestId: id,
         model,
-        messages: normalizeHistory(outbound),
+        messages: normalizeHistory(outboundFinal),
         thinking,
       });
       // 思维链随这条回复一起存下来，之后还能点开回看
       const think = reasoningRef.current.trim();
-      const finalMessages: ChatMessage[] = display.map(
+      // 压缩过就把"摘要 + 保留的消息"作为新的显示基准，回复追加在它后面
+      const base = compactedDisplay ?? display;
+      const finalMessages: ChatMessage[] = base.map(
         (m): ChatMessage => {
           if (m.id !== replyId) return m;
 

@@ -939,6 +939,15 @@ pub struct ChatRequest {
     pub thinking: Option<String>,
 }
 
+/// 请求把一段较早的对话压成摘要。哪一段算"较早"由前端决定。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactRequest {
+    pub model: String,
+    /// 待压缩的那批历史消息（已经是前端挑出来的旧片段）
+    pub messages: Vec<ChatMessage>,
+}
+
 /// 通用的流式补全：负责加载模型、发请求、解析 SSE 并把 token 推给前端。
 ///
 /// `thinking` 决定是否让思考型模型先输出思维链。翻译固定关闭：
@@ -1515,6 +1524,99 @@ fn history_budget(ctx: u64) -> usize {
     (tokens * 2).max(HISTORY_BUDGET_MIN)
 }
 
+/// 摘要提示词：把"较早的一段译文修改对话"压缩成一份可接续的要点。
+///
+/// 刻意**不是**编程 agent 那套（Goal/Progress/Blocked/文件路径）——
+/// 那是给改代码用的。这里是"改译文"，真正需要带下去的是：译的是什么、
+/// 定了哪些译法、试过哪些方向、当前版本长什么样。
+const COMPACT_PROMPT: &str = "The messages above are an earlier part of a translation revision session. \
+Write a compact handover note so the work can continue without re-reading them.
+
+Use EXACTLY this format (skip a section only if it truly does not apply):
+
+## 翻译任务
+- 原文要点 / 语种方向 / 采用的风格
+
+## 术语与约束
+- 用户明确要求过的措辞、术语、语气、禁忌
+
+## 已确定的译法
+- 已经敲定、后续必须延续的具体表达
+
+## 修改历史
+- 试过哪些方向，为什么放弃；哪一版被采纳
+
+## 当前版本
+- 最新的译文（若较长可只留关键段落）
+
+Keep it under 400 words. Preserve exact wording the user approved, \
+and never invent content that was not in the conversation.";
+
+/// 把一段较早的对话压成摘要。
+///
+/// 只负责"摘要"这一件事：哪一段该压、压完怎么替换，由前端决定——
+/// 前端才清楚哪些消息属于"旧"、哪些要原样保留。
+#[tauri::command]
+pub async fn compact_history(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    request: CompactRequest,
+) -> Result<String, String> {
+    if request.messages.is_empty() {
+        return Err("没有需要压缩的内容".into());
+    }
+
+    let service = ensure(&app, &state).await?;
+    let _infer = state.infer_lock.lock().await;
+    // 摘要也是一次推理，同样不能让 TTL 把模型当成空闲
+    let _busy = InflightGuard::new(&state.inflight);
+    state.cancel.store(false, Ordering::Relaxed);
+
+    // 摘要请求本身不该被再次压缩，直接按角色拼成一段文本喂进去，
+    // 避免模型把待总结的内容当成"要继续的对话"。
+    let transcript: String = request
+        .messages
+        .iter()
+        .map(|m| {
+            let who = match m.role.as_str() {
+                "user" => "用户",
+                "assistant" => "助手",
+                other => other,
+            };
+            format!("[{who}]\n{}\n", m.content)
+        })
+        .collect();
+
+    let messages = serde_json::json!([
+        { "role": "system", "content": COMPACT_PROMPT },
+        { "role": "user", "content": transcript }
+    ]);
+
+    let model_params = params::get(&app, &request.model);
+    // 摘要要短，给 1024 足够；思考关闭，否则小模型会把额度全花在思考上
+    let budget = 1024u32.min((model_params.ctx / 4).max(256) as u32);
+
+    let summary = stream_completion(
+        &app,
+        &service,
+        "", // 空 request_id：不向前端推 token
+        &request.model,
+        messages,
+        0.1,
+        budget,
+        Thinking::Off,
+        &state.cancel,
+    )
+    .await;
+
+    *state.last_used.lock().await = Instant::now();
+
+    match summary {
+        Ok(text) => Ok(text),
+        Err(_) if state.cancel.load(Ordering::Relaxed) => Err("已取消".into()),
+        Err(e) => Err(e),
+    }
+}
 /// 裁剪对话历史，使其落在预算内。
 ///
 /// 两条规则，都来自"对话是成对出现的"这个事实：
@@ -1543,7 +1645,6 @@ fn trim_history(messages: &[ChatMessage], ctx: u64) -> Vec<ChatMessage> {
         } else if let Some(last) = turns.last_mut() {
             last.push(message.clone());
         }
-        // 变异：每条消息单独成组（旧的"按字符硬丢"等效行为）
     }
 
     // 从最新的轮次往回装，装不下就停。最后一条无论如何都要保留。

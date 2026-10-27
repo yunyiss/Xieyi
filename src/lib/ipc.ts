@@ -209,6 +209,15 @@ export const translate = (request: TranslateRequest) =>
   invoke<string>("translate", { request });
 export const chat = (request: ChatRequest) =>
   invoke<string>("chat", { request });
+
+/**
+ * 把一段较早的对话压成摘要。
+ *
+ * 用于历史太长时避免"整段丢弃"：摘要会替换掉被压缩的那几轮，
+ * 既腾出上下文，又不至于把之前定好的译法全部忘掉。
+ */
+export const compactHistory = (model: string, messages: ChatMessage[]) =>
+  invoke<string>("compact_history", { request: { model, messages } });
 export const abort = (model?: string) =>
   invoke<void>("abort", { model: model ?? null });
 export const probeVram = () => invoke<number | null>("probe_vram");
