@@ -239,8 +239,27 @@ pub fn profile_of(name: &str, template: Option<&str>) -> ModelProfile {
         };
     }
 
-    // ② 翻译专用家族：能翻译，但没有对话能力。
-    let translate_only = |family: &str, style: PromptStyle| ModelProfile {
+    // ② 已知家族：能翻译，也**能拿来对话**——但需要各自的最佳调用方式。
+    //
+    // 这里有个踩过的坑：最初按"翻译模型一律不能对话"处理，结果用户模型目录里
+    // 只有翻译模型时，对话页直接空了。实测推翻了这个判断：
+    //   Hy-MT2-7B        改写任务 ✅「该功能性能优异，建议您予以试用。」
+    //                    闲聊     ✅「我是混元，是由腾讯开发的大模型。」
+    //   Index-Translate  改写任务 ✅「此功能颇为实用，不妨一试。」（需避开思考吃光额度）
+    // 它们明确不是"不能对话"，而是"对话时要用对提示词"。
+    // 真正不能对话的只有 Seed-X（官方无 chat 模板）和单轮翻译器（translategemma，
+    // 会把用户的问题本身翻译掉）。
+    let known = |family: &str, style: PromptStyle| ModelProfile {
+        style,
+        chat_capable: true,
+        family: family.into(),
+        unsupported: None,
+    };
+
+    // ---- 真正不能对话的：单轮翻译器 ----
+    // 它们把**用户的问题本身**当成待翻译文本，问"你是谁"会回一句英文，
+    // 因为模板里写死了"把这段翻译成目标语言"，没有留出"回答指令"的位置。
+    let translation_only = |family: &str, style: PromptStyle| ModelProfile {
         style,
         chat_capable: false,
         family: family.into(),
@@ -250,28 +269,31 @@ pub fn profile_of(name: &str, template: Option<&str>) -> ModelProfile {
     // translategemma：语言码必须走 chat_template_kwargs，否则默认 en-GB，
     // 把任何输入都翻成英式英语。它的 vLLM 优化版改用文本分隔符。
     if tpl.contains("source_lang_code") || tpl.contains("target_lang_code") {
-        return translate_only("TranslateGemma", PromptStyle::TemplateKwargs);
+        return translation_only("TranslateGemma", PromptStyle::TemplateKwargs);
     }
     if tpl.contains("<<<source>>>") || tpl.contains("<<<text>>>") {
-        return translate_only("TranslateGemma", PromptStyle::Delimiter);
+        return translation_only("TranslateGemma", PromptStyle::Delimiter);
     }
     // NVIDIA Riva-Translate：模板内嵌 language_pairs，system 写 "zh-en"。
     if tpl.contains("language_pairs") {
-        return translate_only("Riva-Translate", PromptStyle::LanguagePair);
+        return translation_only("Riva-Translate", PromptStyle::LanguagePair);
     }
     if squashed.contains("translategemma") || squashed.contains("translate-gemma") {
         // 名字像但模板没特征：仍按 translategemma 处理，宁可多传参数
-        return translate_only("TranslateGemma", PromptStyle::TemplateKwargs);
+        return translation_only("TranslateGemma", PromptStyle::TemplateKwargs);
     }
 
     // Index-Translate（B 站）：官方用中文文本提示，并支持术语/格式硬约束。
+    // 实测能对话（「此功能颇为实用，不妨一试。」），只是直接问答时容易被
+    // 思维链吃光输出额度，需要用它的约束格式引导。
     if squashed.contains("index-translate") || squashed.contains("indextranslate") {
-        return translate_only("Index-Translate", PromptStyle::ChineseText);
+        return known("Index-Translate", PromptStyle::ChineseText);
     }
 
-    // ③ Hy-MT2：翻译专用，但指令服从度好，英文 system prompt 就能用。
+    // ③ Hy-MT2：指令服从度好，英文 system prompt 就能用。
+    // 实测对话页改写与闲聊都正常，属于"能对话"。
     if squashed.contains("hy-mt") || squashed.contains("hymt") || squashed.contains("hunyuan-mt") {
-        return translate_only("Hy-MT2", PromptStyle::EnglishSystem);
+        return known("Hy-MT2", PromptStyle::EnglishSystem);
     }
 
     // ④ 兜底：通用对话模型。宁可当作"能对话"，也不要误判。
@@ -675,22 +697,25 @@ mod tests {
     }
 
     #[test]
-    fn index_translate_uses_chinese_prompt() {
+    fn index_translate_uses_chinese_prompt_and_can_chat() {
         let p = profile_of("Index-Translate-9B", Some("<|im_start|>{{ message.content }}"));
         assert_eq!(p.style, PromptStyle::ChineseText);
         assert_eq!(p.family, "Index-Translate");
-        // 能翻译，但不是对话模型
-        assert!(!p.chat_capable);
+        // 实测能对话（「此功能颇为实用，不妨一试。」），只是要用中文约束格式
+        assert!(p.chat_capable);
     }
 
-    /// Hy-MT2 用现有英文 system prompt 就够，但要挡住对话页。
+    /// Hy-MT2 用现有英文 system prompt 就够，而且**能对话**。
+    ///
+    /// 曾经把它判成"不能对话"，导致用户模型目录里只有翻译模型时对话页全空。
+    /// 实测：改写「该功能性能优异，建议您予以试用。」、闲聊「我是混元…」都正常。
     #[test]
-    fn hy_mt2_keeps_english_prompt_but_not_chat() {
+    fn hy_mt2_keeps_english_prompt_and_can_chat() {
         for name in ["Hy-MT2-1.8B", "Hy-MT2-7B", "Hunyuan-MT-7B"] {
             let p = profile_of(name, Some("<|startoftext|>{{ message.content }}"));
             assert_eq!(p.style, PromptStyle::EnglishSystem, "{name}");
             assert_eq!(p.family, "Hy-MT2", "{name}");
-            assert!(!p.chat_capable, "{name} 是翻译模型，不该进对话页");
+            assert!(p.chat_capable, "{name} 实测能对话，不该被挡掉");
         }
     }
 
