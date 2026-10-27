@@ -2004,6 +2004,10 @@ pub struct LocalModelInfo {
     pub family: String,
     /// 完全用不了时的原因；为空表示可用。
     pub unsupported_reason: Option<String>,
+    /// 自动识别的结果（不受用户覆盖影响），供界面显示"自动判定为…"。
+    pub chat_auto: bool,
+    /// 用户是否手动改过"能不能对话"。
+    pub chat_overridden: bool,
 }
 
 #[tauri::command]
@@ -2020,7 +2024,11 @@ pub fn list_local_models(app: AppHandle) -> Vec<LocalModelInfo> {
                 supports_thinking: caps.supports_thinking,
                 ctx_size: p.ctx,
                 thinking: p.thinking.as_str().to_string(),
-                chat_capable: caps.profile.chat_capable,
+                // 用户的覆盖优先于自动识别：识别靠读 GGUF 特征，改了文件名
+                // 或遇到冷门模型时会认错，得让人能改回来。
+                chat_capable: p.chat_override.unwrap_or(caps.profile.chat_capable),
+                chat_auto: caps.profile.chat_capable,
+                chat_overridden: p.chat_override.is_some(),
                 family: caps.profile.family,
                 unsupported_reason: caps.profile.unsupported,
                 id: m.id,
@@ -2039,14 +2047,28 @@ pub fn set_model_params(
     ctx: u64,
     thinking: String,
 ) -> Result<params::ModelParams, String> {
+    // 保留已有的能力覆盖：这个命令只负责上下文与思考档位，
+    // 若在这里重建 ModelParams 会把 chat_override 抹掉。
+    let existing = params::get(&app, &model);
     params::set(
         &app,
         &model,
         &params::ModelParams {
             ctx,
             thinking: Thinking::parse(&thinking),
+            chat_override: existing.chat_override,
         },
     )
+}
+
+/// 手动指定某个模型"能不能用在对话页"。传 `null` 恢复自动识别。
+#[tauri::command]
+pub fn set_model_chat_capable(
+    app: AppHandle,
+    model: String,
+    capable: Option<bool>,
+) -> Result<(), String> {
+    params::set_chat_override(&app, &model, capable)
 }
 
 /// 改完 GPU 档位后重启引擎，让新参数生效。

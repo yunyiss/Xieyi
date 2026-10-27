@@ -110,6 +110,7 @@ pub fn run() {
             service::get_settings,
             service::list_local_models,
             service::set_model_params,
+            service::set_model_chat_capable,
             service::thinking_tiers,
             service::restart_service,
             sessions::list_sessions,

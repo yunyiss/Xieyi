@@ -114,6 +114,13 @@ pub struct ModelParams {
     pub ctx: u64,
     #[serde(default)]
     pub thinking: Thinking,
+    /// 用户手动覆盖的"能不能对话"。
+    ///
+    /// `None` = 用自动识别的结果；`Some(true/false)` = 用户说了算。
+    /// 自动识别靠读 GGUF 特征，会有认错的时候（改了文件名、冷门模型），
+    /// 这时得让用户能改回来，而不是逼他去动模型文件。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_override: Option<bool>,
 }
 
 fn default_ctx() -> u64 {
@@ -125,6 +132,7 @@ impl Default for ModelParams {
         Self {
             ctx: DEFAULT_CTX,
             thinking: Thinking::Off,
+            chat_override: None,
         }
     }
 }
@@ -144,11 +152,27 @@ pub fn ctx_of(app: &AppHandle, model: &str) -> u64 {
     get(app, model).ctx
 }
 
+/// 只改"能不能对话"这一项，其余参数保持不动。
+///
+/// `None` 表示恢复自动识别。单独提供这个函数是为了避免调用方
+/// 为了改一个布尔值而重新拼一份完整的 ModelParams（容易漏字段）。
+pub fn set_chat_override(
+    app: &AppHandle,
+    model: &str,
+    value: Option<bool>,
+) -> Result<(), String> {
+    let mut params = get(app, model);
+    params.chat_override = value;
+    set(app, model, &params)?;
+    Ok(())
+}
+
 /// 写入单个模型的参数。上下文会被夹到合法区间，避免写进 0 或荒谬值。
 pub fn set(app: &AppHandle, model: &str, params: &ModelParams) -> Result<ModelParams, String> {
     let normalized = ModelParams {
         ctx: params.ctx.clamp(MIN_CTX, MAX_CTX),
         thinking: params.thinking,
+        chat_override: params.chat_override,
     };
 
     let mut map = all(app);
@@ -248,9 +272,50 @@ mod tests {
         assert_eq!(Thinking::Off.output_budget(1024), 512);
     }
 
+    /// 能力覆盖的三态语义：未设置跟随自动识别，设了就以用户为准。
+    ///
+    /// 这是"识别错了能改回来"的兜底，语义必须明确：
+    /// `None` 不等于 `Some(false)`。
     #[test]
-    fn enabled_only_for_thinking_tiers() {
-        assert!(!Thinking::Off.enabled());
+    fn chat_override_is_three_state() {
+        let auto_true = true;
+        let auto_false = false;
+
+        // 未设置：跟随自动
+        let p = ModelParams::default();
+        assert_eq!(p.chat_override, None);
+        assert_eq!(p.chat_override.unwrap_or(auto_true), auto_true);
+        assert_eq!(p.chat_override.unwrap_or(auto_false), auto_false);
+
+        // 手动设为可用：即使自动判为不可用，也要能用
+        let forced_on = ModelParams {
+            chat_override: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(forced_on.chat_override.unwrap_or(auto_false), true);
+
+        // 手动设为不可用：即使自动判为可用，也要挡掉
+        let forced_off = ModelParams {
+            chat_override: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(forced_off.chat_override.unwrap_or(auto_true), false);
+    }
+
+    /// 覆盖值不该影响上下文夹取这类既有行为。
+    #[test]
+    fn chat_override_does_not_disturb_ctx_clamping() {
+        let p = ModelParams {
+            ctx: 10, // 低于 MIN_CTX，应被夹到下限
+            thinking: Thinking::Off,
+            chat_override: Some(true),
+        };
+        assert_eq!(p.ctx.clamp(MIN_CTX, MAX_CTX), MIN_CTX);
+        assert_eq!(p.chat_override, Some(true));
+    }
+
+    #[test]
+    fn enabled_only_for_thinking_tiers() {        assert!(!Thinking::Off.enabled());
         assert!(!Thinking::Default.enabled());
         for mode in [Thinking::Low, Thinking::Medium, Thinking::High, Thinking::Max] {
             assert!(mode.enabled(), "{mode:?} 应被视为开启思考");
@@ -259,9 +324,15 @@ mod tests {
 
     #[test]
     fn ctx_is_clamped_to_sane_range() {
-        let low = ModelParams { ctx: 1, thinking: Thinking::Off };
+        let low = ModelParams {
+            ctx: 1,
+            ..Default::default()
+        };
         assert_eq!(low.ctx.clamp(MIN_CTX, MAX_CTX), MIN_CTX);
-        let high = ModelParams { ctx: u64::MAX, thinking: Thinking::Off };
+        let high = ModelParams {
+            ctx: u64::MAX,
+            ..Default::default()
+        };
         assert_eq!(high.ctx.clamp(MIN_CTX, MAX_CTX), MAX_CTX);
     }
 
