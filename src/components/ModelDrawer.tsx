@@ -483,6 +483,49 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
                     </span>
                   </div>
 
+                  {/* 家族与能力：用户放一堆模型时，这里能一眼看出谁能干什么。
+                      不可用模型（如 Seed-X）直接说明原因，别让他自己试出来。 */}
+                  <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                    {m.family && m.family !== "通用" && (
+                      <span
+                        className="rounded px-1.5 py-0.5 text-[10px]"
+                        style={{
+                          background:
+                            "color-mix(in srgb, var(--brand) 12%, transparent)",
+                          color: "var(--brand-text)",
+                        }}
+                        title={`识别为 ${m.family} 家族，翻译时会用该家族的推荐调用方式`}
+                      >
+                        {m.family}
+                      </span>
+                    )}
+                    {!m.unsupportedReason && (
+                      <span
+                        className="rounded px-1.5 py-0.5 text-[10px]"
+                        style={{
+                          border: "1px solid var(--border)",
+                          color: "var(--text-muted)",
+                        }}
+                        title={
+                          m.chatCapable
+                            ? "翻译页、批量页、对话页都可以用"
+                            : "只用于翻译与批量；对话页不显示（它会把提问本身翻译掉）"
+                        }
+                      >
+                        {m.chatCapable ? "翻译 + 对话" : "仅翻译"}
+                      </span>
+                    )}
+                  </div>
+
+                  {m.unsupportedReason && (
+                    <p
+                      className="m-0 mt-1 text-[11px] leading-relaxed"
+                      style={{ color: "var(--danger)" }}
+                    >
+                      {m.unsupportedReason}
+                    </p>
+                  )}
+
                   <div className="mt-1 flex items-center gap-2">
                     <span className="text-[11px]" style={{ color: "var(--text-muted)" }}>
                       {m.sizeMb} MB
