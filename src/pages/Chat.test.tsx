@@ -102,6 +102,61 @@ async function sendText(text: string) {
 }
 
 describe("Chat", () => {
+  /**
+   * 快捷指令曾经完全无效：它被当成独立的 system 消息插在对话中间，
+   * 而多数本地模型的对话模板只认开头那条 system，中途的会被忽略，
+   * 于是"点按钮"和"不点"输出一模一样。
+   *
+   * 现在改成把指令并进用户消息。这条用例锁住"发给模型的文本里确实带上了指令"。
+   */
+  it("快捷指令会并进用户消息发给模型", async () => {
+    chatMock.mockResolvedValue("润色后的结果");
+
+    await renderReady();
+    const user = userEvent.setup();
+    // 先把文字打进输入框，再点指令，最后发送
+    await user.type(screen.getByPlaceholderText("输入消息…"), "这段文字需要处理");
+    await user.click(screen.getByText("润色"));
+    expect(screen.getByText("下一句生效")).toBeInTheDocument();
+
+    await user.click(screen.getByLabelText("发送"));
+    await screen.findByText("润色后的结果");
+
+    const calls = chatMock.mock.calls;
+    const sent = calls[calls.length - 1]?.[0] as
+      | { messages: { role: string; content: string }[] }
+      | undefined;
+    const last = sent?.messages[sent.messages.length - 1];
+    // 指令与原文在同一条用户消息里
+    expect(last?.role).toBe("user");
+    expect(last?.content).toContain("润色");
+    expect(last?.content).toContain("这段文字需要处理");
+    // 不该再出现"中途插入的 system"
+    expect(sent?.messages.some((m) => m.role === "system")).toBe(false);
+  });
+
+  /** 不用快捷指令时，消息原样发出，不该被拼上任何提示词。 */
+  it("不选快捷指令就不拼接任何指令", async () => {
+    chatMock.mockResolvedValue("普通回答");
+
+    await renderReady();
+    await sendText("普通提问");
+    await screen.findByText("普通回答");
+
+    const calls = chatMock.mock.calls;
+    const sent = calls[calls.length - 1]?.[0] as
+      | { messages: { role: string; content: string }[] }
+      | undefined;
+    const last = sent?.messages[sent.messages.length - 1];
+    expect(last?.content).toBe("普通提问");
+  });
+
+  /** 「对照原文」已移除：对话里没有原文，这个功能只会让模型凭空编造。 */
+  it("不再提供「对照原文」", async () => {
+    await renderReady();
+    expect(screen.queryByText("对照原文")).not.toBeInTheDocument();
+  });
+
   it("流式回复按消息 id 追加，并持久化带 id/status 的会话", async () => {
     chatMock.mockImplementation(async () => {
       await act(async () => {
