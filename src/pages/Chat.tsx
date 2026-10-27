@@ -27,11 +27,16 @@ import {
   type UsagePayload,
 } from "../lib/ipc";
 import {
+  activeVersion,
+  appendVersion,
   canRegenerateAt,
   ensureMessageIds,
   indexOfMessage,
   makeMessage,
+  neighborVersion,
   normalizeHistory,
+  switchVersion,
+  versionCount,
 } from "../lib/chat";
 import { useTauriEvent } from "../lib/useTauriEvent";
 
@@ -256,10 +261,15 @@ export function Chat({
    *
    * 两者只在带了快捷指令时不同：指令作为系统消息只作用于这一轮，不写进会话历史。
    */
+  /**
+   * `branchFrom` 指向"正在被重新生成的那条旧回复"：它的内容要作为旧版本保留下来。
+   * 普通发送 / 编辑重发 / 重试都传 null——那些是产生新消息，不是给已有回复加版本。
+   */
   const sendWith = async (
     display: ChatMessage[],
     outbound: ChatMessage[],
     replyId: string,
+    branchFrom: ChatMessage | null = null,
   ) => {
     if (!model) {
       setError("请先选择模型");
@@ -298,15 +308,22 @@ export function Chat({
       // 思维链随这条回复一起存下来，之后还能点开回看
       const think = reasoningRef.current.trim();
       const finalMessages: ChatMessage[] = display.map(
-        (m): ChatMessage =>
-          m.id === replyId
-            ? {
-                ...m,
-                content: full,
-                status: "ready",
-                ...(think ? { reasoning: think } : {}),
-              }
-            : m,
+        (m): ChatMessage => {
+          if (m.id !== replyId) return m;
+
+          // 重新生成：把"旧回复"作为上一版留下，新内容作为当前版。
+          // 这样用户可以来回切换对比，而不是生成一次就永久丢掉上一次的结果。
+          if (branchFrom) {
+            return appendVersion(branchFrom, full, think || undefined);
+          }
+
+          return {
+            ...m,
+            content: full,
+            status: "ready",
+            ...(think ? { reasoning: think } : {}),
+          };
+        },
       );
       setMessages(finalMessages);
       await persist(finalMessages, model, sessionId);
@@ -360,8 +377,12 @@ export function Chat({
   };
 
   /**
-   * 从某条助手回复重新生成：保留它之前的全部上下文，
-   * 丢掉这条及之后的所有消息，相当于"把对话回滚到这里再问一次"。
+   * 从某条助手回复重新生成。
+   *
+   * 两个要点：
+   * 1. 保留它之前的全部上下文，这条及之后的消息不再发给模型（"回滚到这里再问"）。
+   * 2. **沿用原消息的 id**，新结果作为它的新版本追加——这样同一条消息能
+   *    攒下多版译文，来回切换对比。丢掉旧版会让"试试另一种译法"变成不可逆操作。
    */
   const regenerateAt = async (id: string) => {
     if (busy) return;
@@ -369,14 +390,21 @@ export function Chat({
     const before = at > 0 ? messagesRef.current.slice(0, at) : [];
     if (before.length === 0 || before[before.length - 1].role !== "user") return;
 
-    const reply = makeMessage("assistant", "", { status: "pending" });
+    const previous = messagesRef.current[at];
+    // 沿用 id（这样版本记在同一处），内容先清空当作占位
+    const reply: ChatMessage = {
+      id: previous.id,
+      role: "assistant",
+      content: "",
+      status: "pending",
+    };
+
     setMessages([...before, reply]);
-    await sendWith([...before, reply], before, reply.id);
+    await sendWith([...before, reply], before, reply.id, previous);
   };
 
   /** 删掉单条消息（用户提问或助手回复都可以），其余上下文保持不变。 */
-  const deleteAt = async (id: string) => {
-    if (busy) return;
+  const deleteAt = async (id: string) => {    if (busy) return;
     const next = messagesRef.current.filter((m) => m.id !== id);
     setMessages(next);
     // 全删光了就把会话文件一起删掉，别在列表里留一条空壳
@@ -390,6 +418,19 @@ export function Chat({
       }
       return;
     }
+    await persist(next, model, sessionId);
+  };
+
+  /** 在同一条回复的不同版本之间切换（只改显示，不重新请求模型）。 */
+  const changeVersion = async (id: string, delta: -1 | 1) => {
+    if (busy) return;
+    const next = messagesRef.current.map((m) => {
+      if (m.id !== id) return m;
+      const target = neighborVersion(m, delta);
+      return target === null ? m : switchVersion(m, target);
+    });
+    setMessages(next);
+    // 版本也是会话内容的一部分，切完顺手存一次
     await persist(next, model, sessionId);
   };
 
@@ -650,6 +691,35 @@ export function Chat({
                       </>
                     ) : (
                       <>
+                        {/* 版本切换：只有重新生成过（多版）才出现，平时不占位置 */}
+                        {versionCount(m) > 1 && (
+                          <span
+                            className="flex items-center gap-1 tabular-nums"
+                            style={{ color: "var(--text-muted)" }}
+                          >
+                            <button
+                              className="btn rounded px-0.5 disabled:opacity-30"
+                              disabled={neighborVersion(m, -1) === null}
+                              onClick={() => changeVersion(m.id, -1)}
+                              title="上一版"
+                              aria-label="上一版"
+                            >
+                              ‹
+                            </button>
+                            <span title="这条回复有多个版本，可来回切换对比">
+                              {activeVersion(m) + 1}/{versionCount(m)}
+                            </span>
+                            <button
+                              className="btn rounded px-0.5 disabled:opacity-30"
+                              disabled={neighborVersion(m, 1) === null}
+                              onClick={() => changeVersion(m.id, 1)}
+                              title="下一版"
+                              aria-label="下一版"
+                            >
+                              ›
+                            </button>
+                          </span>
+                        )}
                         {m.content && (
                           <MsgAction onClick={() => copyText(m.content)} title="复制这条回复">
                             复制

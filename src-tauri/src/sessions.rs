@@ -18,6 +18,21 @@ pub struct SessionMessage {
     /// ready / pending / error / stopped。后端只做透明存储，语义由前端决定。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    /// 同一条回复的多个版本（重新生成时追加）。没重新生成过的消息没有这个字段。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub versions: Option<Vec<MessageVersion>>,
+    /// 当前显示第几版。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<u32>,
+}
+
+/// 一条回复的一个版本。后端不解释内容，只负责原样存取。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageVersion {
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -147,6 +162,8 @@ mod tests {
                     content: "问".into(),
                     reasoning: None,
                     status: Some("ready".into()),
+                    versions: None,
+                    active: None,
                 },
                 SessionMessage {
                     id: Some("m2".into()),
@@ -154,6 +171,8 @@ mod tests {
                     content: "答".into(),
                     reasoning: Some("想了一下".into()),
                     status: Some("stopped".into()),
+                    versions: None,
+                    active: None,
                 },
             ],
         };
@@ -170,5 +189,60 @@ mod tests {
         assert_eq!(back.messages[1].status.as_deref(), Some("stopped"));
         // 没有思维链的消息不该写出这个字段，避免会话文件臃肿
         assert!(!json.contains("\"reasoning\":null"));
+    }
+
+    /// 多个版本要能原样存取；旧会话（没有这个字段）也要能读。
+    #[test]
+    fn versions_round_trip_and_old_sessions_still_load() {
+        let session = Session {
+            id: "abc".into(),
+            title: "有分支".into(),
+            model: "m.gguf".into(),
+            updated_at: 1,
+            messages: vec![SessionMessage {
+                id: Some("m1".into()),
+                role: "assistant".into(),
+                content: "第二版".into(),
+                reasoning: Some("想二".into()),
+                status: Some("ready".into()),
+                versions: Some(vec![
+                    MessageVersion {
+                        content: "第一版".into(),
+                        reasoning: None,
+                    },
+                    MessageVersion {
+                        content: "第二版".into(),
+                        reasoning: Some("想二".into()),
+                    },
+                ]),
+                active: Some(1),
+            }],
+        };
+
+        let json = serde_json::to_string(&session).unwrap();
+        assert!(json.contains("\"versions\""));
+        assert!(json.contains("\"active\":1"));
+
+        let back: Session = serde_json::from_str(&json).unwrap();
+        let versions = back.messages[0].versions.as_ref().unwrap();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].content, "第一版");
+        assert_eq!(versions[1].reasoning.as_deref(), Some("想二"));
+
+        // 旧会话没有 versions / active，读入为 None（前端按单版处理）
+        let old: Session = serde_json::from_str(
+            r#"{
+                "id": "x", "title": "旧", "model": "m", "updatedAt": 1,
+                "messages": [{ "role": "assistant", "content": "只有一版" }]
+            }"#,
+        )
+        .expect("旧格式应能解析");
+        assert_eq!(old.messages[0].versions, None);
+        assert_eq!(old.messages[0].active, None);
+
+        // 没有版本的消息不该写出这两个字段
+        let plain = serde_json::to_string(&old).unwrap();
+        assert!(!plain.contains("\"versions\":null"));
+        assert!(!plain.contains("\"active\":null"));
     }
 }

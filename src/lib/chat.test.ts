@@ -1,12 +1,17 @@
 import { describe, expect, it } from "vitest";
 import type { ChatMessage } from "./ipc";
 import {
+  activeVersion,
+  appendVersion,
   canRegenerateAt,
   ensureMessageIds,
   indexOfMessage,
   makeMessage,
+  neighborVersion,
   newMessageId,
   normalizeHistory,
+  switchVersion,
+  versionCount,
 } from "./chat";
 
 describe("newMessageId", () => {
@@ -104,5 +109,65 @@ describe("indexOfMessage / canRegenerateAt", () => {
       makeMessage("assistant", "再答"),
     ];
     expect(canRegenerateAt(merged, merged[2].id)).toBe(false);
+  });
+});
+
+describe("消息版本分支", () => {
+  it("普通消息视为只有 1 版", () => {
+    const m = makeMessage("assistant", "初版");
+    expect(versionCount(m)).toBe(1);
+    expect(activeVersion(m)).toBe(0);
+    expect(neighborVersion(m, -1)).toBeNull();
+    expect(neighborVersion(m, 1)).toBeNull();
+  });
+
+  /** 核心行为：重新生成是"新增一版"，不是覆盖。 */
+  it("追加版本时保留旧内容，并自动切到新版", () => {
+    const first = makeMessage("assistant", "第一版译文");
+    const second = appendVersion(first, "第二版译文");
+
+    expect(versionCount(second)).toBe(2);
+    expect(activeVersion(second)).toBe(1);
+    expect(second.content).toBe("第二版译文");
+    // 旧版本还在，能切回去对比
+    expect(second.versions?.[0].content).toBe("第一版译文");
+    expect(second.versions?.[1].content).toBe("第二版译文");
+  });
+
+  it("切换版本会同步 content 与 reasoning", () => {
+    let m = makeMessage("assistant", "甲", { reasoning: "想甲" });
+    m = appendVersion(m, "乙", "想乙");
+    expect(m.content).toBe("乙");
+
+    const back = switchVersion(m, 0);
+    expect(back.content).toBe("甲");
+    expect(back.reasoning).toBe("想甲");
+    expect(activeVersion(back)).toBe(0);
+  });
+
+  it("切换越界时原样返回，不会把消息弄坏", () => {
+    const m = appendVersion(makeMessage("assistant", "甲"), "乙");
+    expect(switchVersion(m, 5)).toBe(m);
+    expect(switchVersion(m, -1)).toBe(m);
+  });
+
+  it("相邻版本下标越界时返回 null（用于禁用按钮）", () => {
+    const m = appendVersion(makeMessage("assistant", "甲"), "乙");
+    expect(neighborVersion(m, 1)).toBeNull(); // 已在最后一版
+    expect(neighborVersion(m, -1)).toBe(0);
+
+    const atFirst = switchVersion(m, 0);
+    expect(neighborVersion(atFirst, -1)).toBeNull();
+    expect(neighborVersion(atFirst, 1)).toBe(1);
+  });
+
+  it("多个版本可以连续追加", () => {
+    let m = makeMessage("assistant", "v0");
+    m = appendVersion(m, "v1");
+    m = appendVersion(m, "v2");
+
+    expect(versionCount(m)).toBe(3);
+    expect(activeVersion(m)).toBe(2);
+    expect(m.versions?.map((v) => v.content)).toEqual(["v0", "v1", "v2"]);
   });
 });

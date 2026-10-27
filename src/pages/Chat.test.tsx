@@ -192,6 +192,43 @@ describe("Chat", () => {
   });
 
   /**
+   * 重新生成不能把上一版丢掉——用户要对比"更正式"和"更简洁"两种译法，
+   * 覆盖式重新生成会让对比变成不可能。
+   */
+  it("重新生成保留旧版，可以切换回去对比", async () => {
+    chatMock.mockResolvedValue("第一版译文");
+
+    await renderReady();
+    await sendText("翻译这段");
+    expect(await screen.findByText("第一版译文")).toBeInTheDocument();
+
+    // 此时只有一版，不该出现版本计数器
+    expect(screen.queryByText("1/1")).not.toBeInTheDocument();
+
+    chatMock.mockResolvedValue("第二版译文");
+    const user = userEvent.setup();
+    await user.click(screen.getByText("重新生成"));
+
+    expect(await screen.findByText("第二版译文")).toBeInTheDocument();
+    // 出现了 2/2 计数器
+    expect(await screen.findByText("2/2")).toBeInTheDocument();
+
+    // 切回上一版：旧译文回来了，且没有重新请求模型
+    const asked = chatMock.mock.calls.length;
+    await user.click(screen.getByLabelText("上一版"));
+
+    expect(await screen.findByText("第一版译文")).toBeInTheDocument();
+    expect(screen.queryByText("第二版译文")).not.toBeInTheDocument();
+    expect(await screen.findByText("1/2")).toBeInTheDocument();
+    expect(chatMock.mock.calls.length).toBe(asked);
+
+    // 再切回新版
+    await user.click(screen.getByLabelText("下一版"));
+    expect(await screen.findByText("第二版译文")).toBeInTheDocument();
+    expect(await screen.findByText("2/2")).toBeInTheDocument();
+  });
+
+  /**
    * 思维链曾被重复显示：StrictMode 会「挂载→卸载→再挂载」，
    * 而 listen() 是异步的，cleanup 拿不到注销函数，于是留下两个监听器，
    * 每个 token 被累加两次（`Thinking` 变成 `ThinkingThinking`）。

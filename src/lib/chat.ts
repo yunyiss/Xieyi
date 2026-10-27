@@ -1,4 +1,4 @@
-import type { ChatMessage } from "./ipc";
+import type { ChatMessage, MessageVersion } from "./ipc";
 
 /**
  * 消息状态。对齐 jan `MessageStatus` 的四态：
@@ -74,4 +74,81 @@ export function canRegenerateAt(messages: ChatMessage[], id: string): boolean {
   const at = indexOfMessage(messages, id);
   if (at <= 0) return false;
   return messages[at].role === "assistant" && messages[at - 1]?.role === "user";
+}
+
+/**
+ * 这条消息有几个版本。没有 `versions` 时视为 1 版。
+ *
+ * 旧会话文件、以及从未重新生成过的消息，都没有这个字段——
+ * 所以所有版本逻辑都要能接受"只有 content"的普通消息。
+ */
+export function versionCount(message: ChatMessage): number {
+  return message.versions?.length ?? 1;
+}
+
+/** 当前显示第几版（从 0 开始），越界时收敛到 0。 */
+export function activeVersion(message: ChatMessage): number {
+  const count = versionCount(message);
+  const at = message.active ?? 0;
+  return at >= 0 && at < count ? at : 0;
+}
+
+/**
+ * 把一次新生成的结果写成"这条消息的新版本"。
+ *
+ * 语义是**分支而非覆盖**：旧版本留在 `versions` 里，随时可以切回去对比。
+ * 第一次重新生成时，现有 `content` 会被收进 `versions[0]`。
+ */
+export function appendVersion(
+  message: ChatMessage,
+  content: string,
+  reasoning?: string,
+): ChatMessage {
+  const existing: MessageVersion[] =
+    message.versions ??
+    // 首次产生分支：把当前内容作为第 0 版
+    [{ content: message.content, ...(message.reasoning ? { reasoning: message.reasoning } : {}) }];
+
+  const versions: MessageVersion[] = [
+    ...existing,
+    { content, ...(reasoning ? { reasoning } : {}) },
+  ];
+
+  return {
+    ...message,
+    content,
+    reasoning,
+    status: "ready",
+    versions,
+    active: versions.length - 1,
+  };
+}
+
+/**
+ * 切换到指定版本。返回新消息对象（不改原对象）。
+ *
+ * 同时把 `content` / `reasoning` 同步成该版本，这样界面渲染与
+ * 发请求时用的都是当前版本的文本。
+ */
+export function switchVersion(message: ChatMessage, index: number): ChatMessage {
+  const versions = message.versions ?? [];
+  if (index < 0 || index >= versions.length) return message;
+
+  const version = versions[index];
+  return {
+    ...message,
+    content: version.content,
+    reasoning: version.reasoning,
+    active: index,
+  };
+}
+
+/** 取当前版本之前/之后的版本下标；越界返回 null（用于禁用按钮）。 */
+export function neighborVersion(
+  message: ChatMessage,
+  delta: -1 | 1,
+): number | null {
+  const count = versionCount(message);
+  const next = activeVersion(message) + delta;
+  return next >= 0 && next < count ? next : null;
 }
