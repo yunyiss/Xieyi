@@ -95,7 +95,13 @@ function App() {
           className="mr-4 text-[14px] font-semibold tracking-tight"
           style={{ letterSpacing: "-0.01em" }}
         >
-          LocalTranslate
+          Xieyi
+          <span
+            className="ml-1.5 text-[11px] font-normal tracking-normal"
+            style={{ color: "var(--text-muted)" }}
+          >
+            写意
+          </span>
         </span>
 
         {tabs.map((t) => {

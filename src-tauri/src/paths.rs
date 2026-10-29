@@ -59,7 +59,7 @@ pub fn models_dir(app: &AppHandle) -> Result<PathBuf, String> {
 
     app.path()
         .document_dir()
-        .map(|d| d.join("LocalTranslate").join("models"))
+        .map(|d| d.join("Xieyi").join("models"))
         .map_err(|e| e.to_string())
 }
 
