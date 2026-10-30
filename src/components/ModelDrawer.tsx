@@ -311,19 +311,31 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
     }
   };
 
+  /**
+   * 换模型目录。
+   *
+   * 原来用 `window.prompt` 手打路径：Tauri 只 polyfill 了 alert/confirm，
+   * prompt 是 WebView2 原生实现，既不能浏览目录也没法校验，打字极易出错。
+   */
   const changeDir = async () => {
-    const dir = window.prompt(
-      "输入模型目录（存放 .gguf 文件）：",
-      settings?.modelsDir ?? "",
-    );
-    if (!dir) return;
+    setError("");
     try {
-      await setModelsDir(dir);
+      const picked = await openDialog({
+        multiple: false,
+        directory: true,
+        title: "选择存放 .gguf 的模型目录",
+        defaultPath: settings?.modelsDir || undefined,
+      });
+      if (typeof picked !== "string") return;
+      setBusy("dir");
+      await setModelsDir(picked);
       await restartService();
       await refresh();
       onChanged();
     } catch (e) {
       setError(String(e));
+    } finally {
+      setBusy("");
     }
   };
 

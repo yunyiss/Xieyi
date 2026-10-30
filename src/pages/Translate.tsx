@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { UnlistenFn } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { LoadIndicator, toLoadState, type LoadState } from "../components/LoadIndicator";
 import { ModelStateBadge, stateLabel } from "../components/ModelStateBadge";
 import { RunButton } from "../components/RunButton";
@@ -7,6 +9,7 @@ import { Select } from "../components/Select";
 import { TRANSLATE_STYLES } from "../lib/translateStyles";
 import {
   abort,
+  discoverRuntimes,
   getRuntimeStatus,
   installRuntime,
   listRouterModels,
@@ -17,11 +20,13 @@ import {
   onToken,
   onTranslateProgress,
   openModelsDir,
+  restartService,
   setManualRuntime,
   setModelsDir,
   startService,
   stopService,
   translate,
+  type DiscoveredRuntime,
   type QualityReport,
   type RouterModel,
   type RuntimeProgress,
@@ -127,6 +132,12 @@ export function Translate({
   const [model, setModel] = useState("");
   const [progress, setProgress] = useState<RuntimeProgress | null>(null);
   const [engineError, setEngineError] = useState("");
+  /** 首启时扫到的本机引擎：有就列出来点一下即可，不必去翻文件对话框。 */
+  const [discovered, setDiscovered] = useState<DiscoveredRuntime[]>([]);
+  /** 自动扫描只跑一次，避免每次 refresh 都扫盘。 */
+  const scannedRef = useRef(false);
+  /** 正在切换引擎，按钮防重入。 */
+  const [engineBusy, setEngineBusy] = useState(false);
   const [load, setLoad] = useState<LoadState | null>(null);
   const [segmentProgress, setSegmentProgress] = useState({
     done: 0,
@@ -200,20 +211,137 @@ export function Translate({
     }
   };
 
-  const handleManual = async () => {
-    const path = window.prompt(
-      "输入已有的 llama-server 可执行文件完整路径：",
-      "D:\\llama-b11714-bin-win-cuda-13.4-x64\\llama-server.exe",
-    );
-    if (!path) return;
+  const handleManual = async (path: string) => {
+    setEngineError("");
+    setEngineBusy(true);
     try {
       setRuntime(await setManualRuntime(path));
+      await restartService();
+      await bootstrap();
+      onRuntimeChanged?.();
+    } catch (e) {
+      setEngineError(String(e));
+    } finally {
+      setEngineBusy(false);
+    }
+  };
+
+  /**
+   * 用系统文件对话框挑一个 llama-server。
+   *
+   * 原来这里是 `window.prompt` 手打路径。Tauri 只 polyfill 了 alert/confirm，
+   * prompt 走 WebView2 原生实现：不能预设目录、不能过滤扩展名、不能校验，
+   * 而且默认值只能是写死的一串路径——对别人机器根本不成立。
+   */
+  const pickEngine = async () => {
+    setEngineError("");
+    try {
+      const picked = await openDialog({
+        multiple: false,
+        directory: false,
+        title: "选择 llama-server 可执行文件",
+        filters: [{ name: "可执行文件", extensions: ["exe"] }],
+      });
+      if (typeof picked !== "string") return;
+      await handleManual(picked);
+    } catch (e) {
+      setEngineError(String(e));
+    }
+  };
+
+  /** 选一个已有的模型目录（同样替掉原来的手打路径）。 */
+  const pickModelsDir = async () => {
+    setEngineError("");
+    try {
+      const picked = await openDialog({
+        multiple: false,
+        directory: true,
+        title: "选择存放 .gguf 的模型目录",
+      });
+      if (typeof picked !== "string") return;
+      await setModelsDir(picked);
+      await stopService();
       await bootstrap();
       onRuntimeChanged?.();
     } catch (e) {
       setEngineError(String(e));
     }
   };
+
+  /**
+   * 首启自动扫一遍磁盘找现成引擎。
+   *
+   * 多数人机器上本就有一份 llama.cpp（自己下的 CUDA 版之类），
+   * 没必要让人先去设置里点「扫描」——扫到了直接接上才是开箱即用。
+   * 只有唯一候选才自动采用；有多个则列出来让用户自己挑。
+   */
+  const autoAdoptEngine = useCallback(async () => {
+    if (scannedRef.current) return;
+    scannedRef.current = true;
+    try {
+      const found = await discoverRuntimes();
+      setDiscovered(found);
+      if (found.length === 1) await handleManual(found[0].path);
+    } catch {
+      // 扫描失败不拦人，手动入口还在
+    }
+  }, []);
+
+  // 只在「还没引擎」时自动扫一次；装好之后就没必要再扫盘了
+  useEffect(() => {
+    if (runtime && !runtime.installed) void autoAdoptEngine();
+  }, [runtime, autoAdoptEngine]);
+
+  /**
+   * 把 .gguf 直接拖进窗口：把它所在目录设为模型目录。
+   *
+   * 不做拷贝——模型动辄几个 GB，复制一份既慢又白占磁盘。
+   * 拖进来的若是目录，就用目录本身。
+   */
+  const adoptDroppedPath = useCallback(async (paths: string[]) => {
+    const hit = paths.find((p) => p.toLowerCase().endsWith(".gguf")) ?? paths[0];
+    if (!hit) return;
+    const dir = /\.gguf$/i.test(hit)
+      ? hit.replace(/[\\/][^\\/]+$/, "")
+      : hit;
+    if (!dir) return;
+
+    setEngineError("");
+    try {
+      await setModelsDir(dir);
+      await restartService();
+      await bootstrap();
+      onRuntimeChanged?.();
+    } catch (e) {
+      setEngineError(String(e));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 拖放监听：非 Tauri 环境（纯浏览器预览）没有这个 API，兜一层
+  useEffect(() => {
+    let un: UnlistenFn | null = null;
+    let dead = false;
+    try {
+      getCurrentWebview()
+        .onDragDropEvent((event) => {
+          if (event.payload.type === "drop") {
+            void adoptDroppedPath(event.payload.paths);
+          }
+        })
+        .then((fn) => {
+          // 卸载早于订阅兑现时必须补一次注销，否则监听器会越积越多
+          if (dead) fn();
+          else un = fn;
+        });
+    } catch {
+      // 忽略：非 Tauri 环境没有拖放能力
+    }
+    return () => {
+      dead = true;
+      un?.();
+    };
+  }, [adoptDroppedPath]);
 
   const handleRun = async () => {
     if (!model) {
@@ -256,7 +384,9 @@ export function Translate({
     }
   };
 
-  const ready = runtime?.installed && models.length > 0;
+  /** 模型列表非空即算这一步完成（引擎没装时不算，因为拉不到列表）。 */
+  const hasModels = models.length > 0;
+  const ready = runtime?.installed && hasModels;
 
   const currentModelState =
     models.find((m) => m.id === model)?.state ?? "unloaded";
@@ -279,125 +409,195 @@ export function Translate({
 
   return (
     <div className="flex h-full flex-col gap-3 p-4">
-      {/* 运行时 / 引擎状态 */}
-      {!runtime?.installed && (
+      {/*
+        首启清单：把「装引擎」和「放模型」两个前置条件放在一张卡上。
+        原来这是两块独立卡片，装完引擎才浮现第二块，用户得先后撞两次墙；
+        合并后能一眼看出还差几步。
+      */}
+      {(!runtime?.installed || models.length === 0) && (
         <section className="card p-3.5">
-          <div className="mb-2 flex items-center gap-2 text-[13px] font-medium">
-            <span>首次使用：安装推理运行时</span>
+          <div className="mb-2 flex items-center gap-2">
+            <span className="text-[13px] font-medium">开始使用</span>
             <span
-              className="rounded-full px-2 py-0.5 text-[11px]"
+              className="rounded-full px-2 py-0.5 text-[11px] tabular-nums"
               style={{ background: "var(--brand-soft)", color: "var(--brand-text)" }}
             >
-              llama.cpp b11714
+              {ready ? 2 : runtime?.installed || models.length > 0 ? 1 : 0} / 2
+            </span>
+            <span className="text-[11px]" style={{ color: "var(--text-muted)" }}>
+              装好引擎、放进模型就能翻译
             </span>
           </div>
 
-          {progress ? (
-            <div>
-              <div
-                className="mb-1 flex justify-between text-[12px]"
-                style={{ color: "var(--text-muted)" }}
-              >
-                <span>{stageLabel(progress.stage)}</span>
-                <span>
-                  {progress.stage === "downloading"
-                    ? `${progress.percent.toFixed(1)}% · ${(
-                        progress.downloaded /
-                        1048576
-                      ).toFixed(1)} / ${(progress.total / 1048576).toFixed(
-                        1,
-                      )} MB`
-                    : ""}
-                </span>
-              </div>
-              <div
-                className="h-1.5 overflow-hidden rounded-full"
-                style={{ background: "var(--surface-muted)" }}
-              >
+          {/* ① 推理引擎 */}
+          <div className="flex items-start gap-2.5 py-1.5">
+            <span
+              className="mt-0.5 w-3.5 shrink-0 text-center text-[12px]"
+              style={{
+                color: runtime?.installed ? "var(--brand-text)" : "var(--text-muted)",
+              }}
+            >
+              {runtime?.installed ? "✓" : "○"}
+            </span>
+            <div className="min-w-0 flex-1">
+              <div className="text-[12px]">推理引擎</div>
+
+              {progress ? (
+                <div className="mt-1">
+                  <div
+                    className="mb-1 flex justify-between text-[11px]"
+                    style={{ color: "var(--text-muted)" }}
+                  >
+                    <span>{stageLabel(progress.stage)}</span>
+                    <span className="tabular-nums">
+                      {progress.stage === "downloading"
+                        ? `${progress.percent.toFixed(1)}% · ${(
+                            progress.downloaded / 1048576
+                          ).toFixed(1)} / ${(progress.total / 1048576).toFixed(
+                            1,
+                          )} MB`
+                        : ""}
+                    </span>
+                  </div>
+                  <div
+                    className="h-1.5 overflow-hidden rounded-full"
+                    style={{ background: "var(--surface-muted)" }}
+                  >
+                    <div
+                      className="h-full rounded-full transition-[width] duration-200"
+                      style={{
+                        width: `${progress.percent}%`,
+                        background: "var(--brand)",
+                      }}
+                    />
+                  </div>
+                </div>
+              ) : runtime?.installed ? (
                 <div
-                  className="h-full rounded-full transition-[width] duration-200"
-                  style={{
-                    width: `${progress.percent}%`,
-                    background: "var(--brand)",
-                  }}
-                />
-              </div>
+                  className="mt-0.5 truncate text-[11px]"
+                  style={{ color: "var(--text-muted)" }}
+                  title={runtime.serverPath ?? ""}
+                >
+                  {runtime.version} · {runtime.backend}
+                </div>
+              ) : (
+                <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                  <button
+                    className="btn h-7 rounded-md px-2.5 text-[11px] font-medium text-white"
+                    style={{ background: "var(--brand)" }}
+                    onClick={() => handleInstall("vulkan")}
+                    title="下载并解压到应用私有目录，约 31 MB"
+                  >
+                    下载运行时（约 31 MB）
+                  </button>
+                  <button
+                    className="btn h-7 rounded-md border px-2 text-[11px]"
+                    style={{ ...selectStyle }}
+                    onClick={pickEngine}
+                    disabled={engineBusy}
+                  >
+                    {engineBusy ? "切换中…" : "选择文件…"}
+                  </button>
+
+                  {/*
+                    只写后端会撞车——同一台机器常有两个 CUDA 构建，
+                    光看「cuda」分不清哪个是哪个。把 build 号提出来才选得出。
+                    完整版本行太长，放进 tooltip。
+                  */}
+                  {discovered.map((d) => {
+                    const build = /build\s+(\d+)/i.exec(d.version)?.[1];
+                    return (
+                      <button
+                        key={d.path}
+                        className="btn h-7 max-w-[240px] rounded-md border px-2 text-[11px]"
+                        style={{ ...selectStyle }}
+                        onClick={() => handleManual(d.path)}
+                        disabled={engineBusy}
+                        title={`${d.path}\n${d.version}`}
+                      >
+                        <span className="block truncate">
+                          用本机 {d.backend}
+                          {build ? ` b${build}` : ""}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
             </div>
-          ) : (
-            <div className="flex items-center gap-2">
-              <button
-                className="btn h-9 rounded-lg px-4 text-[13px] font-medium text-white"
-                style={{ background: "var(--brand)" }}
-                onClick={() => handleInstall("vulkan")}
-                title="下载并解压到应用私有目录，约 31 MB"
-              >
-                下载运行时（Vulkan · 约 31 MB）
-              </button>
-              <button
-                className="btn h-9 rounded-lg border px-3 text-[13px]"
-                style={{ ...selectStyle }}
-                onClick={handleManual}
-              >
-                使用已有 llama-server
-              </button>
+          </div>
+
+          {/* ② 模型 */}
+          <div className="flex items-start gap-2.5 py-1.5">
+            <span
+              className="mt-0.5 w-3.5 shrink-0 text-center text-[12px]"
+              style={{
+                color: hasModels ? "var(--brand-text)" : "var(--text-muted)",
+              }}
+            >
+              {hasModels ? "✓" : "○"}
+            </span>
+            <div className="min-w-0 flex-1">
+              <div className="text-[12px]">模型</div>
+
+              {!runtime?.installed ? (
+                <div
+                  className="mt-0.5 text-[11px]"
+                  style={{ color: "var(--text-muted)" }}
+                >
+                  装好引擎后再放模型
+                </div>
+              ) : hasModels ? (
+                <div
+                  className="mt-0.5 truncate text-[11px]"
+                  style={{ color: "var(--text-muted)" }}
+                  title={runtime.modelsDir}
+                >
+                  {models.length} 个可用 · {runtime.modelsDir}
+                </div>
+              ) : (
+                <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                  <button
+                    className="btn h-7 rounded-md border px-2 text-[11px]"
+                    style={{ ...selectStyle }}
+                    onClick={async () => {
+                      await openModelsDir();
+                      setEngineError("");
+                      bootstrap();
+                    }}
+                  >
+                    打开模型目录
+                  </button>
+                  <button
+                    className="btn h-7 rounded-md border px-2 text-[11px]"
+                    style={{ ...selectStyle }}
+                    onClick={pickModelsDir}
+                  >
+                    选择已有目录…
+                  </button>
+                  <span className="text-[11px]" style={{ color: "var(--text-muted)" }}>
+                    也可以直接把 .gguf 拖进窗口
+                  </span>
+                </div>
+              )}
             </div>
-          )}
+          </div>
 
           {!progress && (
             <p
-              className="m-0 mt-2 text-[11px]"
+              className="m-0 mt-1.5 text-[11px]"
               style={{ color: "var(--text-muted)" }}
             >
-              Vulkan 为通用后端，首次推理会有约 3 秒着色器编译；NVIDIA 用户若追求更低延迟，
-              可用「使用已有 llama-server」指向本机 CUDA 版。
+              Vulkan 是通用后端，首次推理约 3 秒着色器编译；已有 CUDA 版的话，
+              用「选择文件…」或上面的本机候选直接指过去，不必重新下载。
             </p>
           )}
 
           {engineError && (
-            <p className="m-0 mt-2 text-[12px]" style={{ color: "var(--danger)" }}>
+            <p className="m-0 mt-1.5 text-[12px]" style={{ color: "var(--danger)" }}>
               {engineError}
             </p>
           )}
-        </section>
-      )}
-
-      {runtime?.installed && models.length === 0 && !engineError && (
-        <section className="card p-3.5 text-[13px]">
-          <span style={{ color: "var(--text-muted)" }}>
-            模型目录为空，把 .gguf 文件放进去后重新扫描。
-          </span>
-          <button
-            className="btn ml-3 h-8 rounded-lg border px-3 text-[12px]"
-            style={selectStyle}
-            onClick={async () => {
-              await openModelsDir();
-              setEngineError("");
-              bootstrap();
-            }}
-          >
-            打开模型目录
-          </button>
-
-          <button
-            className="btn ml-2 h-8 rounded-lg border px-3 text-[12px]"
-            style={selectStyle}
-            onClick={async () => {
-              const dir = window.prompt(
-                "输入已有的模型目录（存放 .gguf 文件）：",
-                "D:\\LLM",
-              );
-              if (!dir) return;
-              try {
-                await setModelsDir(dir);
-                await stopService();
-                await bootstrap();
-              } catch (e) {
-                setEngineError(String(e));
-              }
-            }}
-          >
-            使用已有目录
-          </button>
         </section>
       )}
 
