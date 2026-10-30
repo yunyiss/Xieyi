@@ -67,6 +67,21 @@ struct DownloadProgress {
     percent: f64,
 }
 
+/// 写入运行时清单。
+///
+/// `runtime/` 目录不一定存在（首次装引擎、或清过数据目录），
+/// 而 `fs::write` 不会替你建父目录，缺了就是 `os error 3`。
+/// 下载那条路有 `paths::ensure(&downloads)` 兜着，手动指定这条没有，
+/// 所以必须在这里显式建一次——两条路都要能落下 runtime.json。
+fn write_info(app: &AppHandle, info: &RuntimeInfo) -> Result<(), String> {
+    let path = paths::runtime_json(app)?;
+    if let Some(parent) = path.parent() {
+        paths::ensure(parent)?;
+    }
+    let json = serde_json::to_string_pretty(info).map_err(|e| e.to_string())?;
+    std::fs::write(&path, json).map_err(|e| format!("写入运行时清单失败: {e}"))
+}
+
 pub fn read_info(app: &AppHandle) -> Option<RuntimeInfo> {
     let raw = std::fs::read_to_string(paths::runtime_json(app).ok()?).ok()?;
     serde_json::from_str(&raw).ok()
@@ -333,8 +348,7 @@ pub async fn install_runtime(app: AppHandle, backend: String) -> Result<RuntimeS
         source: "downloaded".into(),
         sha256: actual,
     };
-    let json = serde_json::to_string_pretty(&info).map_err(|e| e.to_string())?;
-    std::fs::write(paths::runtime_json(&app)?, json).map_err(|e| e.to_string())?;
+    write_info(&app, &info)?;
 
     emit(&app, "done", 0, 0);
     Ok(status(&app))
@@ -367,8 +381,7 @@ pub fn set_manual_runtime(app: AppHandle, server_path: String) -> Result<Runtime
         source: "manual".into(),
         sha256: String::new(),
     };
-    let json = serde_json::to_string_pretty(&info).map_err(|e| e.to_string())?;
-    std::fs::write(paths::runtime_json(&app)?, json).map_err(|e| e.to_string())?;
+    write_info(&app, &info)?;
 
     let mut st = status(&app);
     // 把自检结果一起带回去，界面上能直接看到"切换后的引擎到底是哪个版本"
@@ -513,6 +526,32 @@ mod tests {
         let dir = std::env::temp_dir();
         let probe = probe_exe(&dir);
         assert!(!probe.ok, "目录不该通过自检");
+    }
+
+    /// 父目录不存在时 `fs::write` 会报 `os error 3`。
+    ///
+    /// 锁住一个真实踩过的坑：`runtime/` 是懒创建的，首次手动指定引擎时
+    /// 它还不存在。下载那条路有 `ensure(&downloads)` 顺带建了父目录，
+    /// 手动这条没有，于是装引擎直接失败，只报一句没头没尾的
+    /// 「系统找不到指定的路径」。
+    #[test]
+    fn writing_into_a_missing_dir_needs_ensure() {
+        let dir = std::env::temp_dir().join("xieyi-missing-parent-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let nested = dir.join("runtime").join("runtime.json");
+
+        // 先确认现象：不建目录就是 NotFound（Windows 下即 os error 3）
+        let err = std::fs::write(&nested, "{}").unwrap_err();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::NotFound,
+            "应当是「找不到路径」而不是别的错：{err}"
+        );
+
+        // ensure 之后必须能写进去
+        paths::ensure(nested.parent().unwrap()).unwrap();
+        std::fs::write(&nested, "{}").expect("建好目录后应当能写入");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 真实引擎的自检：版本信息在 stderr 里，不是 stdout。
