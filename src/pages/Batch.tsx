@@ -6,6 +6,7 @@ import { ModelStateBadge, stateLabel } from "../components/ModelStateBadge";
 import { RunButton } from "../components/RunButton";
 import { Select } from "../components/Select";
 import { TRANSLATE_STYLES } from "../lib/translateStyles";
+import { SOURCE_LANGUAGES, TARGET_LANGUAGES } from "../lib/languages";
 import { useTauriEvent } from "../lib/useTauriEvent";
 import {
   baseName,
@@ -25,17 +26,8 @@ import {
   type TranslateStyle,
 } from "../lib/ipc";
 
-const LANGUAGES = [
-  { value: "auto", label: "自动检测" },
-  { value: "zh", label: "中文" },
-  { value: "en", label: "英语" },
-  { value: "ja", label: "日语" },
-  { value: "ko", label: "韩语" },
-  { value: "fr", label: "法语" },
-  { value: "de", label: "德语" },
-  { value: "es", label: "西班牙语" },
-  { value: "ru", label: "俄语" },
-];
+const LANGUAGES = SOURCE_LANGUAGES;
+const TARGETS = TARGET_LANGUAGES;
 
 const btnStyle = {
   background: "var(--surface)",
@@ -298,7 +290,7 @@ export function Batch({ refreshSignal = 0, active = true }: Props) {
         <Select
           className="w-[104px] shrink-0"
           value={target}
-          options={LANGUAGES.filter((l) => l.value !== "auto")}
+          options={TARGETS}
           onChange={setTarget}
           disabled={running}
           title="译文语言"

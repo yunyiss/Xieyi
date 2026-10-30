@@ -65,21 +65,34 @@ impl Style {
 }
 
 /// 拼一次翻译请求的 system prompt：基础要求 → 风格要求 → 术语表。
+///
+/// 语言名必须写全称（`English` / `Chinese (Simplified)`），不能写 `en` / `zh`，
+/// 更不能写 `the source language`——小模型会因此把原文原样吐回来。
+/// 实测见 `language_name_en` 的注释。
+///
+/// 自动检测时**不提源语言**，只说"翻成 X"：既然不知道是什么语言，
+/// 写 `auto-detect` 反而更糟（实测连 `Hello world` 都不翻了）。
 pub fn system_prompt(
     style: Style,
     source: &str,
     target: &str,
     glossary: &[GlossaryEntry],
 ) -> String {
-    let src = if source == "auto" {
-        "the source language"
-    } else {
-        source
-    };
-    let mut prompt = format!(
-        "You are a professional translator. Translate the user's text from {src} to {target}. \
+    let tgt = language_name_en(target).unwrap_or(target);
+
+    let mut prompt = if source == "auto" {
+        format!(
+            "You are a professional translator. Translate the user's text into {tgt}.\n\
 Output only the translation, without explanations, notes, or quotation marks."
-    );
+        )
+    } else {
+        // 明确指定了源语言：写全称，模型才认得出这是一次翻译任务
+        let src = language_name_en(source).unwrap_or(source);
+        format!(
+            "You are a professional translator. Translate the user's text from {src} to {tgt}.\n\
+Output only the translation, without explanations, notes, or quotation marks."
+        )
+    };
 
     if let Some(instruction) = style.instruction() {
         prompt.push(' ');
@@ -135,10 +148,40 @@ fn language_code(code: &str) -> String {
     }
 }
 
+/// 语言代码 → 英文语言名（英文提示词用）。
+///
+/// 为什么不能直接把 `zh` 这种代码写进提示词：小模型看不懂语种缩写，
+/// 实测 Hy-MT2-1.8B 收到 `from the source language to zh` 时会把
+/// `hello` 原样吐回来；改成 `from English to Chinese` 就正常了。
+/// 同理 `zh` 含义模糊（简体？繁体？），模型有时给繁体，写全称才稳。
+///
+/// 返回 `Option` 而不是回退到原代码：认不出的语言宁可让调用方换一种
+/// 措辞，也不要把裸代码塞进提示词。
+fn language_name_en(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "zh" => "Chinese (Simplified)",
+        "zh-tw" | "zh-hant" => "Chinese (Traditional)",
+        "en" => "English",
+        "ja" => "Japanese",
+        "ko" => "Korean",
+        "de" => "German",
+        "fr" => "French",
+        "es" => "Spanish",
+        "ru" => "Russian",
+        "pt" => "Portuguese",
+        "it" => "Italian",
+        "ar" => "Arabic",
+        "th" => "Thai",
+        "vi" => "Vietnamese",
+        _ => return None,
+    })
+}
+
 /// 语言代码 → 中文语言名（中文提示词用，Index-Translate 系）。
 fn language_name_zh(code: &str) -> Option<&'static str> {
     Some(match code {
-        "zh" => "中文",
+        "zh" => "简体中文",
+        "zh-tw" | "zh-hant" => "繁体中文",
         "en" => "英语",
         "ja" => "日语",
         "ko" => "韩语",
@@ -198,16 +241,17 @@ pub fn build_request(
 
         // ---- Index-Translate：中文文本提示，不发 system ----
         PromptStyle::ChineseText => {
-            let src = if source == "auto" {
-                "原文".to_string()
+            let tgt = language_name_zh(target).unwrap_or(target);
+            // 自动检测时不写源语言：写"原文"这种占位词对它没帮助，
+            // 直接说"把下面的文本翻译为 X"更明确。
+            let mut user = if source == "auto" {
+                format!("请将以下文本翻译为{tgt}，直接输出翻译结果，不要进行任何解释。\n\n【源文】\n{text}")
             } else {
-                language_name_zh(source).unwrap_or(source).to_string()
+                let src = language_name_zh(source).unwrap_or(source);
+                format!(
+                    "请将以下{src}文本翻译为{tgt}，直接输出翻译结果，不要进行任何解释。\n\n【源文】\n{text}"
+                )
             };
-            let tgt = language_name_zh(target).unwrap_or(target).to_string();
-
-            let mut user = format!(
-                "请将以下{src}文本翻译为{tgt}，直接输出翻译结果，不要进行任何解释。\n\n【源文】\n{text}"
-            );
 
             // 术语与风格按 Index-Translate 的约束格式给出
             let mut constraints: Vec<String> = Vec::new();
@@ -290,6 +334,52 @@ pub fn build_request(
             }
         }
 
+        // ---- 官方极简中文模板（Hy-MT2 系）----
+        //
+        // 照抄腾讯 Hunyuan-MT 技术报告 Table 1 的原始格式，一个字都不多加：
+        //   `把下面的文本翻译成<target_language>，不要额外解释。`
+        //
+        // 为什么不能沿用英文那套：Hy-MT2 按这个模板训练，喂它长篇英文
+        // system prompt 会让 1.8B 模型失常（短词原样返回、繁体给简体）。
+        // 用法也与官方一致——提示词和原文放在**同一条 user 消息**里。
+        PromptStyle::ChineseOfficial => {
+            let tgt = language_name_zh(target).unwrap_or(target);
+            let mut user = if source == "auto" {
+                format!("把下面的文本翻译成{tgt}，不要额外解释。\n\n{text}")
+            } else {
+                // 指定了源语言也保持同一句式，只补一句"从 X 翻"，避免改变模板形态
+                let src = language_name_zh(source).unwrap_or(source);
+                format!("把下面的{src}文本翻译成{tgt}，不要额外解释。\n\n{text}")
+            };
+
+            // 风格、术语、纠正提示都追加在原文之后。
+            // 官方模板本身没有注入点，只能用这种"附注"形式；宁可朴素，
+            // 也不要为了放约束而改掉模板主体——主体一改模型就不认了。
+            let mut notes: Vec<String> = Vec::new();
+            if let Some(inst) = style_instruction_zh(style) {
+                notes.push(inst.to_string());
+            }
+            if !glossary.is_empty() {
+                let terms: Vec<String> = glossary
+                    .iter()
+                    .map(|e| format!("{}→{}", e.from, e.to))
+                    .collect();
+                notes.push(format!("术语对照：{}", terms.join("、")));
+            }
+            if let Some(h) = hint {
+                notes.push(h.to_string());
+            }
+            for note in notes {
+                user.push_str("\n\n");
+                user.push_str(&note);
+            }
+
+            TranslationRequest {
+                messages: serde_json::json!([{ "role": "user", "content": user }]),
+                template_kwargs: None,
+            }
+        }
+
         // ---- NVIDIA Riva-Translate：system 写语言对代码 ----
         PromptStyle::LanguagePair => {
             // 模板会拿 system 内容去查 en-zh 这类键；查不到就退化成
@@ -344,13 +434,52 @@ mod tests {
         }
     }
 
+    /// 提示词里必须写语言全称，不能写 `en` / `zh` 这种语种代码。
+    ///
+    /// 这条锁住一个真实 bug：早先写的是 `from the source language to zh`，
+    /// Hy-MT2-1.8B 收到后会把 `hello` 原样吐回来，`Apple` 也不翻；
+    /// 而且 `zh` 含义模糊，模型有时直接给繁体。
+    /// 改成全称后实测 8 个用例全部正常（见 docs 里的实测记录）。
     #[test]
     fn general_prompt_keeps_the_original_wording() {
         let prompt = system_prompt(Style::General, "en", "zh", &[]);
         assert!(prompt.starts_with("You are a professional translator."));
-        assert!(prompt.contains("from en to zh"));
+        // 语言必须写成全称
+        assert!(
+            prompt.contains("from English to Chinese (Simplified)"),
+            "应当使用语言全称而不是代码: {prompt}"
+        );
+        assert!(
+            !prompt.contains(" from en ") && !prompt.contains(" to zh."),
+            "不该出现裸语种代码: {prompt}"
+        );
         // 通用风格不追加任何额外要求
         assert!(!prompt.contains("This is"), "通用风格不该带附加要求: {prompt}");
+    }
+
+    /// 自动检测时不提源语言——写 `the source language` 或 `auto-detect`
+    /// 都会让模型困惑（实测连 `Hello world` 都不翻了）。
+    #[test]
+    fn auto_source_omits_the_source_language() {
+        let prompt = system_prompt(Style::General, "auto", "zh", &[]);
+        assert!(
+            prompt.contains("into Chinese (Simplified)"),
+            "自动检测应当只说翻成什么: {prompt}"
+        );
+        assert!(
+            !prompt.contains("from ") && !prompt.contains("source language"),
+            "自动检测不该提源语言: {prompt}"
+        );
+    }
+
+    /// 繁体目标必须写成 Traditional，否则模型可能给简体。
+    #[test]
+    fn traditional_chinese_is_distinct_from_simplified() {
+        let simplified = system_prompt(Style::General, "en", "zh", &[]);
+        let traditional = system_prompt(Style::General, "en", "zh-tw", &[]);
+        assert!(simplified.contains("Chinese (Simplified)"), "{simplified}");
+        assert!(traditional.contains("Chinese (Traditional)"), "{traditional}");
+        assert_ne!(simplified, traditional);
     }
 
     #[test]
@@ -453,7 +582,7 @@ mod tests {
         assert_eq!(req.messages[0]["role"], "user");
 
         let content = req.messages[0]["content"].as_str().unwrap();
-        assert!(content.contains("翻译为中文"), "应指定目标语言: {content}");
+        assert!(content.contains("翻译为简体中文"), "应指定目标语言: {content}");
         assert!(content.contains("英语"), "应指定源语言: {content}");
         assert!(content.contains("hello"), "应带上原文");
         // 术语按它的【硬性要求】格式给出
@@ -534,6 +663,106 @@ mod tests {
         assert_eq!(req.messages[0]["role"], "system");
         assert_eq!(req.messages[0]["content"], "en-zh");
         assert_eq!(req.messages[1]["content"], "hello");
+    }
+
+    /// 官方中文模板必须逐字贴近原文：Hy-MT2 就是按这个格式训练的。
+    #[test]
+    fn chinese_official_matches_the_trained_template() {
+        let req = build_request(
+            PromptStyle::ChineseOfficial,
+            Style::General,
+            "en",
+            "zh",
+            &[],
+            "hello",
+            None,
+        );
+
+        // 单条 user 消息，提示词和原文在同一个 content 里（与官方示例一致）
+        assert_eq!(req.messages.as_array().unwrap().len(), 1);
+        assert_eq!(req.messages[0]["role"], "user");
+        assert!(req.template_kwargs.is_none());
+
+        let content = req.messages[0]["content"].as_str().unwrap();
+        assert!(
+            content.starts_with("把下面的"),
+            "必须是官方句式开头: {content}"
+        );
+        assert!(content.contains("不要额外解释"), "官方模板的收尾句: {content}");
+        assert!(content.contains("简体中文"), "目标语言要用中文名: {content}");
+        assert!(content.ends_with("hello"), "原文在最后: {content}");
+        // 通用风格不加任何附注
+        assert!(!content.contains("术语"), "无术语表时不该出现附注: {content}");
+    }
+
+    /// 繁体目标必须说清楚，这正是英文提示做不到的地方。
+    #[test]
+    fn chinese_official_distinguishes_traditional() {
+        let simplified = build_request(
+            PromptStyle::ChineseOfficial,
+            Style::General,
+            "en",
+            "zh",
+            &[],
+            "hello",
+            None,
+        );
+        let traditional = build_request(
+            PromptStyle::ChineseOfficial,
+            Style::General,
+            "en",
+            "zh-tw",
+            &[],
+            "hello",
+            None,
+        );
+
+        let s = simplified.messages[0]["content"].as_str().unwrap();
+        let t = traditional.messages[0]["content"].as_str().unwrap();
+        assert!(s.contains("简体中文"), "{s}");
+        assert!(t.contains("繁体中文"), "{t}");
+    }
+
+    /// 自动检测时用同一句式，不提具体源语言。
+    #[test]
+    fn chinese_official_auto_source_stays_minimal() {
+        let req = build_request(
+            PromptStyle::ChineseOfficial,
+            Style::General,
+            "auto",
+            "zh",
+            &[],
+            "hello",
+            None,
+        );
+        let content = req.messages[0]["content"].as_str().unwrap();
+        assert!(content.starts_with("把下面的文本翻译成"), "{content}");
+        assert!(!content.contains("英语"), "自动检测不该写源语言: {content}");
+    }
+
+    /// 风格与术语以附注形式追加在原文之后，不能改动模板主体。
+    #[test]
+    fn chinese_official_appends_notes_but_keeps_template_intact() {
+        let req = build_request(
+            PromptStyle::ChineseOfficial,
+            Style::Technical,
+            "en",
+            "zh",
+            &glossary(),
+            "hello",
+            Some("keep every list marker"),
+        );
+        let content = req.messages[0]["content"].as_str().unwrap();
+
+        // 模板主体必须在最前面且完整
+        assert!(content.starts_with("把下面的英语文本翻译成简体中文，不要额外解释。"));
+        // 原文紧随其后
+        assert!(content.contains("\n\nhello"));
+        // 三种附注都在原文之后
+        let after = content.split("hello").nth(1).unwrap_or("");
+        assert!(after.contains("技术内容"), "风格附注: {content}");
+        assert!(after.contains("apple→苹果"), "术语附注: {content}");
+        assert!(after.contains("keep every list marker"), "纠正附注: {content}");
     }
 
     /// 重试的纠正提示要能进到每一种机制里，不能因为换了风格就丢掉。

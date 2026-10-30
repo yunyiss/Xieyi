@@ -158,7 +158,7 @@ pub fn read_context_length(path: &Path) -> Option<u64> {
 /// 不维护型号名单：新模型一个月出好几个，名单必然滞后。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum PromptStyle {
-    /// 英文 system prompt。现有实现，通用 chat 模型与 Hy-MT2 都走这条。
+    /// 英文 system prompt。现有实现，通用 chat 模型走这条。
     #[default]
     EnglishSystem,
     /// 中文文本提示、不发 system。Index-Translate 官方模型卡给的格式。
@@ -169,6 +169,17 @@ pub enum PromptStyle {
     Delimiter,
     /// system 消息写 `zh-en` 这类语言对代码（NVIDIA Riva-Translate）。
     LanguagePair,
+    /// **官方训练用的极简中文模板**，single user message。
+    ///
+    /// 腾讯 Hunyuan-MT 技术报告 Table 1 给出的原始格式：
+    ///   涉及中文的方向：`把下面的文本翻译成<target_language>，不要额外解释。`
+    ///   其他方向：     `Translate the following segment into <target_language>, without additional explanation.`
+    ///
+    /// 为什么单独成一条：Hy-MT2 是**按中文模板训练的**，喂英文 system prompt
+    /// 会让 1.8B 这类小模型失常——实测 `hello` 原样吐回、`Apple` 不翻；
+    /// 换成官方模板后全部正常，繁体也从"永远给简体"变成可用。
+    /// 长篇英文提示对它不是"更清楚"，而是"没见过的格式"。
+    ChineseOfficial,
 }
 
 impl PromptStyle {
@@ -180,6 +191,7 @@ impl PromptStyle {
             PromptStyle::TemplateKwargs => "template-kwargs",
             PromptStyle::Delimiter => "delimiter",
             PromptStyle::LanguagePair => "language-pair",
+            PromptStyle::ChineseOfficial => "chinese-official",
         }
     }
 }
@@ -294,10 +306,18 @@ pub fn profile_of(name: &str, template: Option<&str>) -> ModelProfile {
         return known("Index-Translate", PromptStyle::ChineseText);
     }
 
-    // ③ Hy-MT2：指令服从度好，英文 system prompt 就能用。
-    // 实测对话页改写与闲聊都正常，属于"能对话"。
+    // ③ Hy-MT2：必须用它训练时的中文模板。
+    //
+    // 这条曾经写成 EnglishSystem（"指令服从度好，英文 system prompt 就能用"），
+    // 后来实测推翻了：7B 确实能吃英文提示，但 **1.8B 会失常**——
+    // `hello` 原样返回、`Apple` 不翻、要繁体却永远给简体。
+    // 换成腾讯技术报告 Table 1 的官方模板后全部恢复正常。
+    //
+    // 教训：翻译专用小模型是按特定模板训练的，英文改写是"没见过的格式"，
+    // 不是"更清楚的指令"。
+    // 对话页改写与闲聊仍正常，属于"能对话"。
     if squashed.contains("hy-mt") || squashed.contains("hymt") || squashed.contains("hunyuan-mt") {
-        return known("Hy-MT2", PromptStyle::EnglishSystem);
+        return known("Hy-MT2", PromptStyle::ChineseOfficial);
     }
 
     // ④ 兜底：通用对话模型。宁可当作"能对话"，也不要误判。
@@ -806,15 +826,19 @@ mod tests {
         assert!(p.chat_capable);
     }
 
-    /// Hy-MT2 用现有英文 system prompt 就够，而且**能对话**。
+    /// Hy-MT2 改用**官方中文模板**，仍然能对话。
     ///
-    /// 曾经把它判成"不能对话"，导致用户模型目录里只有翻译模型时对话页全空。
-    /// 实测：改写「该功能性能优异，建议您予以试用。」、闲聊「我是混元…」都正常。
+    /// 这条断言前后翻过两次，两次都是为了修实际 bug：
+    ///   1. 曾判成"不能对话" → 用户模型目录只有翻译模型时对话页全空，改回 true
+    ///   2. 曾用 EnglishSystem → 1.8B 短词原样返回、要繁体给简体，
+    ///      改成官方 ChineseOfficial 后恢复正常（7B 靠体量能扛住，1.8B 扛不住）
+    ///
+    /// 对话能力不变：改写「该功能性能优异，建议您予以试用。」、闲聊「我是混元…」都正常。
     #[test]
-    fn hy_mt2_keeps_english_prompt_and_can_chat() {
+    fn hy_mt2_uses_official_chinese_template_and_can_chat() {
         for name in ["Hy-MT2-1.8B", "Hy-MT2-7B", "Hunyuan-MT-7B"] {
             let p = profile_of(name, Some("<|startoftext|>{{ message.content }}"));
-            assert_eq!(p.style, PromptStyle::EnglishSystem, "{name}");
+            assert_eq!(p.style, PromptStyle::ChineseOfficial, "{name}");
             assert_eq!(p.family, "Hy-MT2", "{name}");
             assert!(p.chat_capable, "{name} 实测能对话，不该被挡掉");
         }
