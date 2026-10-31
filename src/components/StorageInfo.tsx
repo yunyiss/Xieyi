@@ -4,7 +4,6 @@ import {
   getRuntimeStatus,
   openDataSubdir,
   openEngineDir,
-  openModelsDir,
   type AppInfo,
   type RuntimeStatus,
 } from "../lib/ipc";
@@ -149,29 +148,6 @@ export function StorageInfo({ refreshToken = 0 }: { refreshToken?: number }) {
               style={btnStyle}
               onClick={() => void openEngineDir()}
               title="打开当前引擎所在的目录"
-            >
-              打开
-            </button>
-          </div>
-          {/* 模型目录：通常不在数据目录里，单独一行 */}
-          <div className="mt-2 flex items-center gap-2">
-            <span
-              className="w-[44px] shrink-0"
-              style={{ color: "var(--text-muted)" }}
-            >
-              模型
-            </span>
-            <span
-              className="min-w-0 flex-1 truncate"
-              style={{ ...mono, color: "var(--text)" }}
-              title={info?.modelsDir ?? ""}
-            >
-              {info?.modelsDir ?? "—"}
-            </span>
-            <button
-              className={btnClass}
-              style={btnStyle}
-              onClick={() => void openModelsDir()}
             >
               打开
             </button>
