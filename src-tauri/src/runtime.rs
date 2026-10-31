@@ -67,24 +67,19 @@ struct DownloadProgress {
     percent: f64,
 }
 
-/// 写入运行时清单。
+/// 读取当前引擎信息。
 ///
-/// `runtime/` 目录不一定存在（首次装引擎、或清过数据目录），
-/// 而 `fs::write` 不会替你建父目录，缺了就是 `os error 3`。
-/// 下载那条路有 `paths::ensure(&downloads)` 兜着，手动指定这条没有，
-/// 所以必须在这里显式建一次——两条路都要能落下 runtime.json。
-fn write_info(app: &AppHandle, info: &RuntimeInfo) -> Result<(), String> {
-    let path = paths::runtime_json(app)?;
-    if let Some(parent) = path.parent() {
-        paths::ensure(parent)?;
-    }
-    let json = serde_json::to_string_pretty(info).map_err(|e| e.to_string())?;
-    std::fs::write(&path, json).map_err(|e| format!("写入运行时清单失败: {e}"))
+/// 存在 `config.json` 的 `engine` 字段里，不再单独维护 `runtime/runtime.json`：
+/// 一个配置文件就是全部设置，删它即还原，用户和调试者都不用记哪个文件管什么。
+pub fn read_info(app: &AppHandle) -> Option<RuntimeInfo> {
+    let value = paths::config_value(app, "engine")?;
+    serde_json::from_value(value).ok()
 }
 
-pub fn read_info(app: &AppHandle) -> Option<RuntimeInfo> {
-    let raw = std::fs::read_to_string(paths::runtime_json(app).ok()?).ok()?;
-    serde_json::from_str(&raw).ok()
+/// 写入引擎信息（同样是 `config.json` 的 `engine` 字段）。
+fn write_info(app: &AppHandle, info: &RuntimeInfo) -> Result<(), String> {
+    let value = serde_json::to_value(info).map_err(|e| e.to_string())?;
+    paths::set_config_value(app, "engine", value)
 }
 
 pub fn status(app: &AppHandle) -> RuntimeStatus {
@@ -530,15 +525,17 @@ mod tests {
 
     /// 父目录不存在时 `fs::write` 会报 `os error 3`。
     ///
-    /// 锁住一个真实踩过的坑：`runtime/` 是懒创建的，首次手动指定引擎时
-    /// 它还不存在。下载那条路有 `ensure(&downloads)` 顺带建了父目录，
-    /// 手动这条没有，于是装引擎直接失败，只报一句没头没尾的
-    /// 「系统找不到指定的路径」。
+    /// 锁住一个真实踩过的坑：写清单时目录是懒创建的，首次手动指定引擎时
+    /// 它还不存在，`fs::write` 不会替你建父目录，于是装引擎直接失败，
+    /// 只报一句没头没尾的「系统找不到指定的路径」。
+    ///
+    /// 现在引擎信息改存 `config.json`（`set_config_value` 内部会 `ensure`），
+    /// 这条仍保留：它验证的是 `ensure` 这个兜底动作本身是有效的。
     #[test]
     fn writing_into_a_missing_dir_needs_ensure() {
         let dir = std::env::temp_dir().join("xieyi-missing-parent-test");
         let _ = std::fs::remove_dir_all(&dir);
-        let nested = dir.join("runtime").join("runtime.json");
+        let nested = dir.join("nested").join("probe.json");
 
         // 先确认现象：不建目录就是 NotFound（Windows 下即 os error 3）
         let err = std::fs::write(&nested, "{}").unwrap_err();

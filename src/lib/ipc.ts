@@ -217,6 +217,14 @@ export const startService = () => invoke<ServiceStatus>("start_service");
 export const stopService = () => invoke<void>("stop_service");
 export const listRouterModels = () => invoke<RouterModel[]>("list_router_models");
 export const openModelsDir = () => invoke<string>("open_models_dir");
+/**
+ * 在系统文件管理器里打开数据目录的某个子目录。
+ *
+ * `root` 是整个数据根目录（删掉它等于还原出厂），其余是它下面的子项。
+ * 后端只接受这三个名字，不接受任意路径。
+ */
+export const openDataSubdir = (name: "root" | "sessions" | "runtime") =>
+  invoke<string>("open_data_subdir", { name });
 export const setModelsDir = (path: string) =>
   invoke<string>("set_models_dir", { path });
 export const setTtl = (seconds: number) => invoke<void>("set_ttl", { seconds });

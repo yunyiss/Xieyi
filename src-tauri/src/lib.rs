@@ -68,6 +68,29 @@ fn set_models_dir(app: tauri::AppHandle, path: String) -> Result<String, String>
     Ok(path)
 }
 
+/// 在系统文件管理器里打开数据目录下的某个子目录。
+///
+/// 只允许白名单里的几个名字，不接受任意路径——前端能调这个命令，
+/// 要防止它被当成"打开任意目录"的通用能力。
+#[tauri::command]
+fn open_data_subdir(app: tauri::AppHandle, name: String) -> Result<String, String> {
+    let sub = match name.as_str() {
+        "root" => String::new(),
+        "sessions" => "sessions".to_string(),
+        "runtime" => "runtime".to_string(),
+        _ => return Err(format!("不支持的目录: {name}")),
+    };
+
+    let base = paths::app_data(&app)?;
+    let dir = if sub.is_empty() { base } else { base.join(&sub) };
+    paths::ensure(&dir)?;
+    let path = dir.to_string_lossy().to_string();
+
+    tauri_plugin_opener::open_path(&path, None::<&str>)
+        .map_err(|e| format!("无法打开目录 {path}：{e}"))?;
+    Ok(path)
+}
+
 #[tauri::command]
 fn probe_vram() -> Option<u64> {
     hardware::free_vram_mb()
@@ -88,6 +111,7 @@ pub fn run() {
             app_info,
             open_models_dir,
             set_models_dir,
+            open_data_subdir,
             probe_vram,
             runtime::runtime_status,
             runtime::install_runtime,

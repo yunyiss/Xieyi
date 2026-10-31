@@ -1,22 +1,38 @@
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager};
 
-/// 应用数据目录（Windows: %APPDATA%\<identifier>）。
+/// 应用数据根目录（Windows 上是 `%LOCALAPPDATA%\<identifier>`）。
+///
+/// **刻意用 `app_local_data_dir` 而不是 `app_data_dir`**：
+/// 后者在 Windows 上指向 `Roaming`，于是同一份配置会散落在
+/// `Roaming\com.xieyi.translate\` 和 `Local\com.xieyi.translate\` 两处——
+/// WebView2 的缓存本来就在 Local，用户卸载时清掉 Local 会以为干净了，
+/// 哪知 Roaming 还留着一份。工具自己生成的文件就该只有一处。
+///
+/// 现在全部落在 Local 下，和 WebView2 缓存同一个根：
+/// ```text
+/// Local\com.xieyi.translate\
+///   ├── config.json      ← 所有设置
+///   ├── sessions\        ← 对话历史
+///   ├── runtime\         ← 下载/指定的引擎与启动预设
+///   └── EBWebView\       ← WebView2 缓存（它自己管）
+/// ```
+/// 卸载或重置只需删掉这个根目录。
 pub fn app_data(app: &AppHandle) -> Result<PathBuf, String> {
-    app.path().app_data_dir().map_err(|e| e.to_string())
+    app.path()
+        .app_local_data_dir()
+        .map_err(|e| e.to_string())
 }
 
 /// 运行时根目录：`<app_data>/runtime`。
+///
+/// 只放**运行时产物**（解压出来的 llama-server、启动预设 presets.ini），
+/// 不放用户配置——配置统一在 `config.json`。
 pub fn runtime_root(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(app_data(app)?.join("runtime"))
 }
 
-/// 运行时清单文件。
-pub fn runtime_json(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(runtime_root(app)?.join("runtime.json"))
-}
-
-/// 配置文件（用户设置）。
+/// 配置文件（用户设置 + 引擎信息，全在这一个文件里）。
 pub fn config_json(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(app_data(app)?.join("config.json"))
 }
@@ -140,5 +156,36 @@ mod tests {
         // 不存在的目录一律判为不可写
         assert!(!dir_is_writable(&dir.join("nope")));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 数据根目录必须落在 **Local**，不能是 Roaming。
+    ///
+    /// 这条防的是一个具体的"卸载不干净"：Tauri 的 `app_data_dir()` 在
+    /// Windows 上指向 `Roaming`，而 WebView2 缓存固定在 `Local`。
+    /// 两者并用时，用户清掉 Local 会以为删干净了，Roaming 里还留着配置。
+    /// 我们用 `app_local_data_dir()`，让所有自建文件与缓存同处一个根。
+    ///
+    /// 只做静态断言，不依赖 AppHandle：这条约束的实质是"源码里不能出现
+    /// app_data_dir"，改成任何别的写法都应当让这条测试失败。
+    #[test]
+    fn data_root_uses_local_not_roaming() {
+        let source = include_str!("paths.rs");
+        // 只看测试模块之前的生产代码：测试自己会写到这两个名字，
+        // 把它们算进来会让这条断言永远成立不了。
+        let production = source.split("#[cfg(test)]").next().unwrap_or("");
+        let code: String = production
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            !code.contains(".app_data_dir()"),
+            "数据根目录不能用 app_data_dir（Windows 上是 Roaming）"
+        );
+        assert!(
+            code.contains(".app_local_data_dir()"),
+            "数据根目录应当用 app_local_data_dir（Local）"
+        );
     }
 }
