@@ -5,13 +5,11 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import {
   abort,
   discoverRuntimes,
-  getAppInfo,
   getGlossary,
   getRuntimeStatus,
   getSettings,
   listLocalModels,
   listRouterModels,
-  openDataSubdir,
   openModelsDir,
   probeVram,
   restartService,
@@ -23,7 +21,6 @@ import {
   setModelsDir,
   setPinned,
   setTtl,
-  type AppInfo,
   type DiscoveredRuntime,
   type GlossaryEntry,
   type LocalModel,
@@ -32,6 +29,7 @@ import {
   type Settings,
 } from "../lib/ipc";
 import { Select } from "./Select";
+import { StorageInfo } from "./StorageInfo";
 
 const TTL_OPTIONS = [
   { value: 60, label: "空闲 60 秒释放" },
@@ -101,8 +99,6 @@ export function ModelDrawer({ open, onClose, onChanged, onOpenGuide }: Props) {
   const [needsRestart, setNeedsRestart] = useState(false);
   /** 退场动画期间仍然渲染，动画结束后再卸载 */
   const [closing, setClosing] = useState(false);
-  /** 数据目录信息，用于「存储位置」区块显示路径。 */
-  const [info, setInfo] = useState<AppInfo | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -110,8 +106,6 @@ export function ModelDrawer({ open, onClose, onChanged, onOpenGuide }: Props) {
       setSettings(s);
       setLocal(await listLocalModels());
       setFreeVram(await probeVram());
-      // 路径基本不变，但换标识符或迁移目录后要能反映出来，所以每次刷新都重取
-      setInfo(await getAppInfo());
       setRuntime(await getRuntimeStatus());
 
       const terms = await getGlossary();
@@ -662,6 +656,8 @@ export function ModelDrawer({ open, onClose, onChanged, onOpenGuide }: Props) {
           </section>
           )}
 
+          {tab === "general" && <StorageInfo />}
+
           {tab === "models" && (
           <>
           {/* 术语表 */}
@@ -715,96 +711,6 @@ export function ModelDrawer({ open, onClose, onChanged, onOpenGuide }: Props) {
               <button className={btnClass} style={btnStyle} onClick={changeDir}>
                 切换
               </button>
-            </div>
-          </div>
-
-          {/* 存储位置：让用户随时知道文件在哪，不用满硬盘翻 */}
-          <div className="mb-3">
-            <div className="section-title mb-1">存储位置</div>
-            <div
-              className="rounded-[10px] border p-2.5 text-[11px]"
-              style={{
-                background: "var(--surface-muted)",
-                borderColor: "var(--border)",
-              }}
-            >
-              {/*
-                只给「需要打开」的两项配按钮：
-                配置和缓存是内部文件，用户不必进去翻；
-                会话历史在应用内能看，也不需要。
-              */}
-              <div className="flex items-center gap-2">
-                <span className="w-[52px] shrink-0" style={{ color: "var(--text-muted)" }}>
-                  配置
-                </span>
-                <span
-                  className="min-w-0 flex-1 truncate"
-                  style={{ color: "var(--text)" }}
-                  title={info?.dataDir ? `${info.dataDir}\\config.json` : ""}
-                >
-                  {info?.dataDir ? `${info.dataDir}\\config.json` : "—"}
-                </span>
-              </div>
-
-              <div className="mt-1.5 flex items-center gap-2">
-                <span className="w-[52px] shrink-0" style={{ color: "var(--text-muted)" }}>
-                  引擎
-                </span>
-                <span
-                  className="min-w-0 flex-1 truncate"
-                  style={{ color: "var(--text)" }}
-                  title={info?.dataDir ? `${info.dataDir}\\runtime` : ""}
-                >
-                  {info?.dataDir ? `${info.dataDir}\\runtime` : "—"}
-                </span>
-                <button
-                  className={btnClass}
-                  style={btnStyle}
-                  onClick={() => openDataSubdir("runtime")}
-                >
-                  打开
-                </button>
-              </div>
-
-              <div className="mt-1.5 flex items-center gap-2">
-                <span className="w-[52px] shrink-0" style={{ color: "var(--text-muted)" }}>
-                  会话
-                </span>
-                <span
-                  className="min-w-0 flex-1 truncate"
-                  style={{ color: "var(--text)" }}
-                  title={info?.dataDir ? `${info.dataDir}\\sessions` : ""}
-                >
-                  {info?.dataDir ? `${info.dataDir}\\sessions` : "—"}
-                </span>
-              </div>
-
-              <div className="mt-1.5 flex items-center gap-2">
-                <span className="w-[52px] shrink-0" style={{ color: "var(--text-muted)" }}>
-                  缓存
-                </span>
-                <span
-                  className="min-w-0 flex-1 truncate"
-                  style={{ color: "var(--text)" }}
-                  title={info?.dataDir ? `${info.dataDir}\\EBWebView` : ""}
-                >
-                  {info?.dataDir ? `${info.dataDir}\\EBWebView` : "—"}
-                </span>
-              </div>
-
-              <div className="mt-2 border-t pt-2" style={{ borderColor: "var(--border)" }}>
-                <button
-                  className={btnClass}
-                  style={btnStyle}
-                  onClick={() => openDataSubdir("root")}
-                  title="打开这个目录；删掉它等于还原出厂设置"
-                >
-                  打开数据目录
-                </button>
-                <span className="ml-2" style={{ color: "var(--text-muted)" }}>
-                  以下文件都在此目录内，删除即还原
-                </span>
-              </div>
             </div>
           </div>
 
