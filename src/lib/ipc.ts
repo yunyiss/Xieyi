@@ -217,6 +217,8 @@ export const startService = () => invoke<ServiceStatus>("start_service");
 export const stopService = () => invoke<void>("stop_service");
 export const listRouterModels = () => invoke<RouterModel[]>("list_router_models");
 export const openModelsDir = () => invoke<string>("open_models_dir");
+/** 打开当前引擎所在目录（手动指定的可以不在数据目录里）。 */
+export const openEngineDir = () => invoke<string>("open_engine_dir");
 /**
  * 在系统文件管理器里打开数据目录的某个子目录。
  *

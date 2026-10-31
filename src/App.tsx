@@ -246,7 +246,6 @@ function App() {
         open={drawerOpen}
         onClose={() => setDrawerOpen(false)}
         onChanged={() => setRefreshSignal((n) => n + 1)}
-        onOpenGuide={() => setShowGuide(true)}
       />
     </div>
   );

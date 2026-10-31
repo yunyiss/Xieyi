@@ -58,6 +58,25 @@ fn open_models_dir(app: tauri::AppHandle) -> Result<String, String> {
     Ok(path)
 }
 
+/// 打开**当前引擎所在目录**。
+///
+/// 与 `open_data_subdir("runtime")` 的区别：那是"下载的引擎会放这里"的数据子目录，
+/// 而用户手动指定 D 盘的 llama-server 时，真正该打开的是 D 盘那个目录。
+/// 不接受任意路径——路径取自配置里已记录的引擎，前端无法指定要打开哪。
+#[tauri::command]
+fn open_engine_dir(app: tauri::AppHandle) -> Result<String, String> {
+    let info = runtime::read_info(&app).ok_or("尚未配置推理引擎")?;
+    let exe = std::path::PathBuf::from(&info.server_path);
+    let dir = exe
+        .parent()
+        .ok_or_else(|| format!("无法确定引擎所在目录: {}", info.server_path))?;
+    let path = dir.to_string_lossy().to_string();
+
+    tauri_plugin_opener::open_path(&path, None::<&str>)
+        .map_err(|e| format!("无法打开目录 {path}：{e}"))?;
+    Ok(path)
+}
+
 #[tauri::command]
 fn set_models_dir(app: tauri::AppHandle, path: String) -> Result<String, String> {
     let dir = std::path::PathBuf::from(&path);
@@ -110,6 +129,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             app_info,
             open_models_dir,
+            open_engine_dir,
             set_models_dir,
             open_data_subdir,
             probe_vram,
