@@ -56,6 +56,8 @@ interface Props {
   open: boolean;
   onClose: () => void;
   onChanged: () => void;
+  /** 重新打开首启引导（引擎或模型换地方时，比逐项改更快）。 */
+  onOpenGuide?: () => void;
 }
 
 const btnClass =
@@ -75,7 +77,7 @@ function stateLabel(state: string): { text: string; hot: boolean } {
 }
 
 /** 右侧抽屉：模型列表与目录管理。 */
-export function ModelDrawer({ open, onClose, onChanged }: Props) {
+export function ModelDrawer({ open, onClose, onChanged, onOpenGuide }: Props) {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [local, setLocal] = useState<LocalModel[]>([]);
   /** 当前页签：engines 类参数与模型分开，避免一页塞太多。 */
@@ -554,8 +556,21 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
               <p className="m-0 mt-0.5 text-[11px]" style={{ color: "var(--text-muted)" }}>
                 {runtime?.installed
                   ? `${runtime.backend ?? "未知"} · ${runtime.version ?? "未知版本"}`
-                  : "到「翻译」页安装，或用下方按钮指定已有文件"}
+                  : "还没配置过，可以走一遍引导"}
               </p>
+
+              {onOpenGuide && (
+                <button
+                  className="btn mt-2 h-7 rounded-md border px-2 text-[11px]"
+                  style={btnStyle}
+                  onClick={() => {
+                    onClose();
+                    onOpenGuide();
+                  }}
+                >
+                  重新打开配置引导
+                </button>
+              )}
 
               {probeMsg && (
                 <p

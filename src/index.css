@@ -102,6 +102,30 @@
     color: var(--brand-text);
   }
 
+  /*
+    引擎候选：在 .row 的基础上加边框，让它一眼看得出是"可点的卡片"，
+    而不是一段普通文字。选中态同时用边框和底色表达，
+    因为只靠底色在浅色主题下对比度太低。
+  */
+  .engine-cand {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--surface);
+    padding: 9px 12px;
+    transition:
+      background var(--dur-fast) var(--ease-out),
+      border-color var(--dur-fast) var(--ease-out);
+  }
+  .engine-cand:hover:not(:disabled) {
+    background: var(--surface-muted);
+    border-color: var(--border-strong);
+  }
+  .engine-cand[data-current="true"] {
+    background: var(--brand-soft);
+    border-color: var(--brand);
+    cursor: default;
+  }
+
   /* 卡片里的标题条：一行小字，分隔线极淡，不抢内容 */
   .panel-head {
     display: flex;

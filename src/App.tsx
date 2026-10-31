@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { ModelDrawer } from "./components/ModelDrawer";
+import { Onboarding } from "./components/Onboarding";
 import { StatusBar } from "./components/StatusBar";
 import { Translate } from "./pages/Translate";
 import { Batch } from "./pages/Batch";
@@ -9,6 +10,7 @@ import {
   getRuntimeStatus,
   getServiceStatus,
   getSettings,
+  listRouterModels,
   type AppInfo,
   type RuntimeStatus,
   type ServiceStatus,
@@ -28,6 +30,14 @@ function App() {
   const [refreshSignal, setRefreshSignal] = useState(0);
   /** 从翻译页带到对话页的草稿 */
   const [chatDraft, setChatDraft] = useState("");
+  /**
+   * 首次启动引导是否显示。
+   *
+   * `null` 表示还在判断（首帧不渲染，避免闪一下再消失）；
+   * 判断依据是"引擎没装 或 没模型"——两者任一缺失就还处于未配置状态。
+   */
+  const [showGuide, setShowGuide] = useState(false);
+  const [guideChecked, setGuideChecked] = useState(false);
 
   const handleSendToChat = useCallback((text: string) => {
     setChatDraft(text);
@@ -46,6 +56,38 @@ function App() {
     getAppInfo()
       .then(setInfo)
       .catch((err) => console.error("读取环境信息失败", err));
+  }, []);
+
+  /**
+   * 判断要不要弹首启引导 —— **只在启动时判断一次**。
+   *
+   * 之后不再重判：否则用户手动关掉引导后，只要引擎还没配好，
+   * 下一次轮询就会把它又弹回来，等于关不掉。
+   * 支持"先看看"的选择，所以这里只决定首次显示。
+   */
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        // 引擎没装直接判定需要引导
+        const rt = await getRuntimeStatus();
+        if (!alive) return;
+        if (!rt.installed) {
+          setShowGuide(true);
+          return;
+        }
+        // 引擎装了但一个模型都没有，同样算没配好
+        const list = await listRouterModels();
+        if (alive) setShowGuide(list.length === 0);
+      } catch {
+        // 拉不到状态就不打扰，免得误弹
+      } finally {
+        if (alive) setGuideChecked(true);
+      }
+    })();
+    return () => {
+      alive = false;
+    };
   }, []);
 
   useEffect(() => {
@@ -163,6 +205,7 @@ function App() {
             refreshSignal={refreshSignal}
             onSendToChat={handleSendToChat}
             onRuntimeChanged={handleRuntimeChanged}
+            onOpenSetup={() => setShowGuide(true)}
           />
         </div>
         <div className={tab === "batch" ? "h-full" : "hidden"}>
@@ -177,6 +220,21 @@ function App() {
         </div>
       </main>
 
+      {/*
+        首启引导盖在最上层：三个页面始终是"配置好之后的样子"，
+        配置过程不会嵌进任何业务界面。判断过之后才渲染，避免闪一下。
+      */}
+      {guideChecked && showGuide && (
+        <Onboarding
+          onDone={() => {
+            setShowGuide(false);
+            // 配好的结果要让三个页面都重新拉一次
+            setRefreshSignal((n) => n + 1);
+          }}
+          onChanged={handleRuntimeChanged}
+        />
+      )}
+
       <StatusBar
         info={info}
         runtime={runtime}
@@ -188,6 +246,7 @@ function App() {
         open={drawerOpen}
         onClose={() => setDrawerOpen(false)}
         onChanged={() => setRefreshSignal((n) => n + 1)}
+        onOpenGuide={() => setShowGuide(true)}
       />
     </div>
   );
