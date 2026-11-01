@@ -135,23 +135,11 @@ export interface ModelStatePayload {
   percent?: number;
 }
 
-/**
- * 翻译风格。后端 `prompts::Style` 与之逐字对应；
- * 只影响 system prompt，请求形状与输出额度不变。
- */
-export type TranslateStyle =
-  | "general"
-  | "formal"
-  | "technical"
-  | "literary"
-  | "subtitle";
-
 export interface TranslateRequest {
   requestId: string;
   model: string;
   source: string;
   target: string;
-  style: TranslateStyle;
   text: string;
 }
 
@@ -376,7 +364,6 @@ export interface BatchRequest {
   model: string;
   source: string;
   target: string;
-  style: TranslateStyle;
   paths: string[];
 }
 

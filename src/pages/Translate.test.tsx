@@ -52,7 +52,7 @@ beforeEach(() => {
 });
 
 describe("Translate", () => {
-  it("把所选风格与语言带进请求，并把译文显示出来", async () => {
+  it("把所选语言带进请求，并把译文显示出来", async () => {
     translateMock.mockResolvedValue("你好，世界");
 
     const user = userEvent.setup();
@@ -66,10 +66,6 @@ describe("Translate", () => {
       "hello world",
     );
 
-    // 打开「翻译风格」下拉，选技术风格
-    await user.click(screen.getByTitle("翻译风格"));
-    await user.click(screen.getByRole("option", { name: /技术/ }));
-
     await user.click(run);
 
     expect(await screen.findByText("你好，世界")).toBeInTheDocument();
@@ -79,7 +75,6 @@ describe("Translate", () => {
         model: "demo.gguf",
         source: "auto",
         target: "zh",
-        style: "technical",
       }),
     );
   });

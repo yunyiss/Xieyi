@@ -14,7 +14,6 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tauri::{AppHandle, Emitter};
 
-use crate::prompts::Style;
 use crate::service::{self, AppState, GlossaryEntry, SegmentStats, Service};
 use crate::translate as segmenter;
 
@@ -33,7 +32,6 @@ pub struct BatchRequest {
     pub target: String,
     /// 翻译风格（general/formal/technical/literary/subtitle），空值按 general。
     #[serde(default)]
-    pub style: String,
     pub paths: Vec<String>,
 }
 
@@ -321,8 +319,7 @@ async fn translate_with_retry(
     glossary: &[GlossaryEntry],
     text: &str,
 ) -> Option<(String, SegmentStats)> {
-    let style = Style::parse(&request.style);
-    let mut last_error = String::new();
+        let mut last_error = String::new();
 
     for attempt in 0..MAX_ATTEMPTS {
         if state.cancel.load(Ordering::Relaxed) {
@@ -341,7 +338,6 @@ async fn translate_with_retry(
                 &request.model,
                 &request.source,
                 &request.target,
-                style,
                 glossary,
                 text,
                 &state.cancel,

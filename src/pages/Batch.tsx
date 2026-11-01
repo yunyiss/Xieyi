@@ -5,7 +5,6 @@ import { LoadIndicator, toLoadState, type LoadState } from "../components/LoadIn
 import { ModelStateBadge, stateLabel } from "../components/ModelStateBadge";
 import { RunButton } from "../components/RunButton";
 import { Select } from "../components/Select";
-import { TRANSLATE_STYLES } from "../lib/translateStyles";
 import { SOURCE_LANGUAGES, TARGET_LANGUAGES } from "../lib/languages";
 import { useTauriEvent } from "../lib/useTauriEvent";
 import {
@@ -23,7 +22,6 @@ import {
   type BatchSummary,
   type RouterModel,
   type RuntimeStatus,
-  type TranslateStyle,
 } from "../lib/ipc";
 
 const LANGUAGES = SOURCE_LANGUAGES;
@@ -89,7 +87,6 @@ interface Props {
 export function Batch({ refreshSignal = 0, active = true }: Props) {
   const [source, setSource] = useState("auto");
   const [target, setTarget] = useState("zh");
-  const [style, setStyle] = useState<TranslateStyle>("general");
   const [models, setModels] = useState<RouterModel[]>([]);
   const [model, setModel] = useState("");
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
@@ -246,7 +243,6 @@ export function Batch({ refreshSignal = 0, active = true }: Props) {
         model,
         source,
         target,
-        style,
         paths: queue.map((i) => i.path),
       });
       setSummary(result);
@@ -294,15 +290,6 @@ export function Batch({ refreshSignal = 0, active = true }: Props) {
           onChange={setTarget}
           disabled={running}
           title="译文语言"
-        />
-
-        <Select
-          className="w-[92px] shrink-0"
-          value={style}
-          options={TRANSLATE_STYLES}
-          onChange={setStyle}
-          disabled={running}
-          title="翻译风格"
         />
 
         <span

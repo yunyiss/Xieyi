@@ -5,7 +5,6 @@ import { LoadIndicator, toLoadState, type LoadState } from "../components/LoadIn
 import { ModelStateBadge, stateLabel } from "../components/ModelStateBadge";
 import { RunButton } from "../components/RunButton";
 import { Select } from "../components/Select";
-import { TRANSLATE_STYLES } from "../lib/translateStyles";
 import { SOURCE_LANGUAGES, TARGET_LANGUAGES } from "../lib/languages";
 import {
   abort,
@@ -24,7 +23,6 @@ import {
   type RouterModel,
   type RuntimeStatus,
   type ServiceStatus,
-  type TranslateStyle,
 } from "../lib/ipc";
 import { useTauriEvent } from "../lib/useTauriEvent";
 
@@ -92,7 +90,6 @@ export function Translate({
 }: Props) {
   const [source, setSource] = useState("auto");
   const [target, setTarget] = useState("zh");
-  const [style, setStyle] = useState<TranslateStyle>("general");
   const [input, setInput] = useState("");
   const [output, setOutput] = useState("");
   const [busy, setBusy] = useState(false);
@@ -238,7 +235,6 @@ export function Translate({
         model,
         source,
         target,
-        style,
         text: input,
       });
       setOutput(text);
@@ -328,14 +324,6 @@ export function Translate({
           options={TARGETS}
           onChange={setTarget}
           title="译文语言"
-        />
-
-        <Select
-          className="w-[92px] shrink-0"
-          value={style}
-          options={TRANSLATE_STYLES}
-          onChange={setStyle}
-          title="翻译风格"
         />
 
         <span

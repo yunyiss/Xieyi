@@ -1,70 +1,16 @@
-//! 翻译提示词预设。
+//! 翻译提示词构造。
 //!
-//! 对齐 STranslate 的 `Prompts` 思路：把"怎么翻"从代码里拆成可选风格，
-//! 用户按内容类型选一套。风格只影响 system prompt —— 请求形状、输出上限、
-//! 思考开关都不变。
+//! 核心是「按模型的调用机制生成请求」：不同翻译模型的接口差异很大，
+//! 用错不一定报错，而是静默给出错误结果（如把一切翻成英语）。
 //!
-//! 缓存键会带上风格：同一段原文换风格后会重新翻译，不会命中旧结果。
+//! **翻译风格已于 2026-11-01 移除**。实测四个模型（Hy-MT2 1.8B/7B、
+//! translategemma 4B/12B）：没有一个能稳定用好 5 种风格，最好的也只有
+//! 「正式」一项略有变化；且纯翻译模型会把风格附注当正文翻出来，
+//! 直接污染译文。语气调整改由对话页的快捷指令承担。
 
 use crate::service::GlossaryEntry;
 
-/// 翻译风格。字符串值与前端 `TranslateStyle` 一一对应，未知值回落到通用。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Style {
-    #[default]
-    General,
-    Formal,
-    Technical,
-    Literary,
-    Subtitle,
-}
-
-impl Style {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Style::General => "general",
-            Style::Formal => "formal",
-            Style::Technical => "technical",
-            Style::Literary => "literary",
-            Style::Subtitle => "subtitle",
-        }
-    }
-
-    /// 解析前端传来的风格；空值或未知值一律按通用处理。
-    pub fn parse(value: &str) -> Self {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "formal" => Style::Formal,
-            "technical" => Style::Technical,
-            "literary" => Style::Literary,
-            "subtitle" => Style::Subtitle,
-            _ => Style::General,
-        }
-    }
-
-    /// 风格附加要求。通用风格不追加内容，保持原有提示词逐字不变。
-    fn instruction(self) -> Option<&'static str> {
-        match self {
-            Style::General => None,
-            Style::Formal => Some(
-                "Use formal, written language: avoid slang, contractions and casual wording.",
-            ),
-            Style::Technical => Some(
-                "This is technical content: keep product names, code identifiers, numbers and \
-                 terminology exactly as written; prioritize precision over fluency.",
-            ),
-            Style::Literary => Some(
-                "This is literary or marketing copy: preserve tone, imagery and rhythm; \
-                 favor natural, expressive wording over literal translation.",
-            ),
-            Style::Subtitle => Some(
-                "This is subtitle text: keep each line short and easy to read at speed; \
-                 do not merge lines or add narration.",
-            ),
-        }
-    }
-}
-
-/// 拼一次翻译请求的 system prompt：基础要求 → 风格要求 → 术语表。
+/// 拼一次翻译请求的 system prompt：基础要求 → 术语表。
 ///
 /// 语言名必须写全称（`English` / `Chinese (Simplified)`），不能写 `en` / `zh`，
 /// 更不能写 `the source language`——小模型会因此把原文原样吐回来。
@@ -72,12 +18,7 @@ impl Style {
 ///
 /// 自动检测时**不提源语言**，只说"翻成 X"：既然不知道是什么语言，
 /// 写 `auto-detect` 反而更糟（实测连 `Hello world` 都不翻了）。
-pub fn system_prompt(
-    style: Style,
-    source: &str,
-    target: &str,
-    glossary: &[GlossaryEntry],
-) -> String {
+pub fn system_prompt(source: &str, target: &str, glossary: &[GlossaryEntry]) -> String {
     let tgt = language_name_en(target).unwrap_or(target);
 
     let mut prompt = if source == "auto" {
@@ -94,10 +35,6 @@ Output only the translation, without explanations, notes, or quotation marks."
         )
     };
 
-    if let Some(instruction) = style.instruction() {
-        prompt.push(' ');
-        prompt.push_str(instruction);
-    }
 
     if !glossary.is_empty() {
         prompt.push_str("\nUse these term mappings when they appear:\n");
@@ -207,17 +144,6 @@ fn language_name_zh(code: &str) -> Option<&'static str> {
     })
 }
 
-/// 中文风格要求的追加说明（中文提示词用）。
-fn style_instruction_zh(style: Style) -> Option<&'static str> {
-    Some(match style {
-        Style::General => return None,
-        Style::Formal => "使用正式、书面的语体，避免口语与缩略表达。",
-        Style::Technical => "这是技术内容：产品名、代码标识符、数字与术语保持原样，准确优先于流畅。",
-        Style::Literary => "这是文学或营销文案：保留语气、意象与节奏，意译优先于直译。",
-        Style::Subtitle => "这是字幕：每行简短易读，不要合并行，也不要添加旁白。",
-    })
-}
-
 /// 这个调用机制下，纠正提示该用哪种语言写。
 ///
 /// 判断依据是**模型的提示词语言**：`ChineseOfficial` 与 `ChineseText` 都是
@@ -239,7 +165,6 @@ pub fn hint_lang_for(prompt_style: PromptStyle) -> crate::quality::HintLang {
 /// 追加在末尾——它是"本次输出的额外要求"，与模型家族无关。
 pub fn build_request(
     prompt_style: PromptStyle,
-    style: Style,
     source: &str,
     target: &str,
     glossary: &[GlossaryEntry],
@@ -249,7 +174,7 @@ pub fn build_request(
     match prompt_style {
         // ---- 现状：英文 system prompt，绝大多数模型走这条 ----
         PromptStyle::EnglishSystem => {
-            let mut sys = system_prompt(style, source, target, glossary);
+            let mut sys = system_prompt(source, target, glossary);
             if let Some(h) = hint {
                 sys.push_str("\n\nYour previous attempt had problems. ");
                 sys.push_str(h);
@@ -285,9 +210,6 @@ pub fn build_request(
                     .map(|e| format!("{}→{}", e.from, e.to))
                     .collect();
                 constraints.push(format!("【硬性要求】术语对照: {}", terms.join("、")));
-            }
-            if let Some(inst) = style_instruction_zh(style) {
-                constraints.push(format!("【注意】{inst}"));
             }
             if let Some(h) = hint {
                 constraints.push(format!("【注意】{h}"));
@@ -375,9 +297,6 @@ pub fn build_request(
             // 官方模板本身没有注入点，只能用这种"附注"形式；宁可朴素，
             // 也不要为了放约束而改掉模板主体——主体一改模型就不认了。
             let mut notes: Vec<String> = Vec::new();
-            if let Some(inst) = style_instruction_zh(style) {
-                notes.push(inst.to_string());
-            }
             if !glossary.is_empty() {
                 let terms: Vec<String> = glossary
                     .iter()
@@ -427,32 +346,6 @@ mod tests {
         }]
     }
 
-    #[test]
-    fn unknown_style_falls_back_to_general() {
-        assert_eq!(Style::parse(""), Style::General);
-        assert_eq!(Style::parse("nope"), Style::General);
-        assert_eq!(Style::parse("technical"), Style::Technical);
-        // 前后空白与大小写不该影响选择
-        assert_eq!(Style::parse(" FORMAL "), Style::Formal);
-    }
-
-    #[test]
-    fn wire_names_round_trip_and_are_unique() {
-        let styles = [
-            Style::General,
-            Style::Formal,
-            Style::Technical,
-            Style::Literary,
-            Style::Subtitle,
-        ];
-        let mut names = std::collections::HashSet::new();
-        for style in styles {
-            let name = style.as_str();
-            assert!(names.insert(name), "风格名重复: {name}");
-            assert_eq!(Style::parse(name), style, "{name} 应能解析回原风格");
-        }
-    }
-
     /// 提示词里必须写语言全称，不能写 `en` / `zh` 这种语种代码。
     ///
     /// 这条锁住一个真实 bug：早先写的是 `from the source language to zh`，
@@ -461,7 +354,7 @@ mod tests {
     /// 改成全称后实测 8 个用例全部正常（见 docs 里的实测记录）。
     #[test]
     fn general_prompt_keeps_the_original_wording() {
-        let prompt = system_prompt(Style::General, "en", "zh", &[]);
+        let prompt = system_prompt("en", "zh", &[]);
         assert!(prompt.starts_with("You are a professional translator."));
         // 语言必须写成全称
         assert!(
@@ -480,7 +373,7 @@ mod tests {
     /// 都会让模型困惑（实测连 `Hello world` 都不翻了）。
     #[test]
     fn auto_source_omits_the_source_language() {
-        let prompt = system_prompt(Style::General, "auto", "zh", &[]);
+        let prompt = system_prompt("auto", "zh", &[]);
         assert!(
             prompt.contains("into Chinese (Simplified)"),
             "自动检测应当只说翻成什么: {prompt}"
@@ -494,33 +387,13 @@ mod tests {
     /// 繁体目标必须写成 Traditional，否则模型可能给简体。
     #[test]
     fn traditional_chinese_is_distinct_from_simplified() {
-        let simplified = system_prompt(Style::General, "en", "zh", &[]);
-        let traditional = system_prompt(Style::General, "en", "zh-tw", &[]);
+        let simplified = system_prompt("en", "zh", &[]);
+        let traditional = system_prompt("en", "zh-tw", &[]);
         assert!(simplified.contains("Chinese (Simplified)"), "{simplified}");
         assert!(traditional.contains("Chinese (Traditional)"), "{traditional}");
         assert_ne!(simplified, traditional);
     }
 
-    #[test]
-    fn each_style_appends_its_own_instruction() {
-        let base = system_prompt(Style::General, "en", "zh", &[]);
-        let technical = system_prompt(Style::Technical, "en", "zh", &[]);
-        assert!(technical.starts_with(&base), "风格要求应追加在基础提示之后");
-        assert!(technical.contains("technical content"));
-
-        let subtitle = system_prompt(Style::Subtitle, "en", "zh", &[]);
-        assert!(subtitle.contains("subtitle text"));
-        assert!(subtitle.contains(&base));
-    }
-
-    #[test]
-    fn glossary_is_kept_for_every_style() {
-        let prompt = system_prompt(Style::Literary, "en", "zh", &glossary());
-        assert!(prompt.contains("apple => 苹果"));
-        assert!(prompt.contains("literary or marketing copy"));
-    }
-
-    #[test]
     fn retry_hint_builds_on_the_styled_base() {
         let report = quality::check(
             "- apple\n- banana",
@@ -536,7 +409,6 @@ mod tests {
         // 重试请求必须建立在基础提示之上，并带上针对性的纠正要求
         let base = build_request(
             PromptStyle::EnglishSystem,
-            Style::Formal,
             "en",
             "zh",
             &glossary(),
@@ -545,7 +417,6 @@ mod tests {
         );
         let hinted = build_request(
             PromptStyle::EnglishSystem,
-            Style::Formal,
             "en",
             "zh",
             &glossary(),
@@ -568,14 +439,13 @@ mod tests {
     fn english_system_matches_legacy_behaviour() {
         let req = build_request(
             PromptStyle::EnglishSystem,
-            Style::Technical,
             "en",
             "zh",
             &glossary(),
             "hello",
             None,
         );
-        let legacy = system_prompt(Style::Technical, "en", "zh", &glossary());
+        let legacy = system_prompt("en", "zh", &glossary());
 
         assert_eq!(req.messages[0]["role"], "system");
         assert_eq!(req.messages[0]["content"], legacy.as_str());
@@ -590,7 +460,6 @@ mod tests {
     fn chinese_text_puts_everything_in_one_user_message() {
         let req = build_request(
             PromptStyle::ChineseText,
-            Style::Formal,
             "en",
             "zh",
             &glossary(),
@@ -608,8 +477,6 @@ mod tests {
         // 术语按它的【硬性要求】格式给出
         assert!(content.contains("【硬性要求】"), "{content}");
         assert!(content.contains("apple→苹果"), "{content}");
-        // 风格按【注意】给出
-        assert!(content.contains("【注意】"), "{content}");
         assert!(content.contains("只输出译文"), "{content}");
     }
 
@@ -618,7 +485,6 @@ mod tests {
     fn template_kwargs_carries_language_codes() {
         let req = build_request(
             PromptStyle::TemplateKwargs,
-            Style::General,
             "zh",
             "ja",
             &[],
@@ -641,7 +507,6 @@ mod tests {
     fn template_kwargs_auto_source_is_not_english() {
         let req = build_request(
             PromptStyle::TemplateKwargs,
-            Style::General,
             "auto",
             "zh",
             &[],
@@ -656,7 +521,6 @@ mod tests {
     fn delimiter_variant_embeds_language_markers() {
         let req = build_request(
             PromptStyle::Delimiter,
-            Style::General,
             "en",
             "zh",
             &[],
@@ -673,7 +537,6 @@ mod tests {
     fn language_pair_puts_code_in_system() {
         let req = build_request(
             PromptStyle::LanguagePair,
-            Style::General,
             "en",
             "zh",
             &[],
@@ -690,7 +553,6 @@ mod tests {
     fn chinese_official_matches_the_trained_template() {
         let req = build_request(
             PromptStyle::ChineseOfficial,
-            Style::General,
             "en",
             "zh",
             &[],
@@ -720,7 +582,6 @@ mod tests {
     fn chinese_official_distinguishes_traditional() {
         let simplified = build_request(
             PromptStyle::ChineseOfficial,
-            Style::General,
             "en",
             "zh",
             &[],
@@ -729,7 +590,6 @@ mod tests {
         );
         let traditional = build_request(
             PromptStyle::ChineseOfficial,
-            Style::General,
             "en",
             "zh-tw",
             &[],
@@ -748,7 +608,6 @@ mod tests {
     fn chinese_official_auto_source_stays_minimal() {
         let req = build_request(
             PromptStyle::ChineseOfficial,
-            Style::General,
             "auto",
             "zh",
             &[],
@@ -765,7 +624,6 @@ mod tests {
     fn chinese_official_appends_notes_but_keeps_template_intact() {
         let req = build_request(
             PromptStyle::ChineseOfficial,
-            Style::Technical,
             "en",
             "zh",
             &glossary(),
@@ -778,9 +636,8 @@ mod tests {
         assert!(content.starts_with("把下面的英语文本翻译成简体中文，不要额外解释。"));
         // 原文紧随其后
         assert!(content.contains("\n\nhello"));
-        // 三种附注都在原文之后
+        // 术语与纠正附注在原文之后（风格已移除）
         let after = content.split("hello").nth(1).unwrap_or("");
-        assert!(after.contains("技术内容"), "风格附注: {content}");
         assert!(after.contains("apple→苹果"), "术语附注: {content}");
         assert!(after.contains("keep every list marker"), "纠正附注: {content}");
     }
@@ -799,7 +656,6 @@ mod tests {
     fn template_kwargs_sends_the_bare_text_only() {
         let req = build_request(
             PromptStyle::TemplateKwargs,
-            Style::Technical,
             "en",
             "zh",
             &glossary(),
@@ -821,7 +677,6 @@ mod tests {
     fn template_kwargs_uses_tw_not_hant_for_traditional() {
         let req = build_request(
             PromptStyle::TemplateKwargs,
-            Style::General,
             "en",
             "zh-tw",
             &[],
@@ -839,12 +694,12 @@ mod tests {
     #[test]
     fn template_kwargs_language_codes() {
         let simp = build_request(
-            PromptStyle::TemplateKwargs, Style::General, "en", "zh", &[], "x", None,
+            PromptStyle::TemplateKwargs, "en", "zh", &[], "x", None,
         );
         assert_eq!(simp.template_kwargs.unwrap()["target_lang_code"], "zh-Hans");
 
         let en = build_request(
-            PromptStyle::TemplateKwargs, Style::General, "zh", "en", &[], "x", None,
+            PromptStyle::TemplateKwargs, "zh", "en", &[], "x", None,
         );
         let kw = en.template_kwargs.unwrap();
         assert_eq!(kw["source_lang_code"], "zh-Hans");
@@ -865,7 +720,6 @@ mod tests {
         ] {
             let req = build_request(
                 style,
-                Style::General,
                 "en",
                 "zh",
                 &[],

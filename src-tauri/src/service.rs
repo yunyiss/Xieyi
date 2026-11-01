@@ -9,7 +9,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use crate::models;
 use crate::params::{self, Thinking};
 use crate::paths;
-use crate::prompts::{self, Style};
+use crate::prompts;
 use crate::quality;
 use crate::runtime;
 use crate::translate as segmenter;
@@ -179,7 +179,6 @@ pub struct TranslateRequest {
     pub target: String,
     /// 翻译风格（general/formal/technical/literary/subtitle），空值按 general。
     #[serde(default)]
-    pub style: String,
     pub text: String,
 }
 
@@ -507,12 +506,11 @@ impl Service {
         model: &str,
         source: &str,
         target: &str,
-        style: Style,
         glossary: &[GlossaryEntry],
         text: &str,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<(String, SegmentStats), String> {
-        let key = cache_key(style, model, source, target, glossary, text);
+        let key = cache_key(model, source, target, glossary, text);
 
         if let Some((hit, stats)) = state.cache.lock().await.get(&key).cloned() {
             if let Some(id) = request_id {
@@ -546,7 +544,6 @@ impl Service {
         log_profile_once(model, &profile);
         let request = prompts::build_request(
             profile.style,
-            style,
             source,
             target,
             glossary,
@@ -593,16 +590,15 @@ impl Service {
                 .iter()
                 .all(|i| matches!(i, quality::Issue::InstructionLeak));
 
-            let (retry_style, retry_glossary, retry_hint) = if leak_only {
-                (prompts::Style::General, &[][..], None)
+            let (retry_glossary, retry_hint) = if leak_only {
+                (&[][..], None)
             } else {
                 let hint = best_report.retry_hint(prompts::hint_lang_for(profile.style));
-                (style, glossary, hint)
+                (glossary, hint)
             };
 
             let retry = prompts::build_request(
                 profile.style,
-                retry_style,
                 source,
                 target,
                 retry_glossary,
@@ -1350,7 +1346,6 @@ mod tests {
         // 这里只保留一条最小断言，防止回归到"system+user"之外的结构。
         let req = prompts::build_request(
             models::PromptStyle::EnglishSystem,
-            Style::General,
             "en",
             "zh",
             &[],
@@ -1548,7 +1543,6 @@ pub(crate) fn load_glossary(app: &AppHandle) -> Vec<GlossaryEntry> {
 }
 
 fn cache_key(
-    style: Style,
     model: &str,
     source: &str,
     target: &str,
@@ -1560,9 +1554,8 @@ fn cache_key(
         .map(|e| format!("{}={}", e.from, e.to))
         .collect();
     format!(
-        "{model}\u{1}{style}\u{1}{source}\u{1}{target}\u{1}{}\u{1}{text}",
-        terms.join("\u{1}"),
-        style = style.as_str()
+        "{model}\u{1}{source}\u{1}{target}\u{1}{}\u{1}{text}",
+        terms.join("\u{1}")
     )
 }
 
@@ -1584,7 +1577,6 @@ pub async fn translate(
     state.cancel.store(false, Ordering::Relaxed);
 
     let glossary = load_glossary(&app);
-    let style = Style::parse(&request.style);
     let segments = segmenter::split_segments(&request.text, 1200);
     let total = segments.len();
     let _ = app.emit("translate://progress", TranslateProgress { done: 0, total });
@@ -1604,7 +1596,6 @@ pub async fn translate(
                 &request.model,
                 &request.source,
                 &request.target,
-                style,
                 &glossary,
                 &segment.text,
                 &state.cancel,
