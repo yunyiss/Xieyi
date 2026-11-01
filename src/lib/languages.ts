@@ -23,6 +23,11 @@ export const SOURCE_LANGUAGES: LanguageOption[] = [
   { value: "de", label: "德语" },
   { value: "es", label: "西班牙语" },
   { value: "ru", label: "俄语" },
+  { value: "pt", label: "葡萄牙语" },
+  { value: "it", label: "意大利语" },
+  { value: "ar", label: "阿拉伯语" },
+  { value: "th", label: "泰语" },
+  { value: "vi", label: "越南语" },
 ];
 
 /** 译文语言：没有「自动检测」，其余同上。 */
