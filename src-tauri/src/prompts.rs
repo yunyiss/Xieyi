@@ -525,6 +525,7 @@ mod tests {
                 from: "apple",
                 to: "苹果",
             }],
+            "",
         );
         assert!(!report.is_ok());
 

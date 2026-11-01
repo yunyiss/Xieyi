@@ -45,6 +45,25 @@ pub enum Issue {
     /// 判定不能只看"相等"——`API`、`OK`、`PDF` 本来就该原样保留。
     /// 具体规则见 [`should_ignore_untranslated`]。
     Untranslated,
+    /// 译文的文字系统跟目标语言对不上（要中文却给英文、要俄语却给拉丁字母…）。
+    ///
+    /// 与 [`Issue::Untranslated`] 的区别：那条是"一个字都没改"，
+    /// 这条是"确实换成了别的东西，但换错了语言"。
+    /// 典型场景：模型不支持目标语言，退回到它最熟的英语。
+    WrongScript {
+        /// 目标语言要求的文字系统名，用于提示
+        expected: &'static str,
+    },
+    /// 目标语言是简体/繁体之一，但译文用的是另一种字形。
+    ///
+    /// 只有目标为 `zh`（简体）或 `zh-tw`（繁体）时才检查，
+    /// 其他语言没有这种"同语言两种字形"的问题。
+    WrongVariant {
+        /// 目标要求的是简体还是繁体
+        expected: &'static str,
+        /// 实际检出另一种字形的字数
+        found: usize,
+    },
 }
 
 impl Issue {
@@ -61,6 +80,12 @@ impl Issue {
             Issue::Structure(kinds) => format!("结构丢失（{}）", kinds.join("、")),
             Issue::Glossary(terms) => format!("术语未命中（{}）", terms.join("、")),
             Issue::Untranslated => "译文与原文完全一致，未发生实际翻译".into(),
+            Issue::WrongScript { expected } => {
+                format!("译文不是{expected}，可能翻成了其他语言")
+            }
+            Issue::WrongVariant { expected, found } => {
+                format!("目标为{expected}，但译文检出 {found} 处另一种字形")
+            }
         }
     }
 }
@@ -180,6 +205,23 @@ impl Report {
                      even for very short or single-word input. Only leave text unchanged \
                      when it is a proper noun, code, or a term that is conventionally \
                      written the same way in the target language."
+                        .into()
+                }),
+                Issue::WrongScript { expected } => lines.push(if zh {
+                    format!(
+                        "上一次的译文不是{expected}，可能翻成了其他语言。请用{expected}重新翻译。"
+                    )
+                } else {
+                    format!(
+                        "Your previous answer was not written in the expected target language. Re-translate it properly."
+                    )
+                }),
+                Issue::WrongVariant { expected, .. } => lines.push(if zh {
+                    format!(
+                        "上一次的译文用错了字形，目标是{expected}。请用{expected}的标准字形重新输出。"
+                    )
+                } else {
+                    "Your previous answer used the wrong character variants for the target language. Use the standard forms."
                         .into()
                 }),
             }
@@ -412,8 +454,7 @@ fn strip_paths(text: &str) -> String {
 ///
 /// 返回 `true` 表示**应当忽略**（原样返回是合理的），
 /// 返回 `false` 表示这是一次真正的"没翻译"，要报 [`Issue::Untranslated`]。
-fn should_ignore_untranslated(source: &str) -> bool {
-    // 纯数字、标点、符号：没什么可翻的
+fn should_ignore_untranslated(source: &str) -> bool {    // 纯数字、标点、符号：没什么可翻的
     let stripped = strip_for_compare(source);
     let meaningful: String = stripped
         .chars()
@@ -498,8 +539,245 @@ fn missed_terms(source: &str, target: &str, terms: &[Term]) -> Vec<String> {
         .collect()
 }
 
+// ============================================================================
+// 语言一致性：译文到底是不是目标语言
+// ============================================================================
+//
+// 解决的问题：模型不支持目标语言时，会**静默退回到它最熟的语言**。
+// 典型例子是中文模型把日语翻成中文、或小模型把繁体翻成简体——
+// 长度、结构、术语全都正常，只有"语言不对"这一项过不去。
+//
+// 做法是**按文字系统**（script）判断，而不是做语言识别：
+//   - 要中文却一个汉字都没有 → 明显错了
+//   - 要日语却只有汉字没有假名 → 大概率翻成了中文
+//   - 要简体却满是繁体字 → 字形不对
+//
+// 只做"文字系统"这一层，不引入语言识别模型：零依赖、微秒级，
+// 能抓住绝大多数"退回到别的语言"，而不会误伤"译文里夹了英文术语"。
+
+/// 一个语言要求什么文字系统。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Script {
+    /// 汉字（简体、繁体都算）
+    Han,
+    /// 日语：汉字 + 假名，**必须有假名**
+    Japanese,
+    /// 韩语：谚文
+    Hangul,
+    /// 拉丁字母
+    Latin,
+    /// 西里尔字母
+    Cyrillic,
+    /// 阿拉伯字母
+    Arabic,
+    /// 泰文
+    Thai,
+    /// 不认识的语言，不做检查
+    Unknown,
+}
+
+/// 目标语言 → 应该出现什么文字。
+fn script_of(lang: &str) -> Script {
+    match lang {
+        "zh" | "zh-tw" | "zh-hant" => Script::Han,
+        "ja" => Script::Japanese,
+        "ko" => Script::Hangul,
+        "en" | "fr" | "de" | "es" | "pt" | "it" | "vi" => Script::Latin,
+        "ru" => Script::Cyrillic,
+        "ar" => Script::Arabic,
+        "th" => Script::Thai,
+        _ => Script::Unknown,
+    }
+}
+
+/// 文字系统在提示语里的中文名。
+fn script_label(script: Script) -> &'static str {
+    match script {
+        Script::Han => "中文",
+        Script::Japanese => "日文",
+        Script::Hangul => "韩文",
+        Script::Latin => "拉丁字母文字",
+        Script::Cyrillic => "西里尔字母文字",
+        Script::Arabic => "阿拉伯文",
+        Script::Thai => "泰文",
+        Script::Unknown => "目标语言",
+    }
+}
+
+fn is_han(c: char) -> bool {
+    ('\u{4e00}'..='\u{9fff}').contains(&c)      // CJK 统一表意文字
+        || ('\u{3400}'..='\u{4dbf}').contains(&c) // 扩展 A
+        || ('\u{f900}'..='\u{faff}').contains(&c) // 兼容表意文字
+}
+
+fn is_kana(c: char) -> bool {
+    ('\u{3040}'..='\u{309f}').contains(&c) || ('\u{30a0}'..='\u{30ff}').contains(&c)
+}
+
+fn is_hangul(c: char) -> bool {
+    ('\u{ac00}'..='\u{d7af}').contains(&c) || ('\u{1100}'..='\u{11ff}').contains(&c)
+}
+
+fn is_latin(c: char) -> bool {
+    c.is_ascii_alphabetic() || ('\u{00c0}'..='\u{024f}').contains(&c)
+}
+
+fn is_cyrillic(c: char) -> bool {
+    ('\u{0400}'..='\u{04ff}').contains(&c)
+}
+
+fn is_arabic(c: char) -> bool {
+    ('\u{0600}'..='\u{06ff}').contains(&c)
+}
+
+fn is_thai(c: char) -> bool {
+    ('\u{0e00}'..='\u{0e7f}').contains(&c)
+}
+
+/// 经常用的繁简差异字（简体形 → 繁体形）。
+///
+/// 不追求完整（完整有两千多对），只收**高频**的：
+/// 只要一段译文里出现其中几个繁体形，就足以判断字形不对。
+/// 反过来，简体形出现在繁体译文里同理。
+const HAN_SIMPLIFIED: &[char] = &[
+    '设', '历', '网', '络', '简', '体', '关', '闭', '开', '启', '档', '案', '数', '据', '库',
+    '这', '个', '为', '与', '说', '时', '会', '经', '认', '证', '错', '误', '验', '测', '试',
+    '现', '点', '击', '选', '择', '项', '图', '标', '页', '面', '显', '示', '隐', '藏', '复',
+    '制', '粘', '贴', '删', '除', '修', '改', '查', '询', '过', '滤', '导', '出', '总', '结',
+    '报', '表', '统', '计', '计', '算', '应', '用', '软', '件', '系', '统', '机', '器', '学',
+];
+
+const HAN_TRADITIONAL: &[char] = &[
+    '設', '歷', '網', '絡', '簡', '體', '關', '閉', '開', '啟', '檔', '案', '數', '據', '庫',
+    '這', '個', '為', '與', '說', '時', '會', '經', '認', '證', '錯', '誤', '驗', '測', '試',
+    '現', '點', '擊', '選', '擇', '項', '圖', '標', '頁', '面', '顯', '示', '隱', '藏', '複',
+    '製', '粘', '貼', '刪', '除', '修', '改', '查', '詢', '過', '濾', '導', '出', '總', '結',
+    '報', '表', '統', '計', '計', '算', '應', '用', '軟', '件', '系', '統', '機', '器', '學',
+];
+
+/// 数一数文本里出现了几个指定集合的字。
+fn count_chars_in(text: &str, set: &[char]) -> usize {
+    text.chars().filter(|c| set.contains(c)).count()
+}
+
+/// 检查译文用的文字系统对不对。
+///
+/// 只报"明显不对"的情况：
+/// - 目标文字系统一个字都没有（要中文却全英文）
+/// - 日语没有假名（翻成了中文或英文）
+///
+/// **故意不报"混入了少量其他文字"**：技术文档里夹英文太常见了，
+/// 那是正常的，不是翻译失败。
+fn check_script(target_lang: &str, translated: &str) -> Option<Issue> {
+    let script = script_of(target_lang);
+    if script == Script::Unknown {
+        return None;
+    }
+
+    let chars: Vec<char> = translated.chars().filter(|c| c.is_alphanumeric()).collect();
+    if chars.is_empty() {
+        return None; // 空输出由 Empty 管
+    }
+
+    match script {
+        Script::Han => {
+            if !chars.iter().any(|c| is_han(*c)) {
+                return Some(Issue::WrongScript {
+                    expected: script_label(script),
+                });
+            }
+        }
+        Script::Japanese => {
+            // 日语必须出现假名。只有汉字说明多半翻成了中文。
+            let has_kana = chars.iter().any(|c| is_kana(*c));
+            let has_han = chars.iter().any(|c| is_han(*c));
+            if !has_kana && has_han {
+                return Some(Issue::WrongScript {
+                    expected: script_label(script),
+                });
+            }
+        }
+        Script::Hangul => {
+            if !chars.iter().any(|c| is_hangul(*c)) {
+                return Some(Issue::WrongScript {
+                    expected: script_label(script),
+                });
+            }
+        }
+        Script::Latin => {
+            if !chars.iter().any(|c| is_latin(*c)) {
+                return Some(Issue::WrongScript {
+                    expected: script_label(script),
+                });
+            }
+        }
+        Script::Cyrillic => {
+            if !chars.iter().any(|c| is_cyrillic(*c)) {
+                return Some(Issue::WrongScript {
+                    expected: script_label(script),
+                });
+            }
+        }
+        Script::Arabic => {
+            if !chars.iter().any(|c| is_arabic(*c)) {
+                return Some(Issue::WrongScript {
+                    expected: script_label(script),
+                });
+            }
+        }
+        Script::Thai => {
+            if !chars.iter().any(|c| is_thai(*c)) {
+                return Some(Issue::WrongScript {
+                    expected: script_label(script),
+                });
+            }
+        }
+        Script::Unknown => {}
+    }
+    None
+}
+
+/// 检查简繁字形对不对。
+///
+/// 只在目标是简体（`zh`）或繁体（`zh-tw`）时检查。
+/// 判定用**数量对比**而不是"出现即报"：某些字在两种字形里都合法，
+/// 要看整体偏向哪一边。
+fn check_variant(target_lang: &str, translated: &str) -> Option<Issue> {
+    match target_lang {
+        "zh" => {
+            // 要简体：繁体字明显多于简体字才算错
+            let simp = count_chars_in(translated, HAN_SIMPLIFIED);
+            let trad = count_chars_in(translated, HAN_TRADITIONAL);
+            if trad > simp && trad >= 2 {
+                return Some(Issue::WrongVariant {
+                    expected: "简体中文",
+                    found: trad,
+                });
+            }
+        }
+        "zh-tw" | "zh-hant" => {
+            // 要繁体：简体字明显多于繁体字才算错。
+            // 注意繁体译文里也可能出现简体形（有些字本来就没差异），
+            // 所以要求"简体确实占多数且有 2 个以上"。
+            let simp = count_chars_in(translated, HAN_SIMPLIFIED);
+            let trad = count_chars_in(translated, HAN_TRADITIONAL);
+            if simp > trad && simp >= 2 {
+                return Some(Issue::WrongVariant {
+                    expected: "繁体中文",
+                    found: simp,
+                });
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
 /// 对一个片段的译文做全套检查。
-pub fn check(source: &str, target: &str, terms: &[Term]) -> Report {
+///
+/// `target_lang` 是目标语言代码（`zh` / `zh-tw` / `ja`…），用于判断
+/// 译文用的文字系统对不对。传空串或未知语言时跳过这项检查。
+pub fn check(source: &str, target: &str, terms: &[Term], target_lang: &str) -> Report {
     let mut issues = Vec::new();
 
     let trimmed = target.trim();
@@ -516,6 +794,15 @@ pub fn check(source: &str, target: &str, terms: &[Term]) -> Report {
     // 所以必须单独抓。是否该放过（`API` 这类）由 should_ignore 决定。
     if trimmed == source.trim() && !should_ignore_untranslated(source) {
         issues.push(Issue::Untranslated);
+    }
+
+    // 语言一致性：模型不支持目标语言时会静默退回它最熟的语言，
+    // 长度和结构都正常，只有"语言不对"这一项能发现。
+    if let Some(issue) = check_script(target_lang, trimmed) {
+        issues.push(issue);
+    }
+    if let Some(issue) = check_variant(target_lang, trimmed) {
+        issues.push(issue);
     }
 
     let source_chars = non_space_count(source);
@@ -570,29 +857,21 @@ mod tests {
 
     #[test]
     fn empty_or_punctuation_only_is_flagged() {
-        assert!(!check("hello", "", &[]).is_ok());
-        assert!(!check("hello", "   ", &[]).is_ok());
-        assert!(!check("hello", "...", &[]).is_ok());
+        assert!(!check("hello", "", &[], "").is_ok());
+        assert!(!check("hello", "   ", &[], "").is_ok());
+        assert!(!check("hello", "...", &[], "").is_ok());
         // 空输出只报一条，不叠"过短"
-        assert_eq!(check("hello", "", &[]).issues.len(), 1);
+        assert_eq!(check("hello", "", &[], "").issues.len(), 1);
     }
 
     #[test]
     fn normal_matches_are_clean() {
         // 英文→中文，字数约一半
-        assert!(check(
-            "Hello world, this is a test sentence.",
-            "你好世界，这是一句测试文字。",
-            &[]
-        )
+        assert!(check("Hello world, this is a test sentence.", "你好世界，这是一句测试文字。", &[], "")
         .is_ok());
 
         // 中文→英文，字数翻倍也是正常的
-        assert!(check(
-            "这是一句用来测试的中文句子，长度适中。",
-            "This is a Chinese sentence used for testing, and its length is moderate.",
-            &[]
-        )
+        assert!(check("这是一句用来测试的中文句子，长度适中。", "This is a Chinese sentence used for testing, and its length is moderate.", &[], "")
         .is_ok());
     }
 
@@ -600,7 +879,7 @@ mod tests {
     fn truncated_output_is_flagged() {
         let source = "这是一段比较长的说明文字，用来模拟被截断的情况。它包含多个句子，模型只翻了开头就停了。";
         let target = "这";
-        let report = check(source, target, &[]);
+        let report = check(source, target, &[], "");
         assert!(matches!(report.issues[0], Issue::TooShort { .. }));
     }
 
@@ -608,7 +887,7 @@ mod tests {
     fn verbose_output_is_flagged() {
         let source = "Hello.";
         let target = "你好。".repeat(40);
-        let report = check(source, &target, &[]);
+        let report = check(source, &target, &[], "");
         assert!(report.issues.iter().any(|i| matches!(i, Issue::TooLong { .. })));
     }
 
@@ -616,21 +895,21 @@ mod tests {
     fn lost_list_structure_is_flagged() {
         let source = "- apple\n- banana\n- cherry";
         let target = "苹果香蕉樱桃";
-        let report = check(source, target, &[]);
+        let report = check(source, target, &[], "");
         assert!(report
             .issues
             .iter()
             .any(|i| matches!(i, Issue::Structure(_))));
 
         // 保留列表标记就不该报
-        assert!(check(source, "- 苹果\n- 香蕉\n- 樱桃", &[]).is_ok());
+        assert!(check(source, "- 苹果\n- 香蕉\n- 樱桃", &[], "").is_ok());
     }
 
     #[test]
     fn lost_code_fence_is_flagged() {
         let source = "用法：\n```\nrun --now\n```";
         let target = "用法：运行 --now";
-        assert!(check(source, target, &[])
+        assert!(check(source, target, &[], "")
             .issues
             .iter()
             .any(|i| matches!(i, Issue::Structure(_))));
@@ -640,7 +919,7 @@ mod tests {
     fn lost_subtitle_timestamp_is_flagged() {
         let source = "1\n00:00:01,000 --> 00:00:03,500\nHello";
         let target = "1\n你好";
-        let report = check(source, target, &[]);
+        let report = check(source, target, &[], "");
         assert!(report
             .issues
             .iter()
@@ -650,7 +929,7 @@ mod tests {
     #[test]
     fn arrow_without_colon_is_not_a_timestamp() {
         // 普通文本里的箭头不该被当成 srt
-        assert!(check("a --> b", "甲 --> 乙", &[]).is_ok());
+        assert!(check("a --> b", "甲 --> 乙", &[], "").is_ok());
     }
 
     #[test]
@@ -659,6 +938,7 @@ mod tests {
             "The server is down.",
             "服务宕机了。",
             &terms(&[("server", "服务器")]),
+            "",
         );
         assert!(matches!(
             report.issues.last(),
@@ -666,10 +946,10 @@ mod tests {
         ));
 
         // 用上了指定译法就通过
-        assert!(check("The server is down.", "服务器宕机了。", &terms(&[("server", "服务器")]))
+        assert!(check("The server is down.", "服务器宕机了。", &terms(&[("server", "服务器")]), "")
             .is_ok());
         // 原词没出现在原文里，不检查
-        assert!(check("Hello.", "你好。", &terms(&[("server", "服务器")])).is_ok());
+        assert!(check("Hello.", "你好。", &terms(&[("server", "服务器")]), "").is_ok());
     }
 
     #[test]
@@ -679,30 +959,31 @@ mod tests {
             "- apple\n- banana",
             "红果和香蕉",
             &terms(&[("apple", "苹果")]),
+            "",
         );
         let hint = report.retry_hint(HintLang::English).expect("有问题就该给出提示");
         assert!(hint.contains("list marker"), "提示应点名列表：{hint}");
         assert!(hint.contains("apple => 苹果"), "提示应带上具体术语：{hint}");
 
-        assert!(check("hello", "你好", &[]).retry_hint(HintLang::English).is_none());
+        assert!(check("hello", "你好", &[], "").retry_hint(HintLang::English).is_none());
     }
 
     #[test]
     fn descriptions_are_specific_enough_for_the_ui() {
-        let report = check("hello world", "h", &[]);
+        let report = check("hello world", "h", &[], "");
         let text = report.describe();
         assert!(text.contains("截断"), "应说明是截断：{text}");
     }
 
     #[test]
     fn better_than_prefers_fewer_issues_then_longer_text() {
-        let bad = check("hello world foo bar", "x", &[]);
-        let good = check("hello world foo bar", "你好世界，富吧。", &[]);
+        let bad = check("hello world foo bar", "x", &[], "");
+        let good = check("hello world foo bar", "你好世界，富吧。", &[], "");
         assert!(better_than("你好世界，富吧。", &good, "x", &bad));
 
         // 问题同样多时，长的那个更可能是完整输出
-        let a = check("hello", "a", &[]);
-        let b = check("hello", "ab", &[]);
+        let a = check("hello", "a", &[], "");
+        let b = check("hello", "ab", &[], "");
         assert_eq!(a.issues.len(), b.issues.len());
         assert!(better_than("ab", &b, "a", &a));
         assert!(!better_than("a", &a, "ab", &b));
@@ -717,7 +998,7 @@ mod tests {
     #[test]
     fn unchanged_short_words_are_flagged() {
         for text in ["hello", "Apple", "goodbye", "Hello world", "thank you"] {
-            let report = check(text, text, &[]);
+            let report = check(text, text, &[], "");
             assert!(
                 report.issues.contains(&Issue::Untranslated),
                 "「{text}」原样返回应当被检出，实际: {:?}",
@@ -745,7 +1026,7 @@ mod tests {
             "%s",
             "C:\\Users\\file.txt",
         ] {
-            let report = check(text, text, &[]);
+            let report = check(text, text, &[], "");
             assert!(
                 !report.issues.contains(&Issue::Untranslated),
                 "「{text}」不该被当成未翻译，实际: {:?}",
@@ -761,7 +1042,7 @@ mod tests {
     #[test]
     fn one_translatable_word_is_enough_to_flag() {
         for text in ["PDF export", "API key settings", "OK to proceed"] {
-            let report = check(text, text, &[]);
+            let report = check(text, text, &[], "");
             assert!(
                 report.issues.contains(&Issue::Untranslated),
                 "「{text}」含需要翻译的词，应当被检出，实际: {:?}",
@@ -774,7 +1055,7 @@ mod tests {
     #[test]
     fn punctuation_and_numbers_are_not_flagged() {
         for text in ["123", "1.5", "---", "=>", "。", "...", "100%"] {
-            let report = check(text, text, &[]);
+            let report = check(text, text, &[], "");
             assert!(
                 !report.issues.contains(&Issue::Untranslated),
                 "「{text}」没有可翻内容，不该报未翻译"
@@ -785,9 +1066,9 @@ mod tests {
     /// 真的翻了就不该报（译文与原文不同）。
     #[test]
     fn actual_translation_is_not_flagged() {
-        let report = check("hello", "你好", &[]);
+        let report = check("hello", "你好", &[], "");
         assert!(!report.issues.contains(&Issue::Untranslated));
-        let report = check("Hello world", "你好，世界", &[]);
+        let report = check("Hello world", "你好，世界", &[], "");
         assert!(!report.issues.contains(&Issue::Untranslated));
     }
 
@@ -797,11 +1078,11 @@ mod tests {
     #[test]
     fn placeholders_are_stripped_before_comparing() {
         // 只剩占位符 → 放过
-        assert!(!check("{{count}}", "{{count}}", &[])
+        assert!(!check("{{count}}", "{{count}}", &[], "")
             .issues
             .contains(&Issue::Untranslated));
         // 占位符之外还有实词 → 报
-        assert!(check("Hello {{name}}", "Hello {{name}}", &[])
+        assert!(check("Hello {{name}}", "Hello {{name}}", &[], "")
             .issues
             .contains(&Issue::Untranslated));
     }
@@ -809,7 +1090,7 @@ mod tests {
     /// 重试提示必须明确说清"你在偷懒"，这是让它改对的关键。
     #[test]
     fn untranslated_retry_hint_says_what_went_wrong() {
-        let report = check("hello", "hello", &[]);
+        let report = check("hello", "hello", &[], "");
         let hint = report.retry_hint(HintLang::English).expect("应当有重试提示");
         assert!(
             hint.to_lowercase().contains("identical to the source"),
@@ -823,7 +1104,7 @@ mod tests {
     /// 中文提示才会被当成指令执行。
     #[test]
     fn chinese_hint_stays_chinese() {
-        let report = check("hello", "hello", &[]);
+        let report = check("hello", "hello", &[], "");
         let zh = report
             .retry_hint(HintLang::Chinese)
             .expect("应当有重试提示");
@@ -843,9 +1124,127 @@ mod tests {
     /// 两种语言必须真的不同，否则等于没做区分。
     #[test]
     fn hint_language_actually_changes_output() {
-        let report = check("hello", "hello", &[]);
+        let report = check("hello", "hello", &[], "");
         let en = report.retry_hint(HintLang::English).unwrap();
         let zh = report.retry_hint(HintLang::Chinese).unwrap();
         assert_ne!(en, zh);
+    }
+
+    // ---- 语言一致性 ----
+    //
+    // 模型不支持目标语言时会静默退回它最熟的语言。
+    // 这组测试既要抓住"翻错语言"，也不能误伤"技术文档夹英文"。
+
+    /// 要中文却一个汉字都没有 → 肯定错了。
+    #[test]
+    fn chinese_target_without_han_is_flagged() {
+        let report = check("hello world", "hello world", &[], "zh");
+        // 同时命中 Untranslated 与 WrongScript，只要能报出来就行
+        assert!(
+            report.issues.iter().any(|i| matches!(i, Issue::WrongScript { .. })),
+            "应当报文字系统不对：{:?}",
+            report.issues
+        );
+    }
+
+    /// 中文目标、译文也是中文 → 不报。
+    #[test]
+    fn chinese_target_with_han_is_clean() {
+        let report = check("hello", "你好", &[], "zh");
+        assert!(!report.issues.iter().any(|i| matches!(i, Issue::WrongScript { .. })));
+    }
+
+    /// 日语必须有假名；只有汉字说明翻成了中文。
+    #[test]
+    fn japanese_target_without_kana_is_flagged() {
+        // 只有汉字
+        let report = check("good morning", "早上好", &[], "ja");
+        assert!(
+            report.issues.iter().any(|i| matches!(i, Issue::WrongScript { .. })),
+            "只有汉字的日译应当报错：{:?}",
+            report.issues
+        );
+        // 有假名就对了
+        let ok = check("good morning", "おはようございます", &[], "ja");
+        assert!(!ok.issues.iter().any(|i| matches!(i, Issue::WrongScript { .. })));
+    }
+
+    /// 技术文档里夹英文术语是正常的，不能因此报错。
+    #[test]
+    fn mixed_scripts_are_not_flagged() {
+        let report = check(
+            "The API returns a 404 error",
+            "调用 API 返回 404 错误",
+            &[],
+            "zh",
+        );
+        assert!(
+            !report.issues.iter().any(|i| matches!(i, Issue::WrongScript { .. })),
+            "夹英文术语不应报错：{:?}",
+            report.issues
+        );
+    }
+
+    /// 要简体却全是繁体 → 报。
+    #[test]
+    fn traditional_output_for_simplified_target_is_flagged() {
+        let report = check(
+            "Good morning, how are you?",
+            "早上好，你最近怎麼樣？設定裡的網路關閉了。",
+            &[],
+            "zh",
+        );
+        assert!(
+            report.issues.iter().any(|i| matches!(i, Issue::WrongVariant { .. })),
+            "要简体给繁体应当报错：{:?}",
+            report.issues
+        );
+    }
+
+    /// 要繁体却全是简体 → 报。
+    #[test]
+    fn simplified_output_for_traditional_target_is_flagged() {
+        let report = check(
+            "Good morning, how are you?",
+            "早上好，你最近怎么样？设定里的网络关闭了。",
+            &[],
+            "zh-tw",
+        );
+        assert!(
+            report.issues.iter().any(|i| matches!(i, Issue::WrongVariant { .. })),
+            "要繁体给简体应当报错：{:?}",
+            report.issues
+        );
+    }
+
+    /// 字形对了就不报。
+    #[test]
+    fn correct_variant_is_clean() {
+        let simp = check("good", "很好，设定里的网络关闭了", &[], "zh");
+        assert!(!simp.issues.iter().any(|i| matches!(i, Issue::WrongVariant { .. })));
+
+        let trad = check("good", "很好，設定裡的網路關閉了", &[], "zh-tw");
+        assert!(!trad.issues.iter().any(|i| matches!(i, Issue::WrongVariant { .. })));
+    }
+
+    /// 不认识的语言不做检查，避免误伤。
+    #[test]
+    fn unknown_language_skips_script_check() {
+        let report = check("hello", "你好", &[], "");
+        assert!(!report.issues.iter().any(|i| matches!(i, Issue::WrongScript { .. })));
+        let report = check("hello", "你好", &[], "xx");
+        assert!(!report.issues.iter().any(|i| matches!(i, Issue::WrongScript { .. })));
+    }
+
+    /// 翻错语言时的重试提示要说清楚。
+    #[test]
+    fn wrong_script_hint_is_specific() {
+        let report = check("hello world", "hello world", &[], "zh");
+        let hint = report.retry_hint(HintLang::English).expect("应当有提示");
+        assert!(
+            hint.to_lowercase().contains("target language")
+                || hint.to_lowercase().contains("not written in"),
+            "提示要说明语言不对：{hint}"
+        );
     }
 }

@@ -569,7 +569,7 @@ impl Service {
         )
         .await?;
 
-        let report = quality::check(text, &first, &terms);
+        let report = quality::check(text, &first, &terms, target);
         // 首次检出的问题（用户看到的是"发现了什么"，不是重试之后的状态）
         let found = report.describe();
         let flagged = !report.is_ok();
@@ -609,7 +609,7 @@ impl Service {
             .await;
 
             if let Ok(second) = second {
-                let second_report = quality::check(text, &second, &terms);
+                let second_report = quality::check(text, &second, &terms, target);
                 // 只有确实更干净（或同样干净但更完整）才采用，避免越改越糟
                 if quality::better_than(&second, &second_report, &best, &best_report) {
                     best = second;
