@@ -255,6 +255,9 @@ export function Translate({
   const hasModels = models.length > 0;
   const ready = runtime?.installed && hasModels;
 
+  /** 质检检出、但重试后仍未修好的片段——要在译文区明确提示。 */
+  const unfixedQuality = quality.filter((q) => !q.fixed);
+
   const currentModelState =
     models.find((m) => m.id === model)?.state ?? "unloaded";
 
@@ -400,6 +403,27 @@ export function Translate({
             </span>
           </header>
           <div className="min-h-0 flex-1 overflow-auto px-3.5 py-3">
+            {/*
+              质检没修好时的提示。
+              做成“左侧竖线 + 淡字”的行内提示，而不是带红框的警告条：
+              红框会把整个译文区变成“错误状态”，但用户此时是有译文的，
+              只是质量存疑，不该让人以为整个结果作废。
+            */}
+            {unfixedQuality.length > 0 && output && !busy && (
+              <div
+                className="mb-2.5 pl-2.5 text-[11px] leading-relaxed"
+                style={{
+                  borderLeft: "2px solid var(--border-strong)",
+                  color: "var(--text-muted)",
+                }}
+                title={unfixedQuality
+                  .map((r) => `「${r.segment}…」${r.found}`)
+                  .join("\n")}
+              >
+                本次译文未通过质量检查，原因：{unfixedQuality[0].found}。
+                可尝试更换参数量更大的模型，或将结果转入对话页进一步调整。
+              </div>
+            )}
             {engineError && !output ? (
               <p className="m-0 text-[12px]" style={{ color: "var(--danger)" }}>
                 {engineError}

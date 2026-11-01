@@ -209,6 +209,21 @@ fn style_instruction_zh(style: Style) -> Option<&'static str> {
     })
 }
 
+/// 这个调用机制下，纠正提示该用哪种语言写。
+///
+/// 判断依据是**模型的提示词语言**：`ChineseOfficial` 与 `ChineseText` 都是
+/// 中文模型，给它们追加英文纠正提示会被当成待翻译内容——实测 Hy-MT2-1.8B
+/// 收到英文提示后，把提示词本身翻成中文吐了出来。
+pub fn hint_lang_for(prompt_style: PromptStyle) -> crate::quality::HintLang {
+    match prompt_style {
+        PromptStyle::ChineseOfficial | PromptStyle::ChineseText => {
+            crate::quality::HintLang::Chinese
+        }
+        // 其余机制按英文训练，纠正提示也用英文
+        _ => crate::quality::HintLang::English,
+    }
+}
+
 /// 按模型调用机制生成一次翻译请求。
 ///
 /// `hint` 是质检给出的纠正要求（重试时才有）。各风格的提示词都会把它
@@ -530,7 +545,7 @@ mod tests {
             "zh",
             &glossary(),
             "hello",
-            report.retry_hint().as_deref(),
+            report.retry_hint(crate::quality::HintLang::English).as_deref(),
         );
 
         let base_sys = base.messages[0]["content"].as_str().unwrap();

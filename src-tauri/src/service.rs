@@ -582,7 +582,9 @@ impl Service {
         // 再流一遍会在输出框里重复一遍；翻译页最后会用返回值整体覆盖显示。
         // 已经被取消就不重试了，那只会白跑一次请求。
         if !best_report.is_ok() && !cancel.load(Ordering::Relaxed) {
-            // 重试沿用同一个模型的调用机制，只把纠正提示塞进对应位置
+            // 重试沿用同一个模型的调用机制，只把纠正提示塞进对应位置。
+            // 提示词的语言要跟模型匹配：中文模板模型收到英文纠正会把它当正文翻译。
+            let hint = best_report.retry_hint(prompts::hint_lang_for(profile.style));
             let retry = prompts::build_request(
                 profile.style,
                 style,
@@ -590,7 +592,7 @@ impl Service {
                 target,
                 glossary,
                 text,
-                best_report.retry_hint().as_deref(),
+                hint.as_deref(),
             );
             let second = stream_completion_with(
                 app,
