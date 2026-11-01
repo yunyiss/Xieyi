@@ -582,17 +582,32 @@ impl Service {
         // 再流一遍会在输出框里重复一遍；翻译页最后会用返回值整体覆盖显示。
         // 已经被取消就不重试了，那只会白跑一次请求。
         if !best_report.is_ok() && !cancel.load(Ordering::Relaxed) {
-            // 重试沿用同一个模型的调用机制，只把纠正提示塞进对应位置。
-            // 提示词的语言要跟模型匹配：中文模板模型收到英文纠正会把它当正文翻译。
-            let hint = best_report.retry_hint(prompts::hint_lang_for(profile.style));
+            // 指令泄漏是特殊情况：模型把我们的附注当正文翻了。
+            // 这类模型（translategemma 等纯翻译器）**不接受任何附加内容**，
+            // 再给它一句纠正提示只会让泄漏更长（实测：重试输出比首次还脏）。
+            //
+            // 所以这种情况换策略：丢掉风格与术语，用最朴素的原文重试一次。
+            // 能拿到干净译文就算成功；拿不到至少不会再恶化。
+            let leak_only = best_report
+                .issues
+                .iter()
+                .all(|i| matches!(i, quality::Issue::InstructionLeak));
+
+            let (retry_style, retry_glossary, retry_hint) = if leak_only {
+                (prompts::Style::General, &[][..], None)
+            } else {
+                let hint = best_report.retry_hint(prompts::hint_lang_for(profile.style));
+                (style, glossary, hint)
+            };
+
             let retry = prompts::build_request(
                 profile.style,
-                style,
+                retry_style,
                 source,
                 target,
-                glossary,
+                retry_glossary,
                 text,
-                hint.as_deref(),
+                retry_hint.as_deref(),
             );
             let second = stream_completion_with(
                 app,

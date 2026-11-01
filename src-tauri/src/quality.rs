@@ -64,6 +64,24 @@ pub enum Issue {
         /// 实际检出另一种字形的字数
         found: usize,
     },
+    /// 译文里混进了我们发出去的**指令**。
+    ///
+    /// 纯翻译模型（translategemma 这类）的模板就是"把收到的全部内容翻成目标语言"，
+    /// 没有给"额外要求"留位置。我们把风格要求以 `[Note: ...]` 附在原文后面，
+    /// 它会把这段附注当成待翻译内容，翻出来拼在译文里：
+    ///
+    /// ```text
+    /// 输入：The server is down.\n\n[Note: This is technical content...]
+    /// 输出：服务器已停止运行。\n\n[注意：这属于技术内容：...]
+    /// ```
+    ///
+    /// 实测 4b 模型下，`formal`/`literary` 侥幸没触发，但 `technical`/`subtitle`
+    /// 三次全中，`Keep code unchanged.` 甚至两个词的 `Technical.` 也会被翻。
+    /// 所以这不是"提示太长"，是"任何附加内容"。
+    ///
+    /// 检测这条不需要知道模型支不支持风格——这正是它的价值：
+    /// 未适配过的新模型犯同样的错，一样能被抓住。
+    InstructionLeak,
 }
 
 impl Issue {
@@ -86,6 +104,7 @@ impl Issue {
             Issue::WrongVariant { expected, found } => {
                 format!("目标为{expected}，但译文检出 {found} 处另一种字形")
             }
+            Issue::InstructionLeak => "译文里混入了指令内容，模型把附注也翻了出来".into(),
         }
     }
 }
@@ -222,6 +241,15 @@ impl Report {
                     )
                 } else {
                     "Your previous answer used the wrong character variants for the target language. Use the standard forms."
+                        .into()
+                }),
+                Issue::InstructionLeak => lines.push(if zh {
+                    "上一次的输出把说明文字也翻译出来了。只翻译正文，不要包含任何方括号里的说明。"
+                        .into()
+                } else {
+                    "Your previous answer included instruction text that was translated along \
+                     with the content. Output only the translation of the source text — never \
+                     include bracketed notes, labels or instructions."
                         .into()
                 }),
             }
@@ -737,6 +765,57 @@ fn check_script(target_lang: &str, translated: &str) -> Option<Issue> {
     None
 }
 
+/// 检查译文里有没有混进我们发出去的指令。
+///
+/// 我们给风格/术语/纠正提示加的是 `[Note: ...]` `[Glossary: ...]`
+/// `[Correction: ...]` 这类方括号标记。正常译文里几乎不会出现
+/// 结构化方括号（[1] 这种引用除外），所以"输出里出现方括号标记"
+/// 是相当强的信号。
+///
+/// 为什么不逐字比对指令原文：模型会把它**翻译**成目标语言
+/// （`[Note: keep code unchanged]` → `[注意：请保持代码不变]`），
+/// 原文根本对不上。只能看标记形态。
+fn check_instruction_leak(translated: &str) -> Option<Issue> {
+    // 我们自己发出的标记（英文原形，及各语言翻译后的常见形态）
+    const MARKERS: &[&str] = &[
+        "[note:",
+        "[注意：",
+        "[注意:",
+        "[glossary:",
+        "[术语",
+        "[correction:",
+        "[纠正",
+    ];
+
+    let lower = translated.to_lowercase();
+    // 英文标记用小写比对，中文标记原样比对
+    for marker in MARKERS {
+        let needle = if marker.is_ascii() {
+            marker.to_string()
+        } else {
+            marker.to_string()
+        };
+        if lower.contains(&needle.to_lowercase()) {
+            return Some(Issue::InstructionLeak);
+        }
+    }
+
+    // 兜底：中文方括号里出现"注意/术语/纠正"这类词。
+    // 译成日文/韩文时形态不同，这条只管中文。
+    for segment in translated.split('[').skip(1) {
+        if let Some(end) = segment.find([']', '】']) {
+            let inner = &segment[..end];
+            if inner.contains("注意") || inner.contains("術語") || inner.contains("术语")
+                || inner.contains("糾正") || inner.contains("纠正")
+            {
+                return Some(Issue::InstructionLeak);
+            }
+        }
+    }
+
+    None
+}
+
 /// 检查简繁字形对不对。
 ///
 /// 只在目标是简体（`zh`）或繁体（`zh-tw`）时检查。
@@ -802,6 +881,12 @@ pub fn check(source: &str, target: &str, terms: &[Term], target_lang: &str) -> R
         issues.push(issue);
     }
     if let Some(issue) = check_variant(target_lang, trimmed) {
+        issues.push(issue);
+    }
+
+    // 指令泄漏：纯翻译模型会把我们加的附注当正文一起翻出来。
+    // 与语言无关，任何模型任何语言都可能中招，所以放在通用检查里。
+    if let Some(issue) = check_instruction_leak(trimmed) {
         issues.push(issue);
     }
 
@@ -1245,6 +1330,95 @@ mod tests {
             hint.to_lowercase().contains("target language")
                 || hint.to_lowercase().contains("not written in"),
             "提示要说明语言不对：{hint}"
+        );
+    }
+
+    // ---- 指令泄漏（InstructionLeak）----
+    //
+    // 纯翻译模型会把我们加的附注当正文一起翻出来。
+    // 这组测试的难点不在"抓住自己发出的标记"，而在"不误伤正常译文里的方括号"。
+
+    /// 实测得到的真实污染输出，必须抓住。
+    #[test]
+    fn leaked_instruction_is_flagged() {
+        let cases = [
+            // 实测：translategemma-4b + technical 风格
+            "服务器已停止运行。\n\n[注意：这属于技术内容：请务必保留产品名称、代码标识、数字和术语的原文；优先考虑准确性，而非流畅性。]",
+            // 实测：极短提示也会被翻
+            "服务器已停止工作。\n\n[注意：技术相关]",
+            // 英文原形没被翻的情况
+            "服务器已停止工作。\n\n[Note: keep code unchanged]",
+            // 术语表泄漏
+            "服务器已停止工作。[术语：server=服务器]",
+        ];
+        for text in cases {
+            let report = check("The server is down.", text, &[], "zh");
+            assert!(
+                report.issues.contains(&Issue::InstructionLeak),
+                "应当检出指令泄漏：{text:?}"
+            );
+        }
+    }
+
+    /// 正常译文里的方括号不能误伤。
+    ///
+    /// 这条比上一条重要：误报会让正常翻译被拒收。
+    #[test]
+    fn normal_brackets_are_not_flagged() {
+        let cases = [
+            // 引用标记
+            "详见文档[1]和[2]。",
+            // 代码下标
+            "调用 array[0] 取第一个元素。",
+            // 普通方括号内容
+            "这是一段说明（如下）。",
+            // 含"注意"但不在方括号里
+            "请注意安全。",
+        ];
+        for text in cases {
+            let report = check("Some source text here.", text, &[], "zh");
+            assert!(
+                !report.issues.contains(&Issue::InstructionLeak),
+                "不应当误报：{text:?}"
+            );
+        }
+    }
+
+    /// 英文译文里的方括号同样不上报。
+    #[test]
+    fn english_brackets_are_not_flagged() {
+        let cases = [
+            "See the documentation [1] for details.",
+            "The array[0] holds the first element.",
+            "This is a normal sentence (with parentheses).",
+        ];
+        for text in cases {
+            let report = check("一些中文原文。", text, &[], "en");
+            assert!(
+                !report.issues.contains(&Issue::InstructionLeak),
+                "不应当误报：{text:?}"
+            );
+        }
+    }
+
+    /// 泄漏时的重试提示要点名“不要包含方括号说明”。
+    #[test]
+    fn instruction_leak_hint_is_specific() {
+        let report = check(
+            "The server is down.",
+            "服务器已停止工作。[注意：技术内容]",
+            &[],
+            "zh",
+        );
+        let en = report.retry_hint(HintLang::English).expect("应当有提示");
+        assert!(
+            en.contains("bracketed") || en.contains("instruction text"),
+            "英文提示要说明不要带方括号：{en}"
+        );
+        let zh = report.retry_hint(HintLang::Chinese).expect("应当有提示");
+        assert!(
+            zh.contains("方括号"),
+            "中文提示要说明不要带方括号：{zh}"
         );
     }
 }
