@@ -85,6 +85,24 @@ pub enum Issue {
 }
 
 impl Issue {
+    /// 稳定的原因码，供前端按类型区分展示。
+    ///
+    /// 为什么不让前端解析 `describe()` 的中文：文案会改，解析会脆。
+    /// 这里给机器读的固定标识，`describe()` 给人和界面读的说明。
+    pub fn code(&self) -> &'static str {
+        match self {
+            Issue::Empty => "empty",
+            Issue::TooShort { .. } => "too-short",
+            Issue::TooLong { .. } => "too-long",
+            Issue::Structure(_) => "structure",
+            Issue::Glossary(_) => "glossary",
+            Issue::Untranslated => "untranslated",
+            Issue::WrongScript { .. } => "wrong-script",
+            Issue::WrongVariant { .. } => "wrong-variant",
+            Issue::InstructionLeak => "instruction-leak",
+        }
+    }
+
     /// 给用户看的一句话说明。
     pub fn describe(&self) -> String {
         match self {
@@ -126,6 +144,18 @@ impl Report {
             .map(Issue::describe)
             .collect::<Vec<_>>()
             .join("；")
+    }
+
+    /// 本次检出的问题码（去重）。前端据此决定展示哪条提示。
+    pub fn codes(&self) -> Vec<&'static str> {
+        let mut out: Vec<&'static str> = Vec::new();
+        for issue in &self.issues {
+            let c = issue.code();
+            if !out.contains(&c) {
+                out.push(c);
+            }
+        }
+        out
     }
 
     /// 给重试用的纠正提示，追加到 system prompt 之后。

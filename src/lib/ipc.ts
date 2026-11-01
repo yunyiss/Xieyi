@@ -118,6 +118,13 @@ export interface QualityReport {
   segment: string;
   /** 检出了什么，例如「疑似截断（原文 120 字，译文仅 8 字）」 */
   found: string;
+  /**
+   * 检出问题的原因码（去重），如 `untranslated`、`wrong-script`。
+   *
+   * 界面据此选择展示哪条提示，不去解析 `found` 里的中文——
+   * 文案会改，解析字符串太脆。
+   */
+  codes: string[];
   /** 重试后是否修好 */
   fixed: boolean;
 }

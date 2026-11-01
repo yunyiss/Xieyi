@@ -69,8 +69,11 @@ struct QualityPayload {
     request_id: String,
     /// 出问题那段的开头几个字，方便定位
     segment: String,
-    /// 检出了什么
+    /// 检出了什么（给人读的中文说明）
     found: String,
+    /// 检出了什么（给机器读的原因码，如 `untranslated`、`wrong-script`）。
+    /// 前端据此选择展示哪条提示，不去解析中文说明。
+    codes: Vec<String>,
     /// 重试后是否修好
     fixed: bool,
 }
@@ -569,6 +572,7 @@ impl Service {
         let report = quality::check(text, &first, &terms, target);
         // 首次检出的问题（用户看到的是"发现了什么"，不是重试之后的状态）
         let found = report.describe();
+        let codes: Vec<String> = report.codes().into_iter().map(String::from).collect();
         let flagged = !report.is_ok();
         let mut best = first;
         let mut best_report = report;
@@ -635,6 +639,7 @@ impl Service {
                     request_id: request_id.unwrap_or_default().to_string(),
                     segment: text.chars().take(24).collect(),
                     found,
+                    codes: codes.clone(),
                     fixed,
                 },
             );
