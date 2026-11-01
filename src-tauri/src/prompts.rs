@@ -128,10 +128,19 @@ pub struct TranslationRequest {
 ///
 /// 只覆盖常见语言；映射不到时回退到原代码。Translategemma 用 ISO 带地区码，
 /// 直接给 `en` 落不到它的表里，会被当成未知而默认 en-GB。
+/// 语言代码 → TranslateGemma 需要的地区码。
+///
+/// **繁体用 `zh-TW` 而不是 `zh-Hant`**：实测 translategemma-4b 收到
+/// `zh-Hant` 会输出简体（只有零星几个繁体字），换成 `zh-TW` 才稳定给繁体
+/// （同样文本 11 个繁体字）。这与腾讯 Hy-MT2 正好相反——它认 `zh-Hant`。
+/// 各家的码表不同，必须按模型分开映射，不能共用一个。
+///
+/// 简体 `zh-Hans` 两个模型都认。英文必须 `en-GB`：llama.cpp 里
+/// translategemma 的模板默认值就是 en-GB，给裸 `en` 也能用，但明确写更稳。
 fn language_code(code: &str) -> String {
     match code {
         "zh" => "zh-Hans".into(),
-        "zh-tw" | "zh-hant" => "zh-Hant".into(),
+        "zh-tw" | "zh-hant" => "zh-TW".into(),
         "en" => "en-GB".into(),
         "ja" => "ja-JP".into(),
         "ko" => "ko-KR".into(),
@@ -298,29 +307,24 @@ pub fn build_request(
         }
 
         // ---- TranslateGemma 原版：语言码走 chat_template_kwargs ----
+        //
+        // **只能发原文，不能加任何附注。**
+        // 实测（translategemma-4b）：把风格要求以 `[Note: ...]` 括在原文后面，
+        // 模型会把它当成待翻译内容一起「翻」出来：
+        //
+        //   输入：The server is down.\n\n[Note: This is technical content...]
+        //   输出：服务器已停止工作。\n\n[注意：这属于技术内容：请保持产品名称与原文完全一致。]
+        //
+        // 它的模板本身就是「把这段文字翻译成 X」，没有留出“额外要求”的位置。
+        // 因此：
+        //   - 风格（style）：不支持，传了反而污染译文
+        //   - 术语表：同样不能加（实测偶然幸免，但不可靠）
+        //   - 纠正提示：同理，重试时也只重发原文
+        //
+        // 这是模型的固有局限，不是残缺：它就是专用于纯翻译的。
+        // 想要风格/术语，得换用通用 chat 模型。
         PromptStyle::TemplateKwargs => {
-            // 它的模板只认这个参数，system 消息会被忽略，所以不发 system。
-            // 翻译风格/术语表只能并进正文——模板本身不提供注入点。
-            let mut user = text.to_string();
-            if let Some(inst) = style.instruction() {
-                user.push_str("\n\n[Note: ");
-                user.push_str(inst);
-                user.push(']');
-            }
-            if !glossary.is_empty() {
-                user.push_str("\n\n[Glossary: ");
-                let terms: Vec<String> = glossary
-                    .iter()
-                    .map(|e| format!("{}={}", e.from, e.to))
-                    .collect();
-                user.push_str(&terms.join(", "));
-                user.push(']');
-            }
-            if let Some(h) = hint {
-                user.push_str("\n\n[Correction: ");
-                user.push_str(h);
-                user.push(']');
-            }
+            let user = text.to_string();
 
             TranslationRequest {
                 messages: serde_json::json!([{ "role": "user", "content": user }]),
@@ -781,6 +785,74 @@ mod tests {
         assert!(after.contains("keep every list marker"), "纠正附注: {content}");
     }
 
+    // ---- TranslateGemma（实测驱动）----
+    //
+    // 这组测试对应 translategemma-4b 的真实行为，每条都能在实验里复现。
+
+    /// 只发原文，不能有任何附注。
+    ///
+    /// 实测：把风格要求括在原文后面，模型会把它当成待翻译内容
+    /// 一起翻出来：
+    ///   输入 The server is down.\n\n[Note: This is technical content...]
+    ///   输出 服务器已停止工作。\n\n[注意：这属于技术内容：...]
+    #[test]
+    fn template_kwargs_sends_the_bare_text_only() {
+        let req = build_request(
+            PromptStyle::TemplateKwargs,
+            Style::Technical,
+            "en",
+            "zh",
+            &glossary(),
+            "The server is down.",
+            Some("keep every list marker"),
+        );
+
+        let content = req.messages[0]["content"].as_str().unwrap();
+        assert_eq!(content, "The server is down.", "不能有任何附加内容: {content}");
+        assert_eq!(req.messages.as_array().unwrap().len(), 1, "不能发 system");
+    }
+
+    /// 繁体用 `zh-TW`，不能用 `zh-Hant`。
+    ///
+    /// 实测（同一段文字）：
+    ///   zh-Hant  → 网络设置已禁用。请打开该文件，查看历史记录。   （繁体1字）
+    ///   zh-TW    → 網路設定已關閉。請打開該檔案，查看歷史記錄。   （繁体11字）
+    #[test]
+    fn template_kwargs_uses_tw_not_hant_for_traditional() {
+        let req = build_request(
+            PromptStyle::TemplateKwargs,
+            Style::General,
+            "en",
+            "zh-tw",
+            &[],
+            "hello",
+            None,
+        );
+        let kw = req.template_kwargs.expect("必须带语言码");
+        assert_eq!(
+            kw["target_lang_code"], "zh-TW",
+            "繁体必须用 zh-TW，用 zh-Hant 会给简体"
+        );
+    }
+
+    /// 简体用 zh-Hans，英文用 en-GB。
+    #[test]
+    fn template_kwargs_language_codes() {
+        let simp = build_request(
+            PromptStyle::TemplateKwargs, Style::General, "en", "zh", &[], "x", None,
+        );
+        assert_eq!(simp.template_kwargs.unwrap()["target_lang_code"], "zh-Hans");
+
+        let en = build_request(
+            PromptStyle::TemplateKwargs, Style::General, "zh", "en", &[], "x", None,
+        );
+        let kw = en.template_kwargs.unwrap();
+        assert_eq!(kw["source_lang_code"], "zh-Hans");
+        assert_eq!(
+            kw["target_lang_code"], "en-GB",
+            "英文要 en-GB，与 llama.cpp 模板默认值一致"
+        );
+    }
     /// 重试的纠正提示要能进到每一种机制里，不能因为换了风格就丢掉。
     #[test]
     fn retry_hint_reaches_every_prompt_style() {
@@ -801,8 +873,14 @@ mod tests {
                 Some("keep every list marker"),
             );
             let joined = req.messages.to_string();
-            if style == PromptStyle::LanguagePair {
-                // 这条机制的模板不接受附加要求，只能忽略——不算丢
+            // 这两条机制的模板不接受附加要求，只能忽略——不算丢。
+            //
+            // TemplateKwargs（translategemma）实测证实：把任何附注拼进原文都会被
+            // 当成待翻译内容一起翻出来，反而污染译文。宁可不给纠正提示。
+            if matches!(
+                style,
+                PromptStyle::LanguagePair | PromptStyle::TemplateKwargs
+            ) {
                 continue;
             }
             assert!(
