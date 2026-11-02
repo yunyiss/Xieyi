@@ -1010,8 +1010,11 @@ export function Chat({
               />
 
               <button
-                className="flex h-9 w-9 items-center justify-center rounded-full text-white transition-colors disabled:opacity-40"
-                style={{ background: busy ? "var(--text-muted)" : "var(--brand)" }}
+                className="flex h-9 w-9 items-center justify-center rounded-full transition-colors disabled:opacity-40"
+                style={{
+                  background: busy ? "var(--text-muted)" : "var(--accent-btn)",
+                  color: busy ? "var(--surface)" : "var(--accent-btn-text)",
+                }}
                 onClick={() => {
                   if (!busy) {
                     send();

@@ -18,11 +18,41 @@
   --border-strong: #d2d7de;
   --text: #16181d;
   --text-muted: #6b7280;
-  --brand: #0f9d58;
-  --brand-hover: #0b8047;
-  --brand-soft: #e6f6ec;
-  --brand-text: #075c34;
-  --danger: #d93a2b;
+  /*
+    色彩策略：品牌色只做「点缀」，主按钮用中性色。
+
+    原因是一个色值扛不住四种职责——按钮底、强调字、浅底、状态点
+    对明度的要求互相冲突。早先把 #2c3547 同时用作主按钮底色，
+    整体发闷、像黑洞；再深一点文字就更看不清。
+
+    所以拆开：
+      --brand-*     只在选中态、进度条、徽章上出现（面积小，安全）
+      --accent-btn  主按钮的中性深色（不偏色，白字永远可读）
+
+    色相取自 logo（写意燕）的深墨蓝，而不是效率工具惯用的绿——
+    绿色传达"增长"，这个工具要的是"安静、准确"。
+  */
+  --brand: #5a6b85;
+  --brand-hover: #4a5a72;
+  /*
+    选中底色要能和白底区分开：#eef1f6 与 #ffffff 只差 1.06:1，
+    页签选中几乎看不出来。加深到 #e3e9f2（约 1.2:1）才够。
+  */
+  --brand-soft: #e3e9f2;
+  --brand-text: #39455c;
+  /*
+    主按钮底色：中性深灰，不偏蓝。
+    品牌色在浅底上做按钮会显得"有颜色但不够深"或"够深但发闷"，
+    中性色则在任何主题下都安全：白字永远可读。
+  */
+  --accent-btn: #333a46;
+  --accent-btn-hover: #262c36;
+  /*
+    按钮文字色必须跟着底色走，不能硬编码 #fff：
+    深色模式下 --accent-btn 会反转成浅色，白字就看不见了。
+  */
+  --accent-btn-text: #ffffff;
+  --danger: #c2453a;
 
   /* 圆角梯度：控件 → 卡片 → 浮层 */
   --radius-sm: 8px;
@@ -44,8 +74,16 @@
   --ring: 0 0 0 3px color-mix(in srgb, var(--brand) 20%, transparent);
 }
 
+/*
+  主题机制：
+    - 默认跟随系统（prefers-color-scheme）
+    - html[data-theme="light"] 强制浅色
+    - html[data-theme="dark"]  强制深色
+
+  所有组件的颜色都走变量，切换主题不碰任何组件代码。
+*/
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme="light"]) {
     color-scheme: dark;
     --canvas: #101215;
     --surface: #171a1f;
@@ -54,11 +92,16 @@
     --border-strong: #3a404a;
     --text: #e8eaed;
     --text-muted: #9aa1ac;
-    --brand: #2fbf71;
-    --brand-hover: #3ed684;
-    --brand-soft: #143024;
-    --brand-text: #b6f3cf;
-    --danger: #f16b5e;
+    /* 深色下反向：品牌色提亮做底，深字可读；浅底配深字 */
+    --brand: #8a9bb4;
+    --brand-hover: #9cadc6;
+    --brand-soft: #232a37;
+    --brand-text: #b9c6db;
+    /* 深色下主按钮反色：浅底 + 深字 */
+    --accent-btn: #c8d2e0;
+    --accent-btn-hover: #dae2ec;
+    --accent-btn-text: #1a1f28;
+    --danger: #e0705f;
 
     /* 深色下阴影要更重才看得出层次 */
     --shadow-1: 0 1px 2px rgb(0 0 0 / 0.28), 0 1px 3px rgb(0 0 0 / 0.2);
@@ -66,6 +109,35 @@
     --shadow-3: 0 20px 46px rgb(0 0 0 / 0.52), 0 4px 12px rgb(0 0 0 / 0.3);
   }
 }
+
+/* 手动切到深色：不依赖系统设置 */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+    color-scheme: dark;
+    --canvas: #101215;
+    --surface: #171a1f;
+    --surface-muted: #1f232a;
+    --border: #2a2f37;
+    --border-strong: #3a404a;
+    --text: #e8eaed;
+    --text-muted: #9aa1ac;
+    /* 深色下反向：品牌色提亮做底，深字可读；浅底配深字 */
+    --brand: #8a9bb4;
+    --brand-hover: #9cadc6;
+    --brand-soft: #232a37;
+    --brand-text: #b9c6db;
+    /* 深色下主按钮反色：浅底 + 深字 */
+    --accent-btn: #c8d2e0;
+    --accent-btn-hover: #dae2ec;
+    --accent-btn-text: #1a1f28;
+    --danger: #e0705f;
+
+    /* 深色下阴影要更重才看得出层次 */
+    --shadow-1: 0 1px 2px rgb(0 0 0 / 0.28), 0 1px 3px rgb(0 0 0 / 0.2);
+    --shadow-2: 0 6px 18px rgb(0 0 0 / 0.4), 0 2px 5px rgb(0 0 0 / 0.24);
+    --shadow-3: 0 20px 46px rgb(0 0 0 / 0.52), 0 4px 12px rgb(0 0 0 / 0.3);
+}
+
 
 /* ── 材料与交互基元 ─────────────────────────────────────────────── */
 @layer components {

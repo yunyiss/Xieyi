@@ -188,6 +188,14 @@ export function Onboarding({ onDone, onChanged }: Props) {
       <div className="mx-auto w-full max-w-[560px] px-6 py-10">
         {/* 标题 */}
         <div className="mb-7 text-center">
+          <img
+            src="/swallow.png"
+            alt=""
+            width={72}
+            height={72}
+            className="mx-auto mb-3"
+            aria-hidden
+          />
           <div className="text-[26px] font-semibold tracking-tight">
             Xieyi
             <span
@@ -412,7 +420,7 @@ export function Onboarding({ onDone, onChanged }: Props) {
             className="btn h-10 flex-1 rounded-lg px-4 text-[13px] font-medium"
             style={
               allReady
-                ? { background: "var(--brand)", color: "#fff", border: "none" }
+                ? { background: "var(--accent-btn)", color: "var(--accent-btn-text)", border: "none" }
                 : {
                     background: "var(--surface)",
                     color: "var(--text)",

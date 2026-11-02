@@ -36,15 +36,25 @@ export function RunButton({
 
   return (
     <button
-      className="flex h-10 min-w-[104px] shrink-0 items-center justify-center rounded-lg px-4 text-[13px] font-medium text-white transition-colors disabled:opacity-50"
-      style={{ background: busy ? "var(--text-muted)" : "var(--brand)" }}
+      className="flex h-10 min-w-[104px] shrink-0 items-center justify-center rounded-lg px-4 text-[13px] font-medium transition-colors disabled:opacity-50"
+      /*
+        悬停/离开必须回到**同一个**底色。早先离开时写的是 --brand，
+        初始是 --accent-btn，两者不同 —— 鼠标划过一次按钮就永久变色了。
+
+        文字色用变量而不是写死 #fff：深色模式下 --accent-btn 会反转成浅色，
+        白字就看不见了。
+      */
+      style={{
+        background: busy ? "var(--text-muted)" : "var(--accent-btn)",
+        color: busy ? "var(--surface)" : "var(--accent-btn-text)",
+      }}
       onMouseEnter={(e) => {
-        if (!busy) e.currentTarget.style.background = "var(--brand-hover)";
+        if (!busy) e.currentTarget.style.background = "var(--accent-btn-hover)";
       }}
       onMouseLeave={(e) => {
         e.currentTarget.style.background = busy
           ? "var(--text-muted)"
-          : "var(--brand)";
+          : "var(--accent-btn)";
       }}
       disabled={disabled}
       onClick={onClick}
