@@ -12,6 +12,10 @@ dist
 dist-ssr
 *.local
 
+# cargo vendor 的产物（离线构建用，约 88 MB / 512 个包）。
+# 只在没有网络的环境里临时生成，绝不入库。
+vendor/
+
 # 本地文档（需求 / 方案）与 IDE 产物，不入库
 docs/
 .trae/

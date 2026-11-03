@@ -31,6 +31,9 @@
 
 /// 互斥量名字。带 `Local\` 前缀表示只在当前登录会话内互斥：
 /// 同一台机器上的不同用户各开一个是合理的，不该互相拦。
+///
+/// 只在 Windows 下使用：Unix 侧尚未实现单实例（见 `acquire` 的注释）。
+#[cfg(windows)]
 const MUTEX_NAME: &str = "Local\\com.xieyi.translate.single-instance";
 
 /// 单实例守卫。活着就代表本进程持有锁。
@@ -39,6 +42,10 @@ const MUTEX_NAME: &str = "Local\\com.xieyi.translate.single-instance";
 pub struct SingleInstance {
     #[cfg(windows)]
     _handle: isize,
+    /// Unix：持有 flock 的文件句柄。**不要提前 drop**——
+    /// 进程退出或句柄关闭时锁才释放，这是 flock 的语义。
+    #[cfg(unix)]
+    _lock_file: std::fs::File,
 }
 
 /// 尝试成为唯一实例。
@@ -58,11 +65,87 @@ pub fn acquire() -> Result<SingleInstance, ()> {
             }
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     {
-        // 非 Windows 暂不实现：本项目当前只支持 Windows，
-        // 这里返回成功让程序照常跑，不假装有保护。
-        Ok(SingleInstance {})
+        match unix_impl::try_lock() {
+            Some(file) => Ok(SingleInstance { _lock_file: file }),
+            None => {
+                // 已有实例：把它的窗口拉到前面再退出
+                unix_impl::focus_existing_window();
+                Err(())
+            }
+        }
+    }
+}
+
+/// Unix 侧实现：`flock` 排他锁 + 窗口聚焦。
+///
+/// ## 为什么用 flock 而不是 PID 文件
+///
+/// PID 文件有两个坑：进程崩溃时不会自动清理（留下假锁），
+/// PID 还会被系统复用（误判成"已有实例"）。
+///
+/// `flock` 是**内核级**的：持有者退出（哪怕被 `kill -9`）时锁自动释放，
+/// 不存在清理问题。这是 Unix 上做单实例的标准做法。
+#[cfg(unix)]
+mod unix_impl {
+    use std::fs::{File, OpenOptions};
+    use std::io::Write;
+    use std::os::unix::io::AsRawFd;
+
+    /// 与 Windows 的 `Local\` 语义对齐：锁放在用户自己的运行时目录下，
+    /// 不同用户各开一个是合理的（`/run/user/<uid>`），不该互相拦。
+    pub fn lock_path() -> std::path::PathBuf {
+        let dir = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        dir.join("com.xieyi.translate.lock")
+    }
+
+    #[link(name = "c")]
+    unsafe extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
+
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+
+    /// 拿排他锁。已被占用返回 `None`。
+    pub fn try_lock() -> Option<File> {
+        let path = lock_path();
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .ok()?;
+
+        // LOCK_EX | LOCK_NB：排他 + 不阻塞。返回 -1 说明已有人持有。
+        let rc = unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) };
+        if rc != 0 {
+            return None;
+        }
+
+        // 写入自己的 PID，方便排查（不影响锁本身）
+        let _ = file.set_len(0);
+        let _ = write!(file, "{}", std::process::id());
+        let _ = file.flush();
+
+        Some(file)
+    }
+
+    /// 聚焦已在运行的窗口。
+    ///
+    /// **尚未实现**：Linux 上没有跨桌面环境通用的"按 PID 找窗口并聚焦"接口
+    /// （X11 可以走 `_NET_WM_PID` + `XRaiseWindow`，Wayland 出于安全考虑
+    /// 基本禁止）。这里保持空实现，行为等同于「第二个实例静默退出」——
+    /// 对用户来说至少不会开出两个抢显存的实例。
+    ///
+    /// 后续要补的话：X11 用 `xdotool search --pid <pid> windowactivate`，
+    /// 需要检测 `XDG_SESSION_TYPE` 是否为 `x11`。
+    pub fn focus_existing_window() {
+        // 有意留空，原因见上
     }
 }
 
@@ -236,9 +319,11 @@ mod windows_impl {
 mod tests {
     use super::*;
 
+    /// Windows 用命名互斥量，必须带 `Local\` 前缀：
+    /// 同一台机器上不同用户各开一个是合理的，不该互相拦。
+    #[cfg(windows)]
     #[test]
     fn mutex_name_is_session_scoped() {
-        // 带 Local\ 前缀：不同用户的会话互不干扰
         assert!(
             MUTEX_NAME.starts_with("Local\\"),
             "互斥量应当限定在当前会话内，否则多用户会互相拦"
@@ -247,6 +332,28 @@ mod tests {
             MUTEX_NAME.contains("com.xieyi.translate"),
             "互斥量名字要能唯一标识本应用"
         );
+    }
+
+    /// Unix 用 flock，锁文件必须落在**当前用户**的运行时目录里，
+    /// 语义与 Windows 的 `Local\` 对齐。
+    #[cfg(unix)]
+    #[test]
+    fn unix_lock_path_is_per_user() {
+        let path = unix_impl::lock_path();
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        assert!(
+            name.contains("com.xieyi.translate"),
+            "锁文件名要能唯一标识本应用，实际是 {name}"
+        );
+
+        // XDG_RUNTIME_DIR 是 per-user 的（/run/user/<uid>）；
+        // 没有的话退到 temp_dir，也仍然是当前用户可写
+        if let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR") {
+            assert!(
+                path.starts_with(std::path::PathBuf::from(rt)),
+                "有 XDG_RUNTIME_DIR 时锁应放在里面，实际是 {path:?}"
+            );
+        }
     }
 
     #[test]

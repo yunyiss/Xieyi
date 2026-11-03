@@ -10,14 +10,34 @@ use crate::paths;
 /// 固定的 llama.cpp 构建号。路由模式属于较新特性，必须 pin 版本而不是用 latest。
 pub const PINNED_VERSION: &str = "b11714";
 
-/// 已核对过的下载包校验值（按后端区分；没有记录的组合跳过校验、仅保存实际哈希）。
+/// 已核对过的下载包校验值（按平台 + 后端区分）。
+///
+/// **没有记录的组合会跳过校验**，只保存实际哈希——这是技术债 #7。
+/// 补一个新平台时，应该先跑一次拿到真实哈希，填到这里再发版，
+/// 否则用户下载的包没有被验证过（在网络层被替换也发现不了）。
 fn expected_sha256(backend: &str) -> Option<&'static str> {
-    if cfg!(target_os = "windows") && backend == "vulkan" {
-        // llama-b11714-bin-win-vulkan-x64.zip
-        Some("d4765447307f29fc0b4c8ae5b8b806c46b3e515d0ce5c2a54dd90d9b2c7a392f")
-    } else {
-        None
+    #[cfg(target_os = "windows")]
+    {
+        if backend == "vulkan" {
+            // llama-b11714-bin-win-vulkan-x64.zip
+            return Some("d4765447307f29fc0b4c8ae5b8b806c46b3e515d0ce5c2a54dd90d9b2c7a392f");
+        }
     }
+
+    #[cfg(target_os = "linux")]
+    {
+        // TODO(linux): llama-b11714-bin-ubuntu-vulkan-x64.zip 的实际 SHA-256。
+        //
+        // **不要随便填一个值**：错误的哈希会让所有 Linux 用户下载失败。
+        // 正确做法是在 Linux 上跑一次完整下载，从日志里取
+        // 「实际哈希」那一行，核对包能正常解压后再填进来。
+        //
+        // 在那之前，Linux 走「只记录哈希、不阻断」的降级路径，
+        // 并在日志里明确警告，而不是静默放行。
+        let _ = backend;
+    }
+
+    None
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -178,17 +198,71 @@ pub fn server_exe(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// 各平台发布包的扩展名。
+///
+/// **Windows 是 `.zip`，Linux/macOS 是 `.tar.gz`**——这是 llama.cpp
+/// 上游的打包习惯，不是我们能选的。之前这里一律按 `.zip` 处理，
+/// 导致 Linux 上拼出的 URL 直接 404。
+fn archive_ext() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "zip"
+    } else {
+        "tar.gz"
+    }
+}
+
+/// 解压发布包。Windows 是 zip，Linux/macOS 是 tar.gz。
+///
+/// tar.gz 的解析交给系统 `tar`：Rust 侧的 `tar` + `flate2` 两个 crate
+/// 会让产物再涨几百 KB，而我们只需要解一个自己下载的、结构固定的包。
+/// 系统 `tar` 在所有目标平台上都存在（Windows 10 1803+ 也自带）。
+fn extract_archive(path: &std::path::Path, dest: &std::path::Path) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+        let mut archive =
+            zip::ZipArchive::new(file).map_err(|e| format!("解析压缩包失败: {e}"))?;
+        archive
+            .extract(dest)
+            .map_err(|e| format!("解压失败: {e}"))?;
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut cmd = std::process::Command::new("tar");
+        cmd.args(["-xzf"])
+            .arg(path)
+            .arg("-C")
+            .arg(dest);
+
+        let out = cmd.output().map_err(|e| format!("调用 tar 失败: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "解压失败（tar 退出码 {:?}）：{}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok(())
+    }
+}
+
 fn asset_url(backend: &str) -> Result<String, String> {
     let v = PINNED_VERSION;
+    let ext = archive_ext();
     let name = if cfg!(target_os = "windows") {
         match backend {
-            "cpu" => format!("llama-{v}-bin-win-cpu-x64.zip"),
-            _ => format!("llama-{v}-bin-win-vulkan-x64.zip"),
+            "cpu" => format!("llama-{v}-bin-win-cpu-x64.{ext}"),
+            _ => format!("llama-{v}-bin-win-vulkan-x64.{ext}"),
         }
     } else if cfg!(target_os = "macos") {
-        format!("llama-{v}-bin-macos-arm64.zip")
+        format!("llama-{v}-bin-macos-arm64.{ext}")
     } else {
-        format!("llama-{v}-bin-ubuntu-vulkan-x64.zip")
+        match backend {
+            "cpu" => format!("llama-{v}-bin-ubuntu-x64.{ext}"),
+            _ => format!("llama-{v}-bin-ubuntu-vulkan-x64.{ext}"),
+        }
     };
 
     Ok(format!(
@@ -247,7 +321,10 @@ pub async fn install_runtime(app: AppHandle, backend: String) -> Result<RuntimeS
     let downloads = root.join("downloads");
     paths::ensure(&downloads)?;
 
-    let zip_path = downloads.join(format!("llama-{PINNED_VERSION}-{backend}.zip"));
+    let archive_path = downloads.join(format!(
+        "llama-{PINNED_VERSION}-{backend}.{}",
+        archive_ext()
+    ));
 
     // 下载
     emit(&app, "downloading", 0, 0);
@@ -262,7 +339,7 @@ pub async fn install_runtime(app: AppHandle, backend: String) -> Result<RuntimeS
     }
     let total = resp.content_length().unwrap_or(0);
 
-    let mut file = tokio::fs::File::create(&zip_path)
+    let mut file = tokio::fs::File::create(&archive_path)
         .await
         .map_err(|e| format!("创建下载文件失败: {e}"))?;
     let mut stream = resp.bytes_stream();
@@ -286,13 +363,13 @@ pub async fn install_runtime(app: AppHandle, backend: String) -> Result<RuntimeS
 
     // 校验
     emit(&app, "verifying", 0, 0);
-    let bytes = std::fs::read(&zip_path).map_err(|e| e.to_string())?;
+    let bytes = std::fs::read(&archive_path).map_err(|e| e.to_string())?;
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
     let actual = format!("{:x}", hasher.finalize());
     if let Some(expected) = expected_sha256(&backend) {
         if actual != expected {
-            let _ = std::fs::remove_file(&zip_path);
+            let _ = std::fs::remove_file(&archive_path);
             return Err(format!(
                 "下载包校验失败：期望 {expected}，实际 {actual}。文件已删除。"
             ));
@@ -306,16 +383,12 @@ pub async fn install_runtime(app: AppHandle, backend: String) -> Result<RuntimeS
         let _ = std::fs::remove_dir_all(&dest);
     }
     paths::ensure(&dest)?;
-    let zip_file = std::fs::File::open(&zip_path).map_err(|e| e.to_string())?;
-    let mut archive = zip::ZipArchive::new(zip_file).map_err(|e| format!("解析压缩包失败: {e}"))?;
-    archive
-        .extract(&dest)
-        .map_err(|e| format!("解压失败: {e}"))?;
+    extract_archive(&archive_path, &dest)?;
 
     let exe = find_executable(&dest).ok_or("压缩包内未找到 llama-server")?;
 
     // 解压完安装包就没用了，31 MB 留着只是白占磁盘（失败路径见下方各 return 分支）
-    let _ = std::fs::remove_file(&zip_path);
+    let _ = std::fs::remove_file(&archive_path);
     // 空掉就顺手把 downloads 目录也收掉；非空时 remove_dir 会失败，正好当"别动"
     let _ = std::fs::remove_dir(&downloads);
 
@@ -507,6 +580,44 @@ pub fn discover_runtimes(app: AppHandle) -> Vec<DiscoveredRuntime> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 各平台的发布包扩展名必须与 llama.cpp 上游一致。
+    ///
+    /// **这条是真 bug 的回归点**：之前一律按 `.zip` 拼 URL，
+    /// Linux 上直接 404（上游是 `.tar.gz`），用户点「下载引擎」永远失败。
+    #[test]
+    fn archive_ext_matches_upstream_convention() {
+        let ext = archive_ext();
+        if cfg!(target_os = "windows") {
+            assert_eq!(ext, "zip", "Windows 发布包是 zip");
+        } else {
+            assert_eq!(ext, "tar.gz", "Linux/macOS 发布包是 tar.gz");
+        }
+    }
+
+    /// URL 里的扩展名必须与 `archive_ext()` 一致，不能写死。
+    #[test]
+    fn asset_url_uses_the_right_extension() {
+        let url = asset_url("vulkan").expect("vulkan 后端应当有下载地址");
+        let ext = archive_ext();
+
+        assert!(
+            url.ends_with(&format!(".{ext}")),
+            "URL 应以 .{ext} 结尾，实际是 {url}"
+        );
+        assert!(
+            url.contains(PINNED_VERSION),
+            "URL 必须 pin 版本，实际是 {url}"
+        );
+    }
+
+    /// 后端名要真的体现在文件名里，否则「CPU / Vulkan」会下载同一个包。
+    #[test]
+    fn different_backends_give_different_urls() {
+        let a = asset_url("vulkan").unwrap();
+        let b = asset_url("cpu").unwrap();
+        assert_ne!(a, b, "不同后端必须对应不同的下载地址");
+    }
 
     #[test]
     fn missing_path_is_rejected() {

@@ -814,10 +814,22 @@ impl Service {
                     .creation_flags(0x0800_0000)
                     .status();
             }
-            #[cfg(not(windows))]
+            #[cfg(unix)]
             {
+                // 负 PID = 整个进程组。因为 spawn 时设了 process_group(0)，
+                // 主进程的组号就等于它的 PID，所以 -pid 能一次带走所有子进程。
+                //
+                // 先 TERM 再 KILL：给它一点时间把显存还回去，
+                // 直接 -9 有时会让驱动侧的上下文释放不干净。
+                let pgid = format!("-{pid}");
                 let _ = std::process::Command::new("kill")
-                    .args(["-9", &pid.to_string()])
+                    .args(["-TERM", &pgid])
+                    .status();
+
+                // 200ms 后还没退就强杀
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                let _ = std::process::Command::new("kill")
+                    .args(["-KILL", &pgid])
                     .status();
             }
         }
@@ -868,6 +880,22 @@ async fn spawn(app: &AppHandle, gpu_layers: u64) -> Result<Service, String> {
     #[cfg(windows)]
     {
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+
+    // Unix：把 llama-server 放进**独立的进程组**。
+    //
+    // 它是会派生子进程的（线程池、可能的 crashpad 之类）。
+    // 不建独立进程组的话，`kill -9 <pid>` 只杀主进程，
+    // 孤儿会继续占着显存和端口——Windows 那边靠 `taskkill /T` 解决，
+    // Unix 没有等价开关，只能在启动时就把组号定下来。
+    //
+    // `process_group(0)` 表示「新进程成为自己进程组的组长」，
+    // 之后 `killpg(-pid)` 就能一次带走整组。
+    #[cfg(unix)]
+    {
+        // `process_group` 直接定义在 `std::process::Command` 上（Rust 1.64+），
+        // 不需要 `CommandExt` trait
+        cmd.process_group(0);
     }
 
     let child = cmd.spawn().map_err(|e| format!("启动推理引擎失败: {e}"))?;

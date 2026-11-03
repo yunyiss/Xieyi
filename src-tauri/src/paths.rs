@@ -32,10 +32,58 @@ pub fn app_data(app: &AppHandle) -> Result<PathBuf, String> {
 /// 拿不到 `AppHandle`，只能硬编码；有测试锁住两者一致。
 pub const IDENTIFIER: &str = "com.xieyi.translate";
 
-/// 不依赖 `AppHandle` 的数据根目录，供启动最早期使用。
+/// 不依赖 `AppHandle` 的数据根目录，供启动最早期（日志）使用。
+///
+/// ## 平台差异
+///
+/// `AppHandle` 要等 `Builder::build()` 之后才有，但日志必须在它之前初始化
+/// （WebView 创建失败会 panic，那时日志还没建就抓不到现场）。
+/// 所以这里手工拼各平台的 `app_local_data_dir()`：
+///
+/// | 平台 | 路径 |
+/// |---|---|
+/// | Windows | `%LOCALAPPDATA%\<identifier>` |
+/// | Linux | `$XDG_DATA_HOME/<identifier>` 或 `~/.local/share/<identifier>` |
+/// | macOS | `~/Library/Application Support/<identifier>` |
+///
+/// **必须与 Tauri 的 `app_local_data_dir()` 保持一致**，否则日志会写到
+/// 另一个地方，用户按文档去找会找不到。有测试锁住 Windows 分支与
+/// `tauri.conf.json` 的 identifier 一致；Linux/macOS 的路径规则由
+/// Tauri 上游固定，这里按其实现照抄。
 pub fn data_root_early() -> Option<PathBuf> {
-    let base = std::env::var_os("LOCALAPPDATA")?;
-    Some(PathBuf::from(base).join(IDENTIFIER))
+    #[cfg(target_os = "windows")]
+    {
+        let base = std::env::var_os("LOCALAPPDATA")?;
+        Some(PathBuf::from(base).join(IDENTIFIER))
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // XDG Base Directory：$XDG_DATA_HOME 优先，否则 ~/.local/share
+        if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
+            let p = PathBuf::from(xdg);
+            if !p.as_os_str().is_empty() {
+                return Some(p.join(IDENTIFIER));
+            }
+        }
+        let home = std::env::var_os("HOME")?;
+        Some(PathBuf::from(home).join(".local/share").join(IDENTIFIER))
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var_os("HOME")?;
+        Some(
+            PathBuf::from(home)
+                .join("Library/Application Support")
+                .join(IDENTIFIER),
+        )
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
 }
 
 
