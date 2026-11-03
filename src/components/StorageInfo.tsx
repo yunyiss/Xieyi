@@ -121,6 +121,7 @@ export function StorageInfo({ refreshToken = 0 }: { refreshToken?: number }) {
         >
           <Sub label="配置" name="config.json" />
           <Sub label="会话" name={"sessions\\"} />
+          <Sub label="日志" name={"logs\\"} />
           <Sub label="缓存" name={"EBWebView\\"} />
         </div>
 

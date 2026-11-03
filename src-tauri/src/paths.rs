@@ -24,10 +24,21 @@ pub fn app_data(app: &AppHandle) -> Result<PathBuf, String> {
         .map_err(|e| e.to_string())
 }
 
-/// 运行时根目录：`<app_data>/runtime`。
+/// 应用标识符。**必须与 `tauri.conf.json` 的 `identifier` 一致**。
 ///
-/// 只放**运行时产物**（解压出来的 llama-server、启动预设 presets.ini），
-/// 不放用户配置——配置统一在 `config.json`。
+/// WebView2 的数据目录由 Tauri 硬编码为 `app_local_data_dir()`
+/// （tauri-2.12.5/src/manager/webview.rs:563），也就是
+/// `%LOCALAPPDATA%\<identifier>`。启动最早期（日志、残留清理）
+/// 拿不到 `AppHandle`，只能硬编码；有测试锁住两者一致。
+pub const IDENTIFIER: &str = "com.xieyi.translate";
+
+/// 不依赖 `AppHandle` 的数据根目录，供启动最早期使用。
+pub fn data_root_early() -> Option<PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA")?;
+    Some(PathBuf::from(base).join(IDENTIFIER))
+}
+
+
 pub fn runtime_root(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(app_data(app)?.join("runtime"))
 }
@@ -187,5 +198,38 @@ mod tests {
             code.contains(".app_local_data_dir()"),
             "数据根目录应当用 app_local_data_dir（Local）"
         );
+    }
+
+    /// `IDENTIFIER` 必须与 `tauri.conf.json` 一致。
+    ///
+    /// 启动最早期（日志初始化、残留清理）拿不到 `AppHandle`，
+    /// 只能用硬编码的 identifier 拼路径。一旦改名而这里没同步，
+    /// 日志会写到旧目录、残留清理会匹配错进程——而且**不会有任何报错**，
+    /// 只能在排查时发现「日志怎么没了」。
+    #[test]
+    fn identifier_matches_tauri_config() {
+        let raw = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tauri.conf.json"))
+            .expect("读不到 tauri.conf.json");
+        let conf: serde_json::Value =
+            serde_json::from_str(&raw).expect("tauri.conf.json 不是合法 JSON");
+
+        let configured = conf["identifier"]
+            .as_str()
+            .expect("配置里没有 identifier");
+
+        assert_eq!(
+            configured, IDENTIFIER,
+            "paths::IDENTIFIER 与 tauri.conf.json 的 identifier 不一致"
+        );
+    }
+
+    #[test]
+    fn early_root_ends_with_identifier() {
+        if let Some(root) = data_root_early() {
+            assert!(
+                root.ends_with(IDENTIFIER),
+                "数据根目录应以 identifier 结尾，实际是 {root:?}"
+            );
+        }
     }
 }

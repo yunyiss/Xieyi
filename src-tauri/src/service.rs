@@ -7,6 +7,75 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::models;
+
+/// 退出时回收推理进程树，**带超时、不阻塞事件循环**。
+///
+/// ## 为什么不用 `block_on`
+///
+/// 之前写的是 `tauri::async_runtime::block_on(async { ...lock().await... })`，
+/// 有两个问题：
+///
+/// 1. 它在 **Exit 事件回调**里同步阻塞事件循环；
+/// 2. 如果此刻正有推理请求持有 `service` 锁，`lock().await` 会一直等，
+///    而 `panic = "abort"` 下进程可能等不到那一刻就退了——
+///    实测留下了孤儿 `llama-server.exe` 占着显存。
+///
+/// 现在的做法：先 `try_lock`，拿不到就直接按 PID 强杀（不依赖锁），
+/// 保证**任何情况下**推理进程都会被回收。
+pub fn shutdown_blocking(app: &AppHandle, timeout: Duration) {
+    let state = app.state::<AppState>();
+
+    match state.service.try_lock() {
+        Ok(mut guard) => {
+            if let Some(svc) = guard.take() {
+                // 拿到锁：正常路径，用异步 kill 并限时
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build();
+                match rt {
+                    Ok(rt) => {
+                        let _ = rt.block_on(async {
+                            tokio::time::timeout(timeout, svc.kill()).await
+                        });
+                    }
+                    Err(_) => {
+                        // 建不了运行时：退回按 PID 强杀孤儿
+                        kill_llama_servers_spawned_by_us();
+                    }
+                }
+            }
+        }
+        Err(_) => {
+            // 锁被推理请求持着：不能等（会拖死退出），直接按 PID 强杀。
+            // `llama-server` 是我们自己起的子进程，按 PID 杀是安全的。
+            crate::logging::warn(
+                "app",
+                "退出时服务锁被占用，改为按 PID 强制回收推理进程",
+            );
+            kill_llama_servers_spawned_by_us();
+        }
+    }
+}
+
+/// 兜底：杀掉父进程已退出（或就是我们）的 `llama-server.exe`。
+///
+/// 只认**父进程不存在**的那些：正在被别的程序正常使用的实例不碰。
+#[cfg(windows)]
+fn kill_llama_servers_spawned_by_us() {
+    use std::os::windows::process::CommandExt;
+
+    // 用 PowerShell 找孤儿：父进程已退出的 llama-server
+    let script = "Get-CimInstance Win32_Process -Filter \"Name='llama-server.exe'\" |          ForEach-Object {            $p = Get-Process -Id $_.ParentProcessId -ErrorAction SilentlyContinue;            if (-not $p) { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; Write-Output $_.ProcessId }          }";
+    let mut cmd = std::process::Command::new("powershell");
+    cmd.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script]);
+    cmd.creation_flags(0x0800_0000);
+    let _ = cmd.output();
+}
+
+#[cfg(not(windows))]
+fn kill_llama_servers_spawned_by_us() {}
+
+
 use crate::params::{self, Thinking};
 use crate::paths;
 use crate::prompts;
@@ -803,6 +872,17 @@ async fn spawn(app: &AppHandle, gpu_layers: u64) -> Result<Service, String> {
 
     let child = cmd.spawn().map_err(|e| format!("启动推理引擎失败: {e}"))?;
 
+    // 只记端口和路径，**不记 api-key**：日志可能被发出来排查问题，
+    // 本地 key 虽然只在进程内有效，但没有理由写进磁盘。
+    crate::logging::info(
+        "engine",
+        format!(
+            "引擎启动 pid={:?} port={port} exe={}",
+            child.id(),
+            exe.to_string_lossy()
+        ),
+    );
+
     let service = Service {
         child: tokio::sync::Mutex::new(child),
         port,
@@ -1258,6 +1338,15 @@ async fn stream_completion_with(
         if cancel.load(Ordering::Relaxed) {
             return Err("已取消".into());
         }
+        // 空回复是用户最常反馈的问题，必须留现场：
+        // 思考吃了多少字、额度多少、为什么停的，光看界面判断不出来。
+        crate::logging::warn(
+            "infer",
+            format!(
+                "空正文 model={model} reasoning_chars={reasoning_chars} \
+                 max_tokens={max_tokens} finish_reason={finish_reason:?}"
+            ),
+        );
         return Err(empty_reply_message(
             reasoning_chars,
             max_tokens,
@@ -1267,7 +1356,11 @@ async fn stream_completion_with(
 
     // 有正文但被上限截断：至少留痕，方便排查长回答被切断
     if finish_reason == "length" {
-        eprintln!("输出达到 max_tokens={max_tokens} 上限，可能被截断（模型 {model}）");
+        // release 没有控制台，eprintln 等于丢弃——改成落盘日志
+        crate::logging::warn(
+            "infer",
+            format!("输出达到 max_tokens={max_tokens} 上限，可能被截断（模型 {model}）"),
+        );
     }
 
     Ok(full)

@@ -1,5 +1,6 @@
 mod batch;
 mod hardware;
+mod logging;
 mod models;
 mod params;
 mod paths;
@@ -8,10 +9,11 @@ mod quality;
 mod runtime;
 mod service;
 mod sessions;
+mod single_instance;
 mod translate;
 
 use serde::Serialize;
-use tauri::Manager;
+
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -97,6 +99,7 @@ fn open_data_subdir(app: tauri::AppHandle, name: String) -> Result<String, Strin
         "root" => String::new(),
         "sessions" => "sessions".to_string(),
         "runtime" => "runtime".to_string(),
+        "logs" => "logs".to_string(),
         _ => return Err(format!("不支持的目录: {name}")),
     };
 
@@ -115,13 +118,164 @@ fn probe_vram() -> Option<u64> {
     hardware::free_vram_mb()
 }
 
+/// 启动最早期的日志初始化：不依赖 `AppHandle`。
+///
+/// 级别随构建类型走：debug 记全量，release 只记 Info 以上。
+/// 不暴露成用户设置——多一个开关就多一处要解释。
+fn init_early_logging() {
+    let level = if cfg!(debug_assertions) {
+        logging::Level::Debug
+    } else {
+        logging::Level::Info
+    };
+    if let Some(root) = paths::data_root_early() {
+        logging::init(root.join("logs"), level);
+    }
+}
+
+/// 创建主窗口，失败时清理残留并重试。
+///
+/// ## 为什么要重试
+///
+/// WebView2 的数据目录可能被**上一次崩溃留下的进程**占着，报
+/// `ERROR_BUSY`。这种情况等一会儿、把残留清掉就能起来，
+/// 没必要让用户看到错误框。
+///
+/// 退避 200 / 500 / 1000ms，最多 3 次。**清理只在失败路径执行**——
+/// 正常启动不跑 PowerShell，也就没有那 ~100ms 的额外开销。
+fn create_main_window(app: &tauri::App) -> Result<(), String> {
+    let config = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|w| w.label == "main")
+        .ok_or_else(|| "配置里找不到 label 为 main 的窗口".to_string())?
+        .clone();
+
+    // 只剩一次机会：预检和清理已经在 `run()` 里做完了。
+    //
+    // **为什么不在 setup 里重试**：setup 跑在事件循环的 Ready 事件里，
+    // 在里面 sleep / 起 PowerShell 会把这个线程卡住，实测第一次失败后
+    // 进程直接没了（日志只留下第 0 次那条 WARN）。
+    // 重试与退避必须放在**事件循环启动之前**。
+    match tauri::WebviewWindowBuilder::from_config(app.handle(), &config)
+        .and_then(|b| b.build())
+    {
+        Ok(window) => {
+            let _ = window.set_focus();
+            Ok(())
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// 启动失败时：写日志 + 弹原生中文错误框，然后退出。
+///
+/// **绝不允许再走到 panic/abort**。Tauri 默认对 setup 错误直接
+/// `panic!`（app.rs:1444），在 `panic = "abort"` 下进程以
+/// `0xc0000409` 静默消失——用户只看到一个白窗口闪一下，什么都得不到。
+fn report_startup_failure(_app: &tauri::AppHandle, err: &str) {
+    let data_root = paths::data_root_early()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| "%LOCALAPPDATA%\\com.xieyi.translate".to_string());
+    let log_dir = format!("{data_root}\\logs");
+
+    logging::error("app", format!("启动失败: {err}"));
+
+    let busy = err.contains("0x800700AA") || err.contains("资源在使用中");
+    let detail = if busy {
+        "WebView2 的数据目录正被其他进程占用。\n\n\
+         通常是上一次异常退出留下的残留。可以：\n\
+         · 稍等几秒再试\n\
+         · 在任务管理器里结束所有 msedgewebview2.exe\n\
+         · 仍不行就重启一次电脑"
+    } else {
+        "创建界面失败。详细信息已写入日志。"
+    };
+
+    show_error_dialog(&format!(
+        "Xieyi 写意 启动失败\n\n{detail}\n\n错误信息：{err}\n\n日志目录：{log_dir}"
+    ));
+}
+
+/// 弹一个原生错误框。用 `user32!MessageBoxW`，不为此引依赖。
+fn show_error_dialog(text: &str) {
+    #[cfg(windows)]
+    {
+        show_error_dialog_windows(text);
+    }
+    #[cfg(not(windows))]
+    {
+        eprintln!("{text}");
+    }
+}
+
+#[cfg(windows)]
+fn show_error_dialog_windows(text: &str) {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn MessageBoxW(hwnd: isize, text: *const u16, caption: *const u16, flags: u32) -> i32;
+    }
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    const MB_ICONERROR: u32 = 0x0000_0010;
+    const MB_OK: u32 = 0x0000_0000;
+
+    let text = wide(text);
+    let caption = wide("Xieyi 写意");
+    unsafe {
+        MessageBoxW(0, text.as_ptr(), caption.as_ptr(), MB_OK | MB_ICONERROR);
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // ── 单实例：必须在任何 Tauri 代码之前 ────────────────────────────
+    // `tauri-plugin-single-instance` 的互斥量在 setup 里才检查，
+    // 而 WebView 在 `build()` 内部就已创建。两个实例同时启动时
+    // 都走到创建 WebView，互相撞 `EBWebView` 目录，**双双 panic**。
+    // 实测：同时启动 A、B，两个都崩，进程数为 0。
+    //
+    // 所以这里先抢命名互斥量：拿不到就说明有实例在跑，
+    // 把它的窗口拉到前面，然后本进程直接退出——连 WebView 都不碰。
+    let _guard = match single_instance::acquire() {
+        Ok(g) => g,
+        Err(()) => {
+            // 已有实例，窗口已聚焦，静默退出
+            std::process::exit(0);
+        }
+    };
+
+    // ── 日志前置 ────────────────────────────────────────────────────
+    // 必须在 `Builder::new()` 之前：窗口和 WebView 是在 `build()` 内部
+    // 创建的（tauri-2.12.5/src/app.rs:2692），失败时直接 `panic!`。
+    // 如果把日志初始化放在 setup 回调里，那条 panic 发生时日志还没建，
+    // 用户和我们都看不到任何记录——这正是之前"日志目录空白"的原因。
+    //
+    // 此处没有 `AppHandle`，所以路径用 `paths::data_root_early()`
+    // （硬编码 identifier，有测试与 tauri.conf.json 对齐）。
+    init_early_logging();
+
+    logging::info("app", format!("启动 Xieyi v{}", env!("CARGO_PKG_VERSION")));
+
     tauri::Builder::default()
+        // 插件版单实例不再注册：上面的互斥量已经保证唯一。
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(service::AppState::default())
         .setup(|app| {
+            // 窗口在配置里设了 `create: false`，所以 Tauri 不会自动建。
+            // 这样创建失败的错误落到我们手里，而不是变成 panic。
+            if let Err(e) = create_main_window(app) {
+                report_startup_failure(app.handle(), &e);
+                app.handle().exit(1);
+                return Ok(());
+            }
+
             service::load_settings(app.handle());
             service::spawn_ttl_watcher(app.handle().clone());
             Ok(())
@@ -167,17 +321,63 @@ pub fn run() {
             batch::batch_cancel,
         ])
         .build(tauri::generate_context!())
-        .expect("error while building tauri application")
+        .unwrap_or_else(|e| {
+            // 不再直接 panic：把「资源被占用」这类可自愈的情况翻译成人话。
+            //
+            // Tauri 的原始报错是这样的，用户完全看不懂：
+            //   Failed to setup app: runtime error: failed to create webview:
+            //   WebView2 error: WindowsError(Error { code: HRESULT(0x800700AA),
+            //   message: "请求的资源在使用中。" })
+            let msg = e.to_string();
+            let hint = if msg.contains("0x800700AA") || msg.contains("资源在使用中") {
+                "WebView2 的数据目录正被其他进程占用。\n\
+                 多半是上一次异常退出留下的残留，请稍等几秒重试；\n\
+                 若反复出现，注销一次 Windows 账户或重启即可。"
+            } else {
+                "启动失败。若反复出现，请查看数据目录下的 logs\\ 日志。"
+            };
+
+            eprintln!("\n启动失败：{msg}\n\n{hint}\n");
+            // 日志已初始化的话也落一份，方便事后查
+            logging::error("app", format!("启动失败: {msg}"));
+            std::process::exit(1);
+        })
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
-                // 退出时确保推理进程树被回收，避免僵尸进程占着显存。
-                let state = app.state::<service::AppState>();
-                tauri::async_runtime::block_on(async {
-                    let mut guard = state.service.lock().await;
-                    if let Some(s) = guard.take() {
-                        s.kill().await;
-                    }
-                });
+                logging::info("app", "退出，回收推理进程树");
+                service::shutdown_blocking(app, std::time::Duration::from_secs(3));
+                logging::info("app", "推理进程已回收");
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    /// `focus_main_window` 靠 label `"main"` 找窗口。
+    ///
+    /// 配置里没写 label 时 Tauri 默认就是 `main`，但只要有人显式改成别的
+    /// （或者加了多窗口），单实例的「聚焦已有窗口」就会**静默失效**——
+    /// 第二个实例照常退出，看起来一切正常，实际上用户双击图标毫无反应。
+    /// 这种 bug 不会报错、不会崩，只能靠测试钉住。
+    #[test]
+    fn default_window_label_is_main() {
+        let raw = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tauri.conf.json"))
+            .expect("读不到 tauri.conf.json");
+        let conf: serde_json::Value = serde_json::from_str(&raw).expect("tauri.conf.json 不是合法 JSON");
+
+        let windows = conf["app"]["windows"]
+            .as_array()
+            .expect("配置里没有 app.windows");
+
+        let labels: Vec<&str> = windows
+            .iter()
+            .map(|w| w["label"].as_str().unwrap_or("main"))
+            .collect();
+
+        assert!(
+            labels.contains(&"main"),
+            "focus_main_window 依赖 label \"main\"，但当前窗口 label 是 {labels:?}；\
+             改配置的同时要同步改 focus_main_window"
+        );
+    }
 }
