@@ -195,6 +195,20 @@ export interface Session {
 }
 
 export const getAppInfo = () => invoke<AppInfo>("app_info");
+/**
+ * 让系统窗口（标题栏）跟随界面主题。
+ *
+ * Tauri 底层已封装三平台：Windows 用 DWM、Linux 用
+ * `gtk-application-prefer-dark-theme`、macOS 用 `NSAppearance`。
+ *
+ * 传 `"system"` 而不是解析成具体颜色——后端会映射成 `None`（跟随系统），
+ * 这样 WebView 的 `prefers-color-scheme` 保持与真实 OS 同步，
+ * 前端媒体查询能自动响应系统主题变化。
+ */
+export const syncWindowTheme = (theme: "light" | "dark" | "system") =>
+  invoke<void>("sync_window_theme", { theme }).catch(() => {
+    // 标题栏配色是锦上添花，失败不影响使用，也不该弹错误
+  });
 export const getRuntimeStatus = () => invoke<RuntimeStatus>("runtime_status");
 export const installRuntime = (backend: string) =>
   invoke<RuntimeStatus>("install_runtime", { backend });

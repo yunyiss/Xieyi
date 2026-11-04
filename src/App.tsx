@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { useTheme } from "./lib/useTheme";
 import { ModelDrawer } from "./components/ModelDrawer";
+import { ThemeMenu } from "./components/ThemeMenu";
 import { Onboarding } from "./components/Onboarding";
 import { StatusBar } from "./components/StatusBar";
 import { Translate } from "./pages/Translate";
@@ -28,7 +29,7 @@ function App() {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
   /** 主题偏好：跟随系统 / 浅色 / 深色 */
-  const { mode: themeMode, cycle: cycleTheme } = useTheme();
+  const { mode: themeMode, setMode: setThemeMode } = useTheme();
   /** 设置抽屉里改动后 +1，通知当前页面重新拉取模型与状态。 */
   const [refreshSignal, setRefreshSignal] = useState(0);
   /** 从翻译页带到对话页的草稿 */
@@ -188,56 +189,8 @@ function App() {
           );
         })}
 
-        {/*
-          主题切换：一键循环 跟随系统 → 浅色 → 深色。
-          做成图标按钮而不是下拉，因为只有三态、切换成本极低。
-        */}
-        <button
-          onClick={cycleTheme}
-          className="btn ml-auto flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border"
-          style={{
-            background: "var(--surface)",
-            borderColor: "var(--border)",
-            color: "var(--text-muted)",
-          }}
-          title={
-            themeMode === "auto"
-              ? "主题：跟随系统（点击切换）"
-              : themeMode === "light"
-                ? "主题：浅色（点击切换）"
-                : "主题：深色（点击切换）"
-          }
-          aria-label="切换主题"
-        >
-          {themeMode === "dark" ? (
-            // 月亮：当前是深色
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden>
-              <path
-                d="M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5Z"
-                stroke="currentColor"
-                strokeWidth="1.7"
-                strokeLinejoin="round"
-              />
-            </svg>
-          ) : themeMode === "light" ? (
-            // 太阳：当前是浅色
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden>
-              <circle cx="12" cy="12" r="4" stroke="currentColor" strokeWidth="1.7" />
-              <path
-                d="M12 2v2m0 16v2M2 12h2m16 0h2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M19.1 4.9l-1.4 1.4M6.3 17.7l-1.4 1.4"
-                stroke="currentColor"
-                strokeWidth="1.7"
-                strokeLinecap="round"
-              />
-            </svg>
-          ) : (
-            // 半圆：跟随系统
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden>
-              <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="1.7" />
-              <path d="M12 3a9 9 0 0 1 0 18Z" fill="currentColor" opacity="0.55" />
-            </svg>
-          )}
-        </button>
+        {/* 主题选择：下拉菜单，一次点到目标状态 */}
+        <ThemeMenu mode={themeMode} onChange={setThemeMode} />
 
         <button
           onClick={() => setDrawerOpen(true)}

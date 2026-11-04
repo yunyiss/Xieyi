@@ -11,6 +11,7 @@ mod runtime;
 mod service;
 mod sessions;
 mod single_instance;
+mod titlebar;
 mod translate;
 
 use serde::Serialize;
@@ -117,6 +118,20 @@ fn open_data_subdir(app: tauri::AppHandle, name: String) -> Result<String, Strin
 #[tauri::command]
 fn probe_vram() -> Option<u64> {
     hardware::free_vram_mb()
+}
+
+/// 让系统窗口（标题栏）跟随界面主题。
+///
+/// 界面切成深色后标题栏仍是白的会很突兀。Tauri 的 `set_theme` 底层
+/// 已封装三平台：Windows 用 DWM、Linux 用 `gtk-application-prefer-dark-theme`、
+/// macOS 用 `NSAppearance`。
+///
+/// `theme` 取 `"light"` / `"dark"` / `"system"`。**`system` 会映射成
+/// `None`**（跟随系统），而不是解析成具体颜色——否则 WebView 的
+/// `prefers-color-scheme` 会被锁定，前端就没法响应系统主题变化了。
+#[tauri::command]
+fn sync_window_theme(window: tauri::WebviewWindow, theme: String) {
+    titlebar::set_window_theme(&window, &theme);
 }
 
 /// 启动最早期的日志初始化：不依赖 `AppHandle`。
@@ -287,6 +302,7 @@ pub fn run() {
             set_models_dir,
             open_data_subdir,
             probe_vram,
+            sync_window_theme,
             runtime::runtime_status,
             runtime::install_runtime,
             runtime::set_manual_runtime,

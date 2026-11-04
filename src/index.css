@@ -421,3 +421,17 @@ select {
 ::selection {
   background: color-mix(in srgb, var(--brand) 26%, transparent);
 }
+
+/*
+  切换主题的瞬间禁用所有过渡。
+
+  不加这条的话，每个带 transition 的元素会各自花 110ms 变色，
+  整屏呈现「一格一格刷过去」的效果，观感很差。
+  由 useTheme 的 apply() 在切换前后临时加/移除这个类。
+*/
+.theme-switching,
+.theme-switching *,
+.theme-switching *::before,
+.theme-switching *::after {
+  transition: none !important;
+}
