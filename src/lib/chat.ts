@@ -287,3 +287,23 @@ export function applyCompaction(
   };
   return [note, ...toKeep];
 }
+
+/**
+ * 读入会话文件时规整消息状态。
+ *
+ * 上次异常退出（崩溃、被强杀、断电）时，正在生成的那条消息会以
+ * `pending` 落盘——它是「等待后续事件」的占位状态，但进程已经没了，
+ * 后续事件永远不会再来。
+ *
+ * 若不处理，界面上会永久显示一个转圈的空气泡，用户以为还在生成。
+ * 统一改为 `stopped`：与用户主动中断的语义一致，且这条消息可以原地重试。
+ *
+ * `error` 不改：它表示请求确实失败过，这个信息应当保留。
+ */
+export function hydrateMessages(
+  messages: (Omit<ChatMessage, "id"> & { id?: string })[],
+): ChatMessage[] {
+  return ensureMessageIds(messages).map(
+    (m): ChatMessage => (m.status === "pending" ? { ...m, status: "stopped" } : m),
+  );
+}

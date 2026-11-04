@@ -9,6 +9,7 @@ import {
   ensureMessageIds,
   estimateTokens,
   historyTokens,
+  hydrateMessages,
   indexOfMessage,
   makeMessage,
   neighborVersion,
@@ -303,5 +304,66 @@ describe("上下文压缩", () => {
     const plan = planCompaction(messages, 4096);
     // 要么 null，要么 toCompact 非空——绝不能返回 toCompact 为空的计划
     if (plan) expect(plan.toCompact.length).toBeGreaterThan(0);
+  });
+});
+
+describe("hydrateMessages", () => {
+  /**
+   * 崩溃恢复的核心：上次异常退出时正在生成的消息会以 pending 落盘，
+   * 但后续事件永远不会再来。不处理的话界面会永久显示一个转圈气泡。
+   */
+  it("把遗留的 pending 改成 stopped", () => {
+    const saved: ChatMessage[] = [
+      { id: "u1", role: "user", content: "问", status: "ready" },
+      { id: "a1", role: "assistant", content: "", status: "pending" },
+    ];
+
+    const out = hydrateMessages(saved);
+    expect(out[1].status).toBe("stopped");
+    // 用户消息不受影响
+    expect(out[0].status).toBe("ready");
+  });
+
+  /** error 表示请求确实失败过，这个信息要保留，不能一起改成 stopped。 */
+  it("保留 error 状态", () => {
+    const saved: ChatMessage[] = [
+      { id: "a1", role: "assistant", content: "半截", status: "error" },
+    ];
+    expect(hydrateMessages(saved)[0].status).toBe("error");
+  });
+
+  it("保留 ready 状态不动", () => {
+    const saved: ChatMessage[] = [
+      { id: "a1", role: "assistant", content: "完整回复", status: "ready" },
+    ];
+    expect(hydrateMessages(saved)[0].status).toBe("ready");
+  });
+
+  /** 旧会话文件没有 id 字段，读入时要补齐，且同一次加载结果稳定。 */
+  it("给缺 id 的旧消息补上稳定 id", () => {
+    const saved = [
+      { role: "user" as const, content: "问", status: "ready" as const },
+      { role: "assistant" as const, content: "答", status: "ready" as const },
+    ];
+
+    const first = hydrateMessages(saved);
+    const second = hydrateMessages(saved);
+
+    expect(first[0].id).toBe("legacy-0");
+    expect(first[1].id).toBe("legacy-1");
+    // 稳定：两次读同一个文件得到同样的 id，避免列表抖动
+    expect(second.map((m) => m.id)).toEqual(first.map((m) => m.id));
+  });
+
+  it("已有 id 的消息不被覆盖", () => {
+    const saved: ChatMessage[] = [
+      { id: "keep-me", role: "user", content: "问", status: "ready" },
+    ];
+    expect(hydrateMessages(saved)[0].id).toBe("keep-me");
+  });
+
+  /** 空会话不该崩。 */
+  it("空数组原样返回", () => {
+    expect(hydrateMessages([])).toEqual([]);
   });
 });

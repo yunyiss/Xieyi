@@ -32,7 +32,7 @@ import {
   appendVersion,
   applyCompaction,
   canRegenerateAt,
-  ensureMessageIds,
+  hydrateMessages,
   indexOfMessage,
   makeMessage,
   neighborVersion,
@@ -48,16 +48,6 @@ function newSessionId(): string {
   const c = globalThis.crypto as Crypto | undefined;
   if (c?.randomUUID) return c.randomUUID();
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-}
-
-/**
- * 读入旧会话时补齐消息 id（旧文件没有这个字段）；
- * 上次异常退出留下的 pending 不会再有后续事件，统一按 stopped 处理。
- */
-function hydrate(messages: ChatMessage[]): ChatMessage[] {
-  return ensureMessageIds(messages).map(
-    (m): ChatMessage => (m.status === "pending" ? { ...m, status: "stopped" } : m),
-  );
 }
 
 interface Props {
@@ -605,7 +595,7 @@ export function Chat({
     if (!target) return;
 
     setSessionId(id);
-    setMessages(hydrate(target.messages));
+    setMessages(hydrateMessages(target.messages));
     // 会话里记的模型可能是翻译模型（或早已被移除），直接 setModel 会把
     // 一个不能对话的模型塞回输入区。只在它确实可用时才恢复。
     if (target.model && models.some((m) => m.id === target.model)) {
