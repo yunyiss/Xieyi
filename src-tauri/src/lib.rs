@@ -235,22 +235,6 @@ fn show_error_dialog_windows(text: &str) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // ── 单实例：必须在任何 Tauri 代码之前 ────────────────────────────
-    // `tauri-plugin-single-instance` 的互斥量在 setup 里才检查，
-    // 而 WebView 在 `build()` 内部就已创建。两个实例同时启动时
-    // 都走到创建 WebView，互相撞 `EBWebView` 目录，**双双 panic**。
-    // 实测：同时启动 A、B，两个都崩，进程数为 0。
-    //
-    // 所以这里先抢命名互斥量：拿不到就说明有实例在跑，
-    // 把它的窗口拉到前面，然后本进程直接退出——连 WebView 都不碰。
-    let _guard = match single_instance::acquire() {
-        Ok(g) => g,
-        Err(()) => {
-            // 已有实例，窗口已聚焦，静默退出
-            std::process::exit(0);
-        }
-    };
-
     // ── 日志前置 ────────────────────────────────────────────────────
     // 必须在 `Builder::new()` 之前：窗口和 WebView 是在 `build()` 内部
     // 创建的（tauri-2.12.5/src/app.rs:2692），失败时直接 `panic!`。
@@ -262,6 +246,21 @@ pub fn run() {
     init_early_logging();
 
     logging::info("app", format!("启动 Xieyi v{}", env!("CARGO_PKG_VERSION")));
+
+    // ── 单实例：必须先于任何 Tauri 代码 ─────────────────────────────
+    // `tauri-plugin-single-instance` 的互斥量在 setup 里才检查，
+    // 而 WebView 在 `build()` 内部就已创建。两个实例同时启动时
+    // 都走到创建 WebView，互相撞 `EBWebView` 目录，**双双 panic**。
+    //
+    // 放在日志初始化**之后**：第二实例的聚焦失败需要留痕，
+    // 否则用户只会看到「点了图标没反应」，无从排查。
+    let _guard = match single_instance::acquire() {
+        Ok(g) => g,
+        Err(()) => {
+            // 已有实例，窗口已聚焦（失败会记 warn），静默退出
+            std::process::exit(0);
+        }
+    };
 
     tauri::Builder::default()
         // 插件版单实例不再注册：上面的互斥量已经保证唯一。

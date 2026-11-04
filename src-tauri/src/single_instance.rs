@@ -137,15 +137,540 @@ mod unix_impl {
 
     /// 聚焦已在运行的窗口。
     ///
-    /// **尚未实现**：Linux 上没有跨桌面环境通用的"按 PID 找窗口并聚焦"接口
-    /// （X11 可以走 `_NET_WM_PID` + `XRaiseWindow`，Wayland 出于安全考虑
-    /// 基本禁止）。这里保持空实现，行为等同于「第二个实例静默退出」——
-    /// 对用户来说至少不会开出两个抢显存的实例。
+    /// 聚焦已在运行的窗口。
     ///
-    /// 后续要补的话：X11 用 `xdotool search --pid <pid> windowactivate`，
-    /// 需要检测 `XDG_SESSION_TYPE` 是否为 `x11`。
+    /// ## 平台差异
+    ///
+    /// **X11**：可以通过 `_NET_WM_PID` 属性按 PID 找到窗口，再
+    /// `XRaiseWindow` + `XSetInputFocus` 前置。本实现走这条路。
+    ///
+    /// **Wayland**：协议层面禁止应用获取其他窗口的引用，也没有
+    /// "raise 任意窗口"的接口。这不是能力缺失，是安全模型的设计选择。
+    /// 因此 Wayland 下本函数静默返回，行为等同于「第二个实例直接退出」。
+    ///
+    /// ## 为什么用 dlopen 而不是链接 libX11
+    ///
+    /// 链接 `libX11` 会让二进制在**没有 X11 的机器上无法启动**
+    /// （包括纯 Wayland 系统）。用 `dlopen` 动态加载：加载失败就跳过
+    /// 聚焦，不影响启动。这与「聚焦是锦上添花」的定位一致。
     pub fn focus_existing_window() {
-        // 有意留空，原因见上
+        // Wayland 下不做尝试：既没有可用接口，也没有绕过的手段
+        if std::env::var("XDG_SESSION_TYPE")
+            .map(|t| t.eq_ignore_ascii_case("wayland"))
+            .unwrap_or(false)
+            || std::env::var_os("WAYLAND_DISPLAY").is_some()
+        {
+            crate::logging::info("single", "Wayland 会话，跳过窗口聚焦");
+            return;
+        }
+
+        // 自己的 PID 用来排除；要找的是**另一个**同名进程
+        let Some(pid) = find_other_own_process() else {
+            return;
+        };
+
+        crate::logging::info("single", format!("尝试聚焦已是实例的窗口 pid={pid}"));
+
+        if let Err(e) = x11::raise_window_of_pid(pid) {
+            crate::logging::warn("single", format!("聚焦窗口失败：{e}"));
+        }
+    }
+
+    /// 找出另一个同名可执行文件的进程 PID（排除自己）。
+    ///
+    /// 读 `/proc/<pid>/exe` 的软链接目标做比较——这是 Linux 上判定
+    /// 「同一个程序」最可靠的方式，比命令行字符串匹配更准。
+    fn find_other_own_process() -> Option<u32> {
+        let own = std::env::current_exe().ok()?;
+        let own = std::fs::canonicalize(&own).ok()?;
+        let self_pid = std::process::id();
+
+        for entry in std::fs::read_dir("/proc").ok()? {
+            let entry = entry.ok()?;
+            let name = entry.file_name();
+            let Some(pid) = name.to_str().and_then(|s| s.parse::<u32>().ok()) else {
+                continue;
+            };
+            if pid == self_pid {
+                continue;
+            }
+            let exe_link = entry.path().join("exe");
+            let Ok(target) = std::fs::canonicalize(&exe_link) else {
+                // 无权限读别的用户的进程，正常，跳过
+                continue;
+            };
+            if target == own {
+                return Some(pid);
+            }
+        }
+        None
+    }
+
+    /// X11 操作。全部通过 dlopen 动态解析符号。
+    mod x11 {
+        use std::ffi::{c_char, c_int, c_ulong, c_void, CString};
+
+        /// `XWindowAttributes` 只需要 layout 正确，我们只用它的 map_state。
+        /// 完整结构体字段很多，这里按 Xlib 的顺序声明到需要的字段为止。
+        #[repr(C)]
+        struct XWindowAttributes {
+            x: c_int,
+            y: c_int,
+            width: c_int,
+            height: c_int,
+            border_width: c_int,
+            depth: c_int,
+            visual: *mut c_void,
+            root: c_ulong,
+            class: c_int,
+            bit_gravity: c_int,
+            win_gravity: c_int,
+            backing_store: c_int,
+            backing_planes: c_ulong,
+            backing_pixel: c_ulong,
+            save_under: c_int,
+            colormap: c_ulong,
+            map_installed: c_int,
+            map_state: c_int,
+            all_event_masks: CLong,
+            your_event_mask: CLong,
+            do_not_propagate_mask: CLong,
+            override_redirect: c_int,
+            screen: *mut c_void,
+        }
+
+        type CLong = i64;
+
+        type QueryTreeFn = unsafe extern "C" fn(
+            *mut c_void,
+            c_ulong,
+            *mut c_ulong,
+            *mut c_ulong,
+            *mut *mut c_ulong,
+            *mut u32,
+        ) -> c_int;
+        type GetPropertyFn = unsafe extern "C" fn(
+            *mut c_void,
+            c_ulong,
+            c_ulong,
+            i64,
+            i64,
+            c_int,
+            c_ulong,
+            *mut c_ulong,
+            *mut c_int,
+            *mut c_ulong,
+            *mut c_ulong,
+            *mut *mut u8,
+        ) -> c_int;
+        type GetAttrsFn =
+            unsafe extern "C" fn(*mut c_void, c_ulong, *mut XWindowAttributes) -> c_int;
+        type FreeFn = unsafe extern "C" fn(*mut c_void) -> c_int;
+
+        // X11 的 map_state 取值
+        const IS_VIEWABLE: c_int = 2;
+
+        // dlopen / dlsym
+        #[link(name = "dl")]
+        unsafe extern "C" {
+            fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
+            fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+            fn dlerror() -> *mut c_char;
+        }
+
+        type SendEventFn = unsafe extern "C" fn(
+            *mut c_void,
+            c_ulong,
+            c_int,
+            CLong,
+            *mut c_void,
+        ) -> c_int;
+        type InternAtomFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_int) -> c_ulong;
+        type FlushFn = unsafe extern "C" fn(*mut c_void) -> c_int;
+
+        const RTLD_LAZY: c_int = 1;
+        const RTLD_NOLOAD: c_int = 4;
+
+        struct Lib {
+            handle: *mut c_void,
+        }
+
+        impl Drop for Lib {
+            fn drop(&mut self) {
+                // 不用 dlclose：Xlib 有自己的全局状态，关掉可能影响正在
+                // 运行的 WebView（GTK 也用 X11）。进程退出时由系统回收。
+                let _ = self.handle;
+            }
+        }
+
+        impl Lib {
+            fn open() -> Result<Self, String> {
+                // 先试 RTLD_NOLOAD：如果 GTK/WebKit 已经把 X11 加载进进程，
+                // 直接复用，避免重复初始化
+                for name in ["libX11.so.6 ", "libX11.so "] {
+                    let cname = name.as_ptr() as *const c_char;
+                    let h = unsafe { dlopen(cname, RTLD_LAZY | RTLD_NOLOAD) };
+                    if !h.is_null() {
+                        return Ok(Self { handle: h });
+                    }
+                    let h = unsafe { dlopen(cname, RTLD_LAZY) };
+                    if !h.is_null() {
+                        return Ok(Self { handle: h });
+                    }
+                }
+                let msg = unsafe {
+                    let e = dlerror();
+                    if e.is_null() {
+                        "libX11 加载失败".to_string()
+                    } else {
+                        std::ffi::CStr::from_ptr(e).to_string_lossy().to_string()
+                    }
+                };
+                Err(msg)
+            }
+
+            fn sym(&self, name: &str) -> Result<*mut c_void, String> {
+                let cname = CString::new(name).map_err(|e| e.to_string())?;
+                // SAFETY: handle 来自 dlopen，name 是有效的 C 字符串
+                let p = unsafe { dlsym(self.handle, cname.as_ptr()) };
+                if p.is_null() {
+                    return Err(format!("找不到符号 {name}"));
+                }
+                Ok(p)
+            }
+        }
+
+        /// 通过 EWMH 的 `_NET_ACTIVE_WINDOW` 客户端消息请求 WM 激活窗口。
+        ///
+        /// 这是**唯一跨 WM 通用**的"把窗口带到前面"方式。直接 XRaiseWindow
+        /// 或 XMapRaised 只能改变堆叠顺序，无法让 WM 取消最小化标记。
+        ///
+        /// 消息格式（EWMH 规范）：
+        /// - data[0] = 1（来源：应用主动请求）
+        /// - data[1] = CurrentTime
+        /// - data[2] = 0（无需额外处理）
+        #[allow(clippy::too_many_arguments)]
+        unsafe fn send_activate_request(
+            dpy: *mut c_void,
+            root: c_ulong,
+            window: c_ulong,
+            x_send_event: SendEventFn,
+            x_intern_atom: InternAtomFn,
+            x_flush: FlushFn,
+        ) {
+            #[repr(C)]
+            #[derive(Clone, Copy)]
+            struct XClientMessageEvent {
+                type_: c_int,
+                serial: c_ulong,
+                send_event: c_int,
+                display: *mut c_void,
+                window: c_ulong,
+                message_type: c_ulong,
+                format: c_int,
+                data: [i64; 5],
+            }
+
+            let atom = unsafe { (x_intern_atom)(dpy, c"_NET_ACTIVE_WINDOW".as_ptr(), 0) };
+            if atom == 0 {
+                return;
+            }
+
+            let mut ev = XClientMessageEvent {
+                type_: 33, // ClientMessage
+                serial: 0,
+                send_event: 1,
+                display: dpy,
+                window,
+                message_type: atom,
+                format: 32,
+                // data[0]=2 表示"来自分页器"，比 1（应用主动请求）
+                // 更强制；部分 WM（xfwm4）对 1 会做焦点窃取检查后忽略
+                data: [2, 0, 0, 0, 0],
+            };
+
+            // SubstructureRedirectMask | SubstructureNotifyMask = 0x00140000
+            unsafe {
+                (x_send_event)(dpy, root, 0, 0x0014_0000, &mut ev as *mut _ as *mut c_void);
+                (x_flush)(dpy);
+            }
+        }
+
+        /// 递归遍历窗口树，找出属于 `pid` 且面积最大的窗口。
+        ///
+        /// **必须递归**：`XQueryTree` 只返回直接子窗口。Tauri 的主窗口
+        /// 实测挂在第三层，只遍历顶层时完全找不到，只能找到 10x10 的
+        /// 辅助窗口。
+        ///
+        /// 选面积最大的而非第一个：一个进程通常有多个窗口，
+        /// 主窗口面积远大于辅助窗口。
+        #[allow(clippy::too_many_arguments)]
+        unsafe fn collect_best_window(
+            dpy: *mut c_void,
+            parent: c_ulong,
+            pid: u32,
+            net_wm_pid: c_ulong,
+            xa_cardinal: c_ulong,
+            x_query_tree: &QueryTreeFn,
+            x_get_property: &GetPropertyFn,
+            x_get_attrs: &GetAttrsFn,
+            x_free: &FreeFn,
+            best: &mut c_ulong,
+            best_area: &mut i64,
+            depth: u32,
+        ) {
+            // 防御异常深的树（正常桌面不会超过 10 层）
+            if depth > 16 {
+                return;
+            }
+
+            let mut root_ret: c_ulong = 0;
+            let mut parent_ret: c_ulong = 0;
+            let mut children: *mut c_ulong = std::ptr::null_mut();
+            let mut nchildren: u32 = 0;
+
+            if unsafe { (x_query_tree)(
+                dpy,
+                parent,
+                &mut root_ret,
+                &mut parent_ret,
+                &mut children,
+                &mut nchildren,
+            ) } == 0
+            {
+                return;
+            }
+
+            for i in 0..nchildren as isize {
+                let win = unsafe { *children.offset(i) };
+
+                // 先看这个窗口是不是目标进程的
+                let mut actual_type: c_ulong = 0;
+                let mut actual_format: c_int = 0;
+                let mut nitems: c_ulong = 0;
+                let mut bytes_after: c_ulong = 0;
+                let mut prop: *mut u8 = std::ptr::null_mut();
+
+                let status = unsafe { (x_get_property)(
+                    dpy,
+                    win,
+                    net_wm_pid,
+                    0,
+                    1,
+                    0,
+                    xa_cardinal,
+                    &mut actual_type,
+                    &mut actual_format,
+                    &mut nitems,
+                    &mut bytes_after,
+                    &mut prop,
+                ) };
+
+                let mut matched = false;
+                if status == 0 && nitems > 0 && !prop.is_null() {
+                    let wpid = unsafe { *(prop as *const c_ulong) };
+                    matched = wpid as u32 == pid;
+                    unsafe { (x_free)(prop as *mut c_void) };
+                }
+
+                if matched {
+                    let mut attrs: XWindowAttributes = unsafe { std::mem::zeroed() };
+                    if unsafe { (x_get_attrs)(dpy, win, &mut attrs) } != 0
+                        && attrs.width > 0
+                        && attrs.height > 0
+                    {
+                        let area = attrs.width as i64 * attrs.height as i64;
+                        let _ = depth; // 深度仅用于防御，不需要输出
+                        if area > *best_area {
+                            *best_area = area;
+                            *best = win;
+                        }
+                    }
+                }
+
+                // 继续往下找（无论本层是否匹配）
+                unsafe {
+                    collect_best_window(
+                    dpy,
+                    win,
+                    pid,
+                    net_wm_pid,
+                    xa_cardinal,
+                    x_query_tree,
+                    x_get_property,
+                    x_get_attrs,
+                    x_free,
+                    best,
+                        best_area,
+                        depth + 1,
+                    );
+                }
+            }
+
+            if !children.is_null() {
+                unsafe { (x_free)(children as *mut c_void) };
+            }
+        }
+
+        /// 按 PID 找到可见窗口并前置。
+        pub fn raise_window_of_pid(pid: u32) -> Result<(), String> {
+            let lib = Lib::open()?;
+
+            unsafe {
+                // 函数指针签名（Xlib）
+                type XOpenDisplay = unsafe extern "C" fn(*const c_char) -> *mut c_void;
+                type XInternAtom =
+                    unsafe extern "C" fn(*mut c_void, *const c_char, c_int) -> c_ulong;
+                type XQueryTree = unsafe extern "C" fn(
+                    *mut c_void,
+                    c_ulong,
+                    *mut c_ulong,
+                    *mut c_ulong,
+                    *mut *mut c_ulong,
+                    *mut u32,
+                ) -> c_int;
+                type XGetWindowProperty = unsafe extern "C" fn(
+                    *mut c_void,
+                    c_ulong,
+                    c_ulong,
+                    i64,
+                    i64,
+                    c_int,
+                    c_ulong,
+                    *mut c_ulong,
+                    *mut c_int,
+                    *mut c_ulong,
+                    *mut c_ulong,
+                    *mut *mut u8,
+                ) -> c_int;
+                type XGetWindowAttributes =
+                    unsafe extern "C" fn(*mut c_void, c_ulong, *mut XWindowAttributes) -> c_int;
+                        type XMapRaised = unsafe extern "C" fn(*mut c_void, c_ulong) -> c_int;
+                type XSetInputFocus =
+                    unsafe extern "C" fn(*mut c_void, c_ulong, c_int, c_ulong) -> c_int;
+                        type XFlush = unsafe extern "C" fn(*mut c_void) -> c_int;
+                type XSendEvent = unsafe extern "C" fn(
+                    *mut c_void,
+                    c_ulong,
+                    c_int,
+                    CLong,
+                    *mut c_void,
+                ) -> c_int;
+                type XSync = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
+                type XFree = unsafe extern "C" fn(*mut c_void) -> c_int;
+                type XCloseDisplay = unsafe extern "C" fn(*mut c_void) -> c_int;
+
+                let x_open_display: XOpenDisplay = std::mem::transmute(lib.sym("XOpenDisplay")?);
+                let x_intern_atom: XInternAtom = std::mem::transmute(lib.sym("XInternAtom")?);
+                let x_query_tree: XQueryTree = std::mem::transmute(lib.sym("XQueryTree")?);
+                let x_get_property: XGetWindowProperty =
+                    std::mem::transmute(lib.sym("XGetWindowProperty")?);
+                let x_get_attrs: XGetWindowAttributes =
+                    std::mem::transmute(lib.sym("XGetWindowAttributes")?);
+                let x_focus: XSetInputFocus = std::mem::transmute(lib.sym("XSetInputFocus")?);
+                let x_map_raised: XMapRaised = std::mem::transmute(lib.sym("XMapRaised")?);
+                let x_flush: XFlush = std::mem::transmute(lib.sym("XFlush")?);
+                let x_send_event: XSendEvent = std::mem::transmute(lib.sym("XSendEvent")?);
+                let x_sync: XSync = std::mem::transmute(lib.sym("XSync")?);
+                let x_free: XFree = std::mem::transmute(lib.sym("XFree")?);
+                let x_close: XCloseDisplay = std::mem::transmute(lib.sym("XCloseDisplay")?);
+
+                let dpy = x_open_display(std::ptr::null());
+                if dpy.is_null() {
+                    return Err("无法连接 X server（DISPLAY 未设置？）".into());
+                }
+
+                // 遍历整棵窗口树，找 _NET_WM_PID == 目标 pid 的窗口
+                let net_wm_pid = x_intern_atom(dpy, c"_NET_WM_PID".as_ptr(), 0);
+                let xa_cardinal = 6u64; // XA_CARDINAL
+
+                // Screen 的 root 需要 XDefaultRootWindow，这里用 XQueryTree 传 0 不行，
+                // 改用 XDefaultRootWindow 符号
+                type XDefaultRootWindow = unsafe extern "C" fn(*mut c_void) -> c_ulong;
+                let x_default_root: XDefaultRootWindow =
+                    std::mem::transmute(lib.sym("XDefaultRootWindow")?);
+                let root_win = x_default_root(dpy);
+
+                // **必须递归遍历整棵窗口树**：XQueryTree 只返回直接子窗口，
+                // 而 Tauri 的主窗口可能挂在更深的层级下。
+                // 实测：只遍历顶层时只能找到 10x10 的辅助窗口，
+                // 1080x720 的主窗口完全找不到。
+                let mut best: c_ulong = 0;
+                let mut best_area: i64 = -1;
+
+                collect_best_window(
+                    dpy,
+                    root_win,
+                    pid,
+                    net_wm_pid,
+                    xa_cardinal,
+                    &x_query_tree,
+                    &x_get_property,
+                    &x_get_attrs,
+                    &x_free,
+                    &mut best,
+                    &mut best_area,
+                    0,
+                );
+
+                let found = best;
+                if found == 0 {
+                    x_close(dpy);
+                    return Err(format!("pid={pid} 没有可用的窗口"));
+                }
+
+                // **最小化不是单纯的 unmapped**：窗口管理器会在
+                // `_NET_WM_STATE` 里记一个 `_NET_WM_STATE_HIDDEN`。
+                // 只调 XMapRaised 会让窗口重新 map，但 WM 仍认为它是
+                // 最小化状态，于是立刻又收起来。
+                //
+                // 正确做法是走 EWMH 的标准流程：向 root 窗口发一条
+                // `_NET_ACTIVE_WINDOW` 客户端消息，由 WM 负责取消最小化
+                // 并聚焦。这是唯一跨 WM 通用的方式。
+                send_activate_request(
+                    dpy,
+                    root_win,
+                    found,
+                    x_send_event,
+                    x_intern_atom,
+                    x_flush,
+                );
+
+                // 兜底：有些 WM 不响应激活请求，直接 map 一次
+                x_map_raised(dpy, found);
+                x_flush(dpy);
+
+                // **等映射真正生效再设焦点**。
+                // XSetInputFocus 对尚未 map 的窗口返回 BadMatch，
+                // 而 map 是异步的——XFlush 只是把请求发出去。
+                //
+                // 轮询 map_state 直到 IsViewable：通常 1-2 次就够，
+                // 上限 20 次（约 200ms）防止 X server 异常时卡死。
+                let mut tries = 0;
+                loop {
+                    let mut attrs: XWindowAttributes = std::mem::zeroed();
+                    let ok = x_get_attrs(dpy, found, &mut attrs) != 0;
+                    if ok && attrs.map_state == IS_VIEWABLE {
+                        break;
+                    }
+                    tries += 1;
+                    if tries > 20 {
+                        x_close(dpy);
+                        return Err("窗口映射超时".into());
+                    }
+                    // XSync 让 X server 处理完已发出的请求
+                    x_sync(dpy, 0);
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+
+                // RevertToParent = 2, CurrentTime = 0
+                x_focus(dpy, found, 2, 0);
+                x_flush(dpy);
+                x_close(dpy);
+
+                Ok(())
+            }
+        }
     }
 }
 
