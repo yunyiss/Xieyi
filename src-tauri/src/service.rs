@@ -89,6 +89,11 @@ pub struct Service {
     child: tokio::sync::Mutex<tokio::process::Child>,
     loaded: tokio::sync::Mutex<Vec<String>>,
     client: reqwest::Client,
+    /// Windows Job Object 句柄。持有期间推理进程树受内核级保护：
+    /// 主进程无论正常退出还是被强杀，整个组都会被一并终止。
+    ///
+    /// Unix 上没有对应概念（进程组已覆盖），恒为 `None`。
+    _job: Option<crate::job_object::JobHandle>,
 }
 
 #[derive(Serialize, Clone)]
@@ -900,6 +905,13 @@ async fn spawn(app: &AppHandle, gpu_layers: u64) -> Result<Service, String> {
 
     let child = cmd.spawn().map_err(|e| format!("启动推理引擎失败: {e}"))?;
 
+    // **紧接 spawn 之后**加入 Job Object：这是内核级的进程树保护，
+    // 覆盖「主进程被强杀」这类 `Service::kill()` 跑不到的路径。
+    // 失败只记日志不阻断——没有 Job 时仍能靠 kill() 清理。
+    let job = child
+        .id()
+        .and_then(crate::job_object::JobHandle::assign);
+
     // 只记端口和路径，**不记 api-key**：日志可能被发出来排查问题，
     // 本地 key 虽然只在进程内有效，但没有理由写进磁盘。
     crate::logging::info(
@@ -917,6 +929,7 @@ async fn spawn(app: &AppHandle, gpu_layers: u64) -> Result<Service, String> {
         key,
         loaded: tokio::sync::Mutex::new(Vec::new()),
         client: reqwest::Client::new(),
+        _job: job,
     };
 
     // 等待服务就绪

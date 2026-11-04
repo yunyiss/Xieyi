@@ -1,5 +1,6 @@
 mod batch;
 mod hardware;
+mod job_object;
 mod logging;
 mod models;
 mod params;
