@@ -25,6 +25,13 @@ use crate::models;
 pub fn shutdown_blocking(app: &AppHandle, timeout: Duration) {
     let state = app.state::<AppState>();
 
+    // 无锁读取：退出时 service 锁可能被推理请求持着
+    let api_key = state
+        .api_key
+        .lock()
+        .map(|k| k.clone())
+        .unwrap_or_default();
+
     match state.service.try_lock() {
         Ok(mut guard) => {
             if let Some(svc) = guard.take() {
@@ -40,7 +47,7 @@ pub fn shutdown_blocking(app: &AppHandle, timeout: Duration) {
                     }
                     Err(_) => {
                         // 建不了运行时：退回按 PID 强杀孤儿
-                        kill_llama_servers_spawned_by_us();
+                        kill_llama_servers_spawned_by_us(&api_key);
                     }
                 }
             }
@@ -52,7 +59,7 @@ pub fn shutdown_blocking(app: &AppHandle, timeout: Duration) {
                 "app",
                 "退出时服务锁被占用，改为按 PID 强制回收推理进程",
             );
-            kill_llama_servers_spawned_by_us();
+            kill_llama_servers_spawned_by_us(&api_key);
         }
     }
 }
@@ -60,20 +67,92 @@ pub fn shutdown_blocking(app: &AppHandle, timeout: Duration) {
 /// 兜底：杀掉父进程已退出（或就是我们）的 `llama-server.exe`。
 ///
 /// 只认**父进程不存在**的那些：正在被别的程序正常使用的实例不碰。
+/// 兜底清理：杀掉**本程序**遗留的 llama-server。
+///
+/// ## 只认自己的进程
+///
+/// 早期实现按「父进程已退出」判断孤儿，那会误杀用户自己开的 llama-server
+/// ——比如他从终端启动后关了终端，父进程同样消失。
+///
+/// 现在的判据是**命令行里带本程序的 api-key**。key 在 `spawn()` 时随机
+/// 生成、只存在于本进程内存中，因此「命令行含这个 key」可以确定是本次
+/// 运行启动的实例，不会碰到别人的。
 #[cfg(windows)]
-fn kill_llama_servers_spawned_by_us() {
+fn kill_llama_servers_spawned_by_us(api_key: &str) {
     use std::os::windows::process::CommandExt;
 
-    // 用 PowerShell 找孤儿：父进程已退出的 llama-server
-    let script = "Get-CimInstance Win32_Process -Filter \"Name='llama-server.exe'\" |          ForEach-Object {            $p = Get-Process -Id $_.ParentProcessId -ErrorAction SilentlyContinue;            if (-not $p) { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; Write-Output $_.ProcessId }          }";
+    if api_key.is_empty() {
+        return;
+    }
+
+    // 用 key 而非进程名做过滤条件
+    let script = format!(
+        "Get-CimInstance Win32_Process -Filter \"Name='llama-server.exe'\" | \
+         Where-Object {{ $_.CommandLine -like '*-{key}*' }} | \
+         ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}",
+        key = escape_ps(api_key)
+    );
+
     let mut cmd = std::process::Command::new("powershell");
-    cmd.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script]);
+    cmd.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        &script,
+    ]);
     cmd.creation_flags(0x0800_0000);
     let _ = cmd.output();
 }
 
-#[cfg(not(windows))]
-fn kill_llama_servers_spawned_by_us() {}
+/// PowerShell 单引号字符串里的转义：单引号要写两遍。
+#[cfg(windows)]
+fn escape_ps(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+/// Unix：按进程组兜底。
+///
+/// `PR_SET_PDEATHSIG` 已覆盖「父进程被 kill」的场景，这里是第二重保证：
+/// 遍历 `/proc`，找出命令行含本程序 api-key 的 llama-server 并终止。
+#[cfg(unix)]
+fn kill_llama_servers_spawned_by_us(api_key: &str) {
+    if api_key.is_empty() {
+        return;
+    }
+
+    let needle = format!("--api-key {api_key}");
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let cmdline_path = entry.path().join("cmdline");
+        let Ok(raw) = std::fs::read(&cmdline_path) else {
+            continue;
+        };
+        // /proc/<pid>/cmdline 用 NUL 分隔
+        let cmdline = String::from_utf8_lossy(&raw).replace('\0', " ");
+        if !cmdline.contains(&needle) {
+            continue;
+        }
+        // 只杀 llama-server，防止误伤（理论上 key 唯一，但多加一层无妨）
+        if !cmdline.contains("llama-server") {
+            continue;
+        }
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .status();
+    }
+}
 
 
 use crate::params::{self, Thinking};
@@ -280,6 +359,13 @@ pub struct AppState {
     /// 句子级翻译缓存：相同模型 / 风格 / 语言对 / 术语表 / 原文直接命中。
     /// 值里带上当时的质检统计，命中缓存时批量汇总仍然准确。
     pub cache: tokio::sync::Mutex<HashMap<String, (String, SegmentStats)>>,
+
+    /// 本次运行使用的 api-key。
+    ///
+    /// 与 `Service.key` 重复持有是有意的：退出清理时可能拿不到
+    /// `service` 锁（推理请求正持着），而回收孤儿进程需要靠 key
+    /// 识别「哪些是我们启动的」。存在这里可以无锁读取。
+    api_key: std::sync::Mutex<String>,
 }
 
 impl Default for AppState {
@@ -294,6 +380,7 @@ impl Default for AppState {
             gpu_layers: AtomicU64::new(models::AUTO_LAYERS),
             pinned: tokio::sync::Mutex::new(HashSet::new()),
             cache: tokio::sync::Mutex::new(HashMap::new()),
+            api_key: std::sync::Mutex::new(String::new()),
         }
     }
 }
@@ -898,9 +985,31 @@ async fn spawn(app: &AppHandle, gpu_layers: u64) -> Result<Service, String> {
     // 之后 `killpg(-pid)` 就能一次带走整组。
     #[cfg(unix)]
     {
-        // `process_group` 直接定义在 `std::process::Command` 上（Rust 1.64+），
-        // 不需要 `CommandExt` trait
+        // `process_group` 与 `pre_exec` 都定义在 `std::process::Command` 上
+        // （Rust 1.64+ / 1.2+），不需要 `CommandExt` trait
         cmd.process_group(0);
+
+        // **PR_SET_PDEATHSIG**：父进程死亡时内核给本进程发 SIGTERM。
+        //
+        // 进程组只能保证「我们主动 killpg 时」整组退出。如果主进程被
+        // `kill -9` 或崩溃，没人发信号，孤儿就留下来了——这正是
+        // Windows 上 Job Object 解决的同一个问题。
+        //
+        // pre_exec 在 fork 之后、exec 之前执行，此时设置才有效：
+        // PDEATHSIG 绑定的是「调用 prctl 那一刻的父进程」。
+        unsafe {
+            cmd.pre_exec(|| {
+                #[cfg(target_os = "linux")]
+                {
+                    // PR_SET_PDEATHSIG = 1, SIGTERM = 15
+                    unsafe extern "C" {
+                        fn prctl(option: i32, ...) -> i32;
+                    }
+                    prctl(1, 15i32);
+                }
+                Ok(())
+            });
+        }
     }
 
     let child = cmd.spawn().map_err(|e| format!("启动推理引擎失败: {e}"))?;
@@ -922,6 +1031,14 @@ async fn spawn(app: &AppHandle, gpu_layers: u64) -> Result<Service, String> {
             exe.to_string_lossy()
         ),
     );
+
+    // 把 api-key 同步到 AppState，供退出清理无锁读取。
+    // 退出时 service 锁可能被推理请求持着，那时拿不到 Service.key。
+    if let Some(state) = app.try_state::<AppState>() {
+        if let Ok(mut slot) = state.api_key.lock() {
+            *slot = key.clone();
+        }
+    }
 
     let service = Service {
         child: tokio::sync::Mutex::new(child),
