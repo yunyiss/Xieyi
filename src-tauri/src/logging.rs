@@ -257,9 +257,62 @@ fn local_offset_secs() -> i64 {
     }
 }
 
-#[cfg(not(windows))]
+/// Unix：用 `localtime_r` 问系统要时区偏移。
+///
+/// 之前这里直接 `0`（= UTC），日志时间和用户的实际时钟差 8 小时。
+/// 上面 `timestamp()` 的注释写着「日志是给人看的」，那条要求对
+/// Linux/macOS 同样成立，不能只在 Windows 上做到。
+///
+/// 不引 `libc` crate：只用到一个 `tm` 结构和一个函数，手写 FFI
+/// 比多一个依赖划算（与 `single_instance` 里的 `flock` 同一思路）。
+#[cfg(unix)]
 fn local_offset_secs() -> i64 {
-    0
+    use std::mem::MaybeUninit;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// glibc / Darwin 的 `struct tm` 布局一致：9 个 int，顺序相同。
+    #[repr(C)]
+    struct Tm {
+        tm_sec: i32,
+        tm_min: i32,
+        tm_hour: i32,
+        tm_mday: i32,
+        tm_mon: i32,
+        tm_year: i32,
+        tm_wday: i32,
+        tm_yday: i32,
+        tm_isdst: i32,
+        // 后面还有 tm_gmtoff / tm_zone，但我们不需要，不声明
+    }
+
+    unsafe extern "C" {
+        fn localtime_r(timep: *const i64, result: *mut Tm) -> *mut Tm;
+    }
+
+    let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        Err(_) => return 0,
+    };
+
+    // SAFETY: `localtime_r` 是线程安全的可重入版本（这正是选它而非
+    // `localtime` 的原因——日志在后台线程里写）。返回的指针就是
+    // 我们传进去的 `result`，只要它非空即表示填充成功。
+    unsafe {
+        let mut out = MaybeUninit::<Tm>::zeroed();
+        if localtime_r(&now, out.as_mut_ptr()).is_null() {
+            return 0;
+        }
+        let tm = out.assume_init();
+        let _ = tm.tm_isdst; // 夏令时已由 localtime_r 算进 tm_hour
+
+        // 把「本地时间各字段」和「UTC 各字段」都换算成当天秒数再相减。
+        // 不能直接 `tm_hour * 3600` 了事——那样算的是「本地时钟读数」，
+        // 不是「偏移量」，遇到跨日（如 UTC 23:00 对应东八区次日 07:00）
+        // 就会得到负数。
+        let local_secs_of_day = tm.tm_hour as i64 * 3600 + tm.tm_min as i64 * 60 + tm.tm_sec as i64;
+        let utc = now.rem_euclid(86_400);
+        local_secs_of_day - utc
+    }
 }
 
 fn day_to_date(day: u64) -> String {
@@ -274,8 +327,14 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// 当前的**本地**日期序号。
+///
+/// 必须用本地日期而不是 UTC：日志文件名和 `timestamp()` 里的日期是
+/// 同一个东西，一个按 UTC 取、一个按本地取，跨日时段就会对不上——
+/// 东八区凌晨 01:00 写的日志，时间戳是今天，文件名却是昨天，
+/// 用户按当天日期找文件会找不到。
 fn day_number() -> u64 {
-    now_secs() / 86_400
+    (now_secs() as i64).saturating_add(local_offset_secs()).max(0) as u64 / 86_400
 }
 
 // ── 日期换算 ────────────────────────────────────────────────────────────
@@ -362,5 +421,41 @@ mod tests {
         assert!(Level::Error < Level::Warn);
         assert!(Level::Warn < Level::Info);
         assert!(Level::Info < Level::Debug);
+    }
+
+    /// 日志文件名里的日期，必须和 `timestamp()` 打出的日期一致。
+    ///
+    /// 这条锁住一个真坑：`day_number()` 曾用 UTC，而 `timestamp()`
+    /// 用本地时间。东八区凌晨 01:00 写的日志，时间戳显示今天、
+    /// 文件名却是昨天，用户按当天日期去找文件会找不到。
+    #[test]
+    fn log_filename_date_matches_timestamp_date() {
+        let file_date = day_to_date(day_number());
+
+        // timestamp() 前 10 个字符就是 YYYY-MM-DD
+        let stamp = timestamp();
+        let stamp_date = &stamp[..10];
+
+        assert_eq!(
+            file_date, stamp_date,
+            "日志文件名日期 {file_date} 与时间戳日期 {stamp_date} 不一致"
+        );
+    }
+
+    /// 本地时区偏移必须在真实范围内。
+    ///
+    /// 这条防的是「Unix 分支无条件返回 0」那种退化：虽然 0 在合法
+    /// 范围内（UTC），但真出现时日志时间会和用户时钟差好几个小时。
+    /// 这里只做范围校验——CI 机器的时区不可控，不能断言具体值。
+    #[test]
+    fn local_offset_is_plausible() {
+        let off = local_offset_secs();
+        // 真实世界时区范围：UTC-12:00 ~ UTC+14:00
+        assert!(
+            (-12 * 3600..=14 * 3600).contains(&off),
+            "时区偏移超出现实范围：{off} 秒"
+        );
+        // 现实中最小粒度是 15 分钟
+        assert_eq!(off % 900, 0, "时区偏移不是 15 分钟的整数倍：{off} 秒");
     }
 }
