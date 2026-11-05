@@ -12,7 +12,7 @@
 
 <p align="center">
   <img alt="License" src="https://img.shields.io/badge/License-MIT-3DA639">
-  <img alt="Platform" src="https://img.shields.io/badge/Platform-Windows-0078D4">
+  <img alt="Platform" src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-0078D4">
   <img alt="Shell" src="https://img.shields.io/badge/Shell-Tauri%20v2-24C8DB">
   <img alt="UI" src="https://img.shields.io/badge/UI-React%2019-61DAFB">
   <img alt="Core" src="https://img.shields.io/badge/Core-Rust-000000">
@@ -22,28 +22,23 @@
 
 <p align="center">
   <img alt="Models" src="https://img.shields.io/badge/Models-GGUF%20Local-orange">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-unit%20%2B%20component-success">
   <img alt="VRAM" src="https://img.shields.io/badge/VRAM-idle%20released-yellowgreen">
+  <img alt="Install" src="https://img.shields.io/badge/Install-3%20MB%20shell-blueviolet">
 </p>
 
 <p align="center">
-  <b>本项目是完全离线的本地翻译工具，不依赖任何云端 API。</b><br />
+  <b>完全离线的本地翻译工具，不依赖任何云端 API。</b><br />
   名字取自「写意」—— 不拘泥字面形似，重神韵：译文不是翻完就结束，可以像改稿一样继续打磨。
 </p>
 
 <p align="center">
-  基于 <b>Tauri v2 + React 19 + Rust</b>，用 llama.cpp 的<b>路由模式</b>托管本地 GGUF，<br />
-  只做「翻译 / 批量翻译 / 译后润色」三件事。
-</p>
-
-<p align="center">
-  <a href="#快速开始">快速开始</a> ·
-  <a href="#核心设计">核心设计</a> ·
+  <a href="#下载安装">下载安装</a> ·
+  <a href="#第一次启动">第一次启动</a> ·
   <a href="#三个页面">三个页面</a> ·
-  <a href="#模型兼容">模型兼容</a> ·
-  <a href="#架构">架构</a> ·
-  <a href="#开发与测试">开发与测试</a> ·
-  <a href="#许可">许可</a>
+  <a href="#模型怎么选">模型怎么选</a> ·
+  <a href="#文件都在哪">文件都在哪</a> ·
+  <a href="#常见问题">常见问题</a> ·
+  <a href="#参与开发">参与开发</a>
 </p>
 
 <p align="center"><sub><b>简体中文</b> | <a href="README_EN.md">English</a></sub></p>
@@ -52,160 +47,239 @@
 
 > [!IMPORTANT]
 > **不联网、不常驻、不抢资源。**
-> 常驻的只是 llama-server 的**空壳路由进程**（0 显存），模型作为子进程在首次请求时拉起、空闲 120 秒后自动卸载并归还显存。
-> 除首次下载推理运行时外，应用不做任何网络请求；随机本地端口 + 本地 api-key，不读取系统里的 `OLLAMA_*` / `LLAMA_*` 环境变量。
+> 常驻的只是推理引擎的**空壳路由进程**（0 显存）。模型在首次请求时拉起，
+> 空闲 120 秒后自动卸载并归还显存。
+> 除首次下载推理运行时外，应用不做任何网络请求。
 
 ---
 
-## 快速开始
+## 它是什么
 
-**环境要求**：Windows 10 / 11 + WebView2 Runtime、Node.js、Rust stable + MSVC 工具链。
+一句话：**把 `.gguf` 模型变成一个好用的翻译工具。**
 
-```bash
-npm install
-npm run tauri dev      # 开发：自动起 Vite + Tauri 窗口
-```
+你不用碰命令行、不用配 OpenAI 兼容接口、不用担心文档被上传。
+装好外壳、放一个模型文件进去，就能翻译。
 
-启动后跟着**全屏引导层**走两步即可：
+**它只做三件事**：
 
-1. **装引擎** —— 自动扫描磁盘上现成的 `llama-server`，也可以「指定其他引擎」，或直接下载 **Vulkan 版**（含 SHA-256 校验与 `--version` 自检）
-   选 Vulkan 是因为它一套包通吃 NVIDIA / AMD / Intel 和纯 CPU，不必让用户先判断自己是什么显卡；翻译模型体量不大，Vulkan 的性能已经够用
-2. **放模型** —— 把 `.gguf` 丢进**程序目录下的 `models`**（不可写时回退 `Documents\Xieyi\models`），或指向已有目录；也可以直接把 `.gguf` 拖进窗口
-
-配置完成后引导层整体消失，三个页面回到本来的样子。也可以「稍后配置」先进去看看。
-
-**打包**：
-
-```bash
-npm run tauri build    # NSIS / MSI 安装包，运行时另按需下载
-```
-
-## 核心设计
-
-| 取舍 | 做法 |
+| 页面 | 干什么 |
 | :--- | :--- |
-| **轻** | 安装包只含 Tauri 外壳；llama.cpp 运行时首次按需下载；模型权重由用户自备，不内置 |
-| **不常驻占硬件** | 路由进程 `--models-max 1` + `--no-models-autoload`，永不为空壳加载权重；TTL 默认 120s，可把某个模型标为「常驻」 |
-| **本地与隐私** | 随机端口 + 本地 api-key；不读系统模型环境变量；译文、会话、配置全部落在本机 |
-| **快** | 流式输出、翻译结果内存缓存、固定 prompt 前缀命中 slot 缓存、预热把 Vulkan 着色器编译挪到加载阶段 |
-| **克制的边界** | 不做工具调用、不做自主循环、不做 Markdown 渲染、不做多模型同时驻留 |
+| **翻译** | 粘贴一段文本，出译文。带质检，可疑的片段会被标出来并自动重试 |
+| **批量** | 拖入一堆 `txt` / `md` / `srt`，批量翻译，结果写在原文件旁边 |
+| **对话** | 译文的二次加工台：改语意、调语气、统一术语 |
 
 **它不是**：云端翻译服务、通用聊天客户端、模型管理器、多模型并发服务。
-对话页的定位是「翻译的二次加工台」—— 把译文带过去，改语意、调语气、统一术语。
+
+---
+
+## 下载安装
+
+| 平台 | 状态 | 获取方式 |
+| :--- | :--- | :--- |
+| **Windows 10 / 11** | ✅ 实测通过 | [Releases](https://github.com/yunyiss/Xieyi/releases) 下载 `Xieyi_x.y.z_x64-setup.exe` |
+| **Linux (x64)** | ✅ 实测通过（X11；Wayland 下窗口聚焦不可用） | `Xieyi_x.y.z_amd64.deb` 或 `.rpm` |
+| **macOS (Apple Silicon)** | ⚠️ **源码可编译，运行行为未验证** | 不提供预编译包，请从源码构建 |
+
+> **关于 macOS**：代码里有完整的 macOS 分支（单实例、`NSRunningApplication`
+> 聚焦、`ps` 兜底清理、Metal 推理后端），CI 也会在真机上编译一次。
+> 但**没有任何人在 Mac 上实际跑过完整流程**，所以不发布安装包、也不声称支持。
+> 如果你愿意试并反馈，非常欢迎。
+
+**安装包只有 3 MB 左右**，因为不含推理引擎和模型——两者都在首次启动时按需获取。
+推理引擎下载约 30 MB，带 SHA-256 校验。
+
+---
+
+## 第一次启动
+
+启动后会出现一个**全屏引导层**，走两步就能用。也可以点「稍后配置」先进界面看看。
+
+### 第 1 步：装引擎
+
+程序会自动扫描磁盘上现成的 `llama-server`（如果你装过 Ollama、LM Studio 之类），
+也可以「指定其他引擎」的路径，或者直接点下载。
+
+> **推荐直接下载**。默认选 **Vulkan 版**，因为它一套包通吃 NVIDIA / AMD / Intel
+> 和纯 CPU，不需要你先判断自己是什么显卡。翻译模型体量不大，Vulkan 的性能完全够用。
+
+下载完成后会做 SHA-256 校验并跑一次 `--version` 自检，确认引擎真能起来。
+
+### 第 2 步：放模型
+
+把 `.gguf` 文件放进**程序目录下的 `models` 文件夹**，
+或者用界面指向你已有的模型目录，也可以直接把 `.gguf` 拖进窗口。
+
+> 程序目录不可写时（比如装在 `Program Files`），会自动回退到
+> `Documents\Xieyi\models`。
+
+配置完成后引导层整体消失。
+
+---
 
 ## 三个页面
 
-| 页面 | 作用 | 关键能力 |
-| :--- | :--- | :--- |
-| **翻译** | 粘贴文本 → 流式译文 | 14 种语言（简繁分列）、术语表、长文分段、质检自检与自动修正、一键发送到对话页 |
-| **批量** | 拖入 txt / md / srt → 生成 `*.目标语言.*` | 文件级并发 2、SRT 结构保留、GB18030 解码、片段失败重试、不覆盖已有输出、质检统计 |
-| **对话** | 译文的二次加工 | 多轮、思维链实时显示与回看、消息版本分支、编辑重发 / 单条删除 / 重新生成、会话本地落盘、上下文用量环、快捷指令 |
+### 翻译
+
+粘贴文本 → 流式译文。
+
+- **14 种语言**，简体与繁体分列
+- **术语表**：指定某些词怎么译，全篇统一
+- **长文分段**：超长文本自动切分，逐段翻译
+- **质检**：译完自检，可疑片段自动重试修正，底部显示 `质检 2/12 段 · 均已修正`
+- **一键发送到对话页**：译完想再打磨，直接带过去
 
 <p align="center">
   <img src="assets/screenshots/translate.png" width="720" alt="翻译页">
   <br />
-  <sub>翻译 —— 左原文右译文，流式输出，底部显示引擎端口与驻留状态</sub>
+  <sub>左原文右译文，流式输出，底部显示引擎端口与驻留状态</sub>
 </p>
+
+### 批量
+
+拖入文件即排队。
+
+- 支持 `txt` / `md` / `srt`，**SRT 的时间轴与结构完整保留**
+- 自动识别 `GB18030` 编码（中文老文件常见）
+- 输出文件名为 `原名.目标语言.txt`，**不覆盖已有文件**
+- 单个片段失败会重试，不因一处失败中断整个文件
+- 结束后给出成功数与耗时汇总
+
+> **并发上限是 2**。这不是保守，是实测：4 路并发会打爆 llama.cpp 共享的
+> KV 池，报 `Context size has been exceeded`。
 
 <p align="center">
   <img src="assets/screenshots/batch.png" width="720" alt="批量页">
   <br />
-  <sub>批量 —— 拖入文件即排队，输出写到原文件旁边，汇总成功与耗时</sub>
+  <sub>拖入文件即排队，输出写到原文件旁边，汇总成功与耗时</sub>
 </p>
+
+### 对话
+
+译文的**二次加工台**。把译文带过来，继续改。
+
+- 多轮对话，**思维链实时显示**也可回看
+- **消息版本分支**：重新生成保留旧版，可以来回切换对比
+- 编辑重发 / 单条删除
+- 会话本地落盘，重启还在
+- 上下文用量环，快满了会提示压缩
+- 快捷指令：一键把「更书面」「更口语」这类固定要求并进消息
 
 <p align="center">
   <img src="assets/screenshots/chat.png" width="720" alt="对话页">
   <br />
-  <sub>对话 —— 译文的二次加工台，快捷指令与上下文用量环</sub>
+  <sub>译文的二次加工台，快捷指令与上下文用量环</sub>
 </p>
 
-## 模型兼容
+---
 
-不同翻译模型的调用方式差异极大。工具会读 GGUF 的 `chat_template` 特征 **+ 文件名**自动判断该用哪种机制，**不维护型号名单**（新模型月月出，名单必然滞后）：
+## 模型怎么选
 
-| 模型家族 | 调用机制 | 说明 |
+**都能用。** 放进去就能识别，认不出的按通用对话模型处理——绝不会让某个模型从界面上消失。
+
+不同翻译模型的「喂法」差异极大：有的要英文 system prompt，有的只认中文模板，
+有的语言码得走特殊参数。工具会读 GGUF 的 `chat_template` 特征**加上文件名**
+自动判断，**不维护型号名单**（新模型月月出，名单必然滞后）。
+
+| 模型家族 | 调用机制 | 备注 |
 | :--- | :--- | :--- |
-| 通用对话模型（Qwen / Llama / Gemma…） | `EnglishSystem` | 英文 system prompt，兜底路径 |
-| Index-Translate | `ChineseText` | 中文文本提示 + 硬性约束块 |
-| TranslateGemma | `TemplateKwargs` / `Delimiter` | 语言码走 `chat_template_kwargs`；繁体必须用 `zh-TW` |
-| NVIDIA Riva-Translate | `LanguagePair` | system 直接传 `zh-en` 这类语言对 |
-| **Hy-MT2 / 腾讯混元** | `ChineseOfficial` | 腾讯官方中文模板，**不能收英文 system** |
-| Seed-X | — | 官方无 chat 模板，标记为不可用 |
+| 通用对话模型（Qwen / Llama / Gemma…） | 英文 system prompt | 兜底路径，任何模型都能走 |
+| Index-Translate | 中文文本提示 | 带硬性约束块 |
+| TranslateGemma | 模板参数 / 分隔符 | 繁体必须用 `zh-TW` |
+| NVIDIA Riva-Translate | 语言对直传 | system 里直接给 `zh-en` |
+| **Hy-MT2 / 腾讯混元** | 腾讯官方中文模板 | **不能收英文 system** |
+| Seed-X | — | 官方无 chat 模板，标为不可用 |
 
-> 识别不准时，可在设置里手动勾选某个模型「能不能用在对话页」—— 认不出的模型一律按通用对话模型处理，绝不让它从界面消失。
+> **翻译专用模型一定要按它的训练格式喂。** 这条是踩出来的：
+> Hy-MT2-1.8B 收到英文 system prompt 时，短词会原样返回、要繁体却永远给简体；
+> 换成官方中文模板后全部正常。遇到行为古怪的翻译模型，先查它的官方模型卡。
 
-**翻译专用模型要按它的训练格式喂。** 这条经验是踩出来的：Hy-MT2-1.8B 收到英文 system prompt 时短词会原样返回、要繁体却永远给简体；换成官方中文模板后全部正常。遇到行为古怪的翻译模型，先查它的官方模型卡。
+**模型大小建议**：1.8B 起步能跑，7B 以上明显更稳。
+`Hello world` 这种极短文本在 1.8B 上仍可能原样返回——质检能检出并提示，
+这属于模型能力上限，不是程序的 bug。
 
-## 架构
+---
 
-```
-┌──────────────── WebView2（React 19）────────────────┐
-│  App.tsx：三页常驻挂载 + 顶部页签 + 设置抽屉          │
-│  lib/ipc.ts：所有 invoke 命令与事件监听集中于此        │
-└──────────────────────▲───────────────────────────────┘
-                       │ Tauri IPC（命令 + 事件）
-┌──────────────────────┴───────────────────────────────┐
-│  Rust 后端                                            │
-│  service.rs：引擎与模型生命周期、流式补全、翻译流水线   │
-│  batch / translate / quality / prompts / runtime /    │
-│  models / params / sessions / paths / hardware        │
-└──────────────────────▲───────────────────────────────┘
-                       │ HTTP 127.0.0.1:<随机端口>，Bearer <本地随机 key>
-┌──────────────────────┴───────────────────────────────┐
-│  llama-server（路由模式，常驻空壳，0 显存）            │
-│    └─ 模型子进程：首次请求时 load，TTL 到期后 unload   │
-└──────────────────────────────────────────────────────┘
-```
+## 文件都在哪
 
-三条全局约束：
+全部集中在一个数据目录，与 WebView2 缓存同根，不往 `Roaming` 里写东西。
 
-1. **单推理通道** —— 翻译、批量、对话共用一把推理锁，同一时刻只有一个请求在跑（避免打爆 llama.cpp 共享的 KV 池）
-2. **单模型驻留** —— 换模型就卸载再加载
-3. **一切状态可中断** —— 全局取消位，加载 / 翻译 / 批量 / 对话都在检查点退出并清理子进程
-
-## 数据与文件
-
-全部集中在 `%LOCALAPPDATA%\com.xieyi.translate`，与 WebView2 缓存同根，`Roaming` 下不生成任何东西。
-
-| 内容 | 路径 |
+| 平台 | 数据根目录 |
 | :--- | :--- |
-| 用户配置（含引擎信息） | `<数据根目录>\config.json` |
-| 会话历史 | `<数据根目录>\sessions\<id>.json` |
-| 下载 / 指定的推理引擎 | `<数据根目录>\runtime\llama-<版本>-<backend>\` |
-| 默认模型目录 | **程序目录下的 `models`**（不可写时回退 `Documents\Xieyi\models`） |
+| Windows | `%LOCALAPPDATA%\com.xieyi.translate` |
+| Linux | `~/.local/share/com.xieyi.translate` |
+| macOS | `~/Library/Application Support/com.xieyi.translate` |
 
-> **删掉数据根目录 = 还原出厂设置**，模型目录在别处不受影响。
+里面有：
 
-## 开发与测试
+| 内容 | 位置 |
+| :--- | :--- |
+| 用户配置（含引擎信息） | `<数据根目录>/config.json` |
+| 会话历史 | `<数据根目录>/sessions/<id>.json` |
+| 日志（保留 7 天） | `<数据根目录>/logs/xieyi-YYYY-MM-DD.log` |
+| 下载的推理引擎 | `<数据根目录>/runtime/llama-<版本>-<backend>/` |
 
-```bash
-npm test                    # 前端：Vitest + Testing Library
-cd src-tauri && cargo test  # 后端：Rust 单测
-```
+> **删掉数据根目录 = 还原出厂设置。** 模型目录在别处，不受影响。
 
-> `cargo test` **必须在 `src-tauri/` 目录执行**，在仓库根目录会失败。
-> 前端测试用 `vi.mock("lib/ipc")` 全量打桩，不启动 Tauri / 引擎，数秒跑完。
+---
 
-改完代码的验证顺序：`npx tsc --noEmit` → `npm test` → `cargo test` →（必要时）`npm run tauri build`。
+## 常见问题
 
-详细的项目交接、机制说明与历史决策见 `docs/`（本地文档，不入库）。
+**Q：双击图标没反应 / 提示「资源在使用中」？**
+上一次异常退出留下了 WebView 缓存锁。等几秒再试；或者在任务管理器里
+结束所有 `msedgewebview2.exe`；再不行重启一次。
+
+**Q：翻译很慢？**
+先确认走的是 GPU。设置里能看到引擎后端和驻留状态。
+纯 CPU 能跑但慢很多，1.8B 模型在 CPU 上大约每秒几十个 token。
+
+**Q：显存被吃满 / 想让它早点释放？**
+默认空闲 120 秒卸载。可以在设置里调短 TTL，或者手动点卸载。
+
+**Q：关了程序，但显存没释放？**
+不该发生——Windows 用 Job Object、Linux 用 `PR_SET_PDEATHSIG`，
+主进程死亡时内核会终止整棵进程树。如果真遇到了，把日志发出来
+（`<数据根目录>/logs/`），那是需要修的 bug。
+
+**Q：能同时开两个窗口吗？**
+不能，单实例。再点图标会把已有窗口拉到前面。
+
+**Q：支持 AMD / Intel 显卡吗？**
+支持，走 Vulkan。显存自动估算只对 NVIDIA 有效（读 `nvidia-smi`），
+其他显卡会退化成「全部层都上 GPU」——性能不是最优，但能跑。
+
+**Q：为什么不做 Markdown 渲染？**
+对话页是**二次加工台**，不是通用 Agent。完整渲染 HTML/Markdown 会带来
+安全和性能上的复杂度，与「轻、快」的定位冲突。
+
+---
 
 ## 已知限制
 
-- **推理运行时跟随固定的 llama.cpp 版本**：路由模式属于较新特性，不跟 latest，避免行为漂移；升级时需重新做全链路实测
-- **显存自动估算仅 NVIDIA**：通过 `nvidia-smi` 拿空闲显存；AMD / Intel 退化为「全 GPU 层」
-- **模型识别依赖文件名**：把 `Hy-MT2-7B.gguf` 改名成 `mymodel.gguf` 会被当通用模型（有意取舍 —— 比靠不可靠的元数据乱猜安全）
-- **批量并发上限 2**：实测 4 路会报 `Context size has been exceeded`，文件内不再并发
+- **推理运行时锁定版本**：跟随固定的 llama.cpp 构建号，不跟 `latest`，避免行为漂移
+- **显存自动估算仅 NVIDIA**：AMD / Intel 退化为「全 GPU 层」
+- **模型识别依赖文件名**：把 `Hy-MT2-7B.gguf` 改名成 `mymodel.gguf` 会被当通用模型
+- **批量并发上限 2**：实测 4 路会报 `Context size has been exceeded`
 - **翻译缓存仅内存**：重启即失效，上限 4000 条
-- `Hello world` 这类极短文本在 1.8B 模型上仍可能原样返回 —— 质检能检出并提示，属模型能力上限，7B 及以上正常
+- **Wayland 下窗口聚焦不可用**：协议层面禁止应用操作其他窗口，不是能力缺失
 
-## 路线图
+---
 
-- [ ] 翻译页显示当前生效的调用机制（识别错了能一眼看出）
-- [ ] `Delimiter` / `LanguagePair` 两种机制拿到真实模型实测
-- [ ] 引擎切换的端到端验证
-- [ ] 对外分发打包：单实例、日志落盘、Job Object 进程回收、自动更新
-- [ ] 划词 / 全局快捷键 / 悬浮窗
+## 参与开发
+
+见 **[CONTRIBUTING.md](CONTRIBUTING.md)** —— 架构、构建、测试、验证闸门、平台矩阵。
+
+一句话版本：
+
+```bash
+npm install
+npm run tauri dev
+```
+
+> ⚠️ 构建时**必须用 `npx tauri build`**，不能用 `cargo build --release`。
+> 后者不会把前端打包进去，程序会去连不存在的开发服务器然后白屏。
+> 详细原因见 CONTRIBUTING。
+
+---
 
 ## 致谢
 
@@ -219,6 +293,10 @@ cd src-tauri && cargo test  # 后端：Rust 单测
 | [LinguaGacha](https://github.com/neavo/LinguaGacha) | 未声明 | 批量任务状态机、质量规则（仅参考思路） |
 | [pot-desktop](https://github.com/pot-app/pot-desktop) | GPL-3.0 | 快捷键与托盘的设计思路（**未复制任何代码**） |
 
+推理核心是 [llama.cpp](https://github.com/ggml-org/llama.cpp)（MIT）。
+
+---
+
 ## 许可
 
 本项目基于 [MIT License](LICENSE) 开源。
@@ -227,5 +305,5 @@ cd src-tauri && cargo test  # 后端：Rust 单测
 
 <p align="center">
   <sub>Xieyi 写意 · 本地优先，安静准确</sub><br />
-  <sub><a href="README_EN.md">Read in English</a></sub>
+  <sub><a href="README_EN.md">Read in English</a> · <a href="CONTRIBUTING.md">参与开发</a></sub>
 </p>

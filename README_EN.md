@@ -12,7 +12,7 @@
 
 <p align="center">
   <img alt="License" src="https://img.shields.io/badge/License-MIT-3DA639">
-  <img alt="Platform" src="https://img.shields.io/badge/Platform-Windows-0078D4">
+  <img alt="Platform" src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-0078D4">
   <img alt="Shell" src="https://img.shields.io/badge/Shell-Tauri%20v2-24C8DB">
   <img alt="UI" src="https://img.shields.io/badge/UI-React%2019-61DAFB">
   <img alt="Core" src="https://img.shields.io/badge/Core-Rust-000000">
@@ -22,8 +22,8 @@
 
 <p align="center">
   <img alt="Models" src="https://img.shields.io/badge/Models-GGUF%20Local-orange">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-unit%20%2B%20component-success">
   <img alt="VRAM" src="https://img.shields.io/badge/VRAM-idle%20released-yellowgreen">
+  <img alt="Install" src="https://img.shields.io/badge/Install-3%20MB%20shell-blueviolet">
 </p>
 
 <p align="center">
@@ -33,18 +33,13 @@
 </p>
 
 <p align="center">
-  Built with <b>Tauri v2 + React 19 + Rust</b>, hosting local GGUF models through llama.cpp's <b>router mode</b>.<br />
-  It does exactly three things: <b>translate</b>, <b>batch translate</b>, and <b>post-edit</b>.
-</p>
-
-<p align="center">
-  <a href="#quick-start">Quick Start</a> ·
-  <a href="#design">Design</a> ·
-  <a href="#three-pages">Three Pages</a> ·
-  <a href="#model-compatibility">Model Compatibility</a> ·
-  <a href="#architecture">Architecture</a> ·
-  <a href="#development">Development</a> ·
-  <a href="#license">License</a>
+  <a href="#download">Download</a> ·
+  <a href="#first-run">First Run</a> ·
+  <a href="#the-three-pages">The Three Pages</a> ·
+  <a href="#choosing-a-model">Choosing a Model</a> ·
+  <a href="#where-files-live">Where Files Live</a> ·
+  <a href="#faq">FAQ</a> ·
+  <a href="#contributing">Contributing</a>
 </p>
 
 <p align="center"><sub><b>English</b> | <a href="README.md">简体中文</a></sub></p>
@@ -52,176 +47,281 @@
 ---
 
 > [!IMPORTANT]
-> **No network. No idle footprint. No resource contention.**
-> What stays resident is only the llama-server **router shell** (0 VRAM). Each model is a child process spawned on first request and unloaded after 120s of idle, returning its VRAM.
-> Except for the one-time runtime download, the app makes no network requests. It binds a random local port with a random local api-key, and ignores `OLLAMA_*` / `LLAMA_*` environment variables.
+> **No network, no daemon, no resource hogging.**
+> What stays resident is only the engine's **empty router process** (0 VRAM).
+> Models are spawned on first request and unloaded after 120 seconds idle,
+> returning VRAM to the system.
+> Apart from the one-time engine download, the app makes no network requests.
 
 ---
 
-## Quick Start
+## What it is
 
-**Requirements**: Windows 10/11 + WebView2 Runtime, Node.js, Rust stable + MSVC toolchain.
+In one line: **it turns a `.gguf` file into a usable translation tool.**
 
-```bash
-npm install
-npm run tauri dev      # starts Vite + the Tauri window
-```
+No command line, no OpenAI-compatible endpoint to configure, no documents
+uploaded anywhere. Install the shell, drop in a model, translate.
 
-Then follow the full-screen onboarding — only two steps:
+**It does exactly three things:**
 
-1. **Get an engine** — scan the disk for an existing `llama-server`, point to one manually, or download the **Vulkan build** (SHA-256 verified and self-checked via `--version`)
-   Vulkan is the default because one build covers NVIDIA, AMD, Intel and CPU-only machines, so users never have to figure out their own GPU first — and translation models are small enough that Vulkan performance is plenty.
-2. **Add models** — drop `.gguf` files into the `models` folder **next to the executable** (falls back to `Documents\Xieyi\models` if that's read-only), point to an existing folder, or just drag a `.gguf` onto the window
-
-Once both are set, the overlay disappears and the three pages look exactly as they should. You can also choose "configure later" and look around first.
-
-**Build an installer**:
-
-```bash
-npm run tauri build    # NSIS / MSI installers; the runtime downloads on demand
-```
-
-## Design
-
-| Trade-off | How it's done |
+| Page | What it does |
 | :--- | :--- |
-| **Light** | The installer ships only the Tauri shell; the llama.cpp runtime downloads on first use; model weights are user-supplied |
-| **No idle footprint** | The router runs `--models-max 1 --no-models-autoload`, so the shell never holds weights; TTL defaults to 120s, and any model can be pinned as resident |
-| **Local & private** | Random port + local api-key; no model env vars read; translations, sessions and settings never leave the machine |
-| **Fast** | Streaming output, in-memory translation cache, a stable prompt prefix that hits the slot cache, and warm-up that moves Vulkan shader compilation into the load phase |
-| **Deliberately narrow** | No tool calling, no autonomous loops, no Markdown rendering, no concurrent models |
+| **Translate** | Paste text, get a translation. Quality checks flag suspicious segments and retry them |
+| **Batch** | Drop in `txt` / `md` / `srt` files, get translations written next to the originals |
+| **Chat** | A workbench for polishing translations: adjust nuance, tone, terminology |
 
-**It is not**: a cloud translation service, a general chat client, a model manager, or a multi-model server.
+**It is not**: a cloud translation service, a general chat client, a model
+manager, or a multi-model concurrent server.
 
-The chat page is a *post-editing workbench* for translated text — take a translation there, then adjust meaning, tone, or terminology.
+---
 
-## Three Pages
+## Download
 
-| Page | Purpose | Highlights |
+| Platform | Status | How to get it |
 | :--- | :--- | :--- |
-| **Translate** | Paste text → streaming translation | 14 languages (Simplified/Traditional split), glossary, long-text segmentation, quality checks with auto-correction, send to chat |
-| **Batch** | Drop txt / md / srt → produces `*.target.*` | File-level concurrency of 2, SRT structure preserved, GB18030 decoding, per-segment retry, never overwrites existing output, quality stats |
-| **Chat** | Post-editing the translation | Multi-turn, live reasoning display, message version branches, edit-and-resend / delete / regenerate, sessions saved locally, context usage ring, quick actions |
+| **Windows 10 / 11** | ✅ Tested | `Xieyi_x.y.z_x64-setup.exe` from [Releases](https://github.com/yunyiss/Xieyi/releases) |
+| **Linux (x64)** | ✅ Tested (X11; window focus unavailable on Wayland) | `Xieyi_x.y.z_amd64.deb` or `.rpm` |
+| **macOS (Apple Silicon)** | ⚠️ **Builds from source; runtime unverified** | No prebuilt binaries — build from source |
+
+> **About macOS**: there are complete macOS code paths (single instance,
+> `NSRunningApplication` focus, `ps`-based cleanup, Metal backend) and CI
+> compiles it on real hardware. But **nobody has run the full flow on a Mac**,
+> so no binaries are published and no support is claimed.
+> If you try it and report back, that would be genuinely useful.
+
+**The installer is ~3 MB** because it ships neither the inference engine nor
+any model — both are fetched on first run. The engine download is ~30 MB and
+is SHA-256 verified.
+
+---
+
+## First Run
+
+A **full-screen onboarding layer** appears on first launch. Two steps and
+you're done. You can also hit "configure later" to look around first.
+
+### Step 1: Get the engine
+
+The app scans your disk for an existing `llama-server` (from Ollama, LM Studio,
+etc.), lets you point it at another path, or downloads one.
+
+> **Downloading is the recommended path.** The default is the **Vulkan** build
+> because a single package covers NVIDIA / AMD / Intel and pure CPU — you don't
+> have to know what GPU you have. Translation models are small; Vulkan is
+> more than fast enough.
+
+After downloading it verifies the SHA-256 and runs a `--version` self-check to
+confirm the engine actually starts.
+
+### Step 2: Add a model
+
+Drop a `.gguf` into the `models` folder **next to the executable**, point the
+app at an existing model directory, or drag the `.gguf` straight into the window.
+
+> If the program directory isn't writable (e.g. installed under
+> `Program Files`), it falls back to `Documents\Xieyi\models`.
+
+The onboarding layer disappears once configured.
+
+---
+
+## The Three Pages
+
+### Translate
+
+Paste → streaming translation.
+
+- **14 languages**, Simplified and Traditional listed separately
+- **Glossary**: pin how specific terms must be rendered, applied throughout
+- **Long-text segmentation**: oversized input is split and translated piecewise
+- **Quality check**: self-review after translating; suspicious segments are
+  retried automatically. The footer shows `checked 2/12 · all corrected`
+- **Send to Chat**: carry the result over for polishing
 
 <p align="center">
   <img src="assets/screenshots/translate.png" width="720" alt="Translate page">
   <br />
-  <sub>Translate — source and target side by side, streaming output, engine status in the footer</sub>
+  <sub>Source on the left, translation on the right; streaming output, engine port and residency in the footer</sub>
 </p>
+
+### Batch
+
+Drop files in and they queue up.
+
+- `txt` / `md` / `srt`; **SRT timing and structure preserved exactly**
+- Detects `GB18030` automatically (common in older Chinese files)
+- Output written as `original.target-language.txt`, **never overwriting** existing files
+- Failed segments retry individually; one failure doesn't abort the file
+- Summary of successes and elapsed time at the end
+
+> **Concurrency is capped at 2.** Not caution — measured: 4-way parallelism
+> blows out llama.cpp's shared KV pool and fails with
+> `Context size has been exceeded`.
 
 <p align="center">
   <img src="assets/screenshots/batch.png" width="720" alt="Batch page">
   <br />
-  <sub>Batch — drop files to queue them, output written next to the source, with a success summary</sub>
+  <sub>Drop files to queue; output lands next to the source; success count and timing at the end</sub>
 </p>
+
+### Chat
+
+The **workbench** for a translation. Bring the text over and keep working.
+
+- Multi-turn, with **live reasoning display** and the ability to review it later
+- **Message version branches**: regenerating keeps the old version so you can flip back and compare
+- Edit-and-resend, delete individual messages
+- Sessions persisted locally, surviving restarts
+- Context usage ring with a compaction prompt when it fills up
+- Quick commands that fold standing instructions (e.g. "more formal") into a message
 
 <p align="center">
   <img src="assets/screenshots/chat.png" width="720" alt="Chat page">
   <br />
-  <sub>Chat — the post-editing workbench, with quick actions and a context usage ring</sub>
+  <sub>Workbench for translations, with quick commands and a context usage ring</sub>
 </p>
 
-## Model Compatibility
+---
 
-Translation models are called very differently from one another. Instead of maintaining a model list (new models ship monthly — any list goes stale), the app inspects the GGUF's `chat_template` **plus the filename** and picks the right mechanism:
+## Choosing a Model
+
+**Any of them works.** Drop a model in and it will be recognized; anything
+unrecognized is treated as a general chat model — a model never disappears
+from the UI just because the app couldn't classify it.
+
+Translation models differ wildly in how they want to be fed: some need an
+English system prompt, some only accept a Chinese template, some need the
+language code passed through a special parameter. The app reads the GGUF's
+`chat_template` metadata **plus the filename** to decide, and **maintains no
+model list** (new models ship monthly; a list would always lag).
 
 | Family | Mechanism | Notes |
 | :--- | :--- | :--- |
-| General chat models (Qwen / Llama / Gemma…) | `EnglishSystem` | English system prompt, the safe fallback |
-| Index-Translate | `ChineseText` | Chinese text prompt with hard constraints |
-| TranslateGemma | `TemplateKwargs` / `Delimiter` | Language codes via `chat_template_kwargs`; Traditional Chinese must be `zh-TW` |
-| NVIDIA Riva-Translate | `LanguagePair` | System prompt carries pairs like `zh-en` |
-| **Hy-MT2 / Tencent Hunyuan** | `ChineseOfficial` | Tencent's official Chinese template — **it must not receive an English system prompt** |
+| General chat models (Qwen / Llama / Gemma…) | English system prompt | Fallback path; works for anything |
+| Index-Translate | Chinese text prompt | With a hard-constraint block |
+| TranslateGemma | Template kwargs / delimiter | Traditional Chinese must use `zh-TW` |
+| NVIDIA Riva-Translate | Language pair | Passed directly as `zh-en` in system |
+| **Hy-MT2 / Tencent Hunyuan** | Official Chinese template | **Rejects an English system prompt** |
 | Seed-X | — | No official chat template; marked unavailable |
 
-> If detection gets it wrong, you can override "usable in chat" per model in Settings. Anything unrecognized is treated as a general chat model — it is never removed from the UI.
+> **Translation-specific models must be fed in their trained format.** This was
+> learned the hard way: Hy-MT2-1.8B returns short words unchanged and always
+> gives Simplified when asked for Traditional if it receives an English system
+> prompt. With the official Chinese template everything behaves. If a
+> translation model acts strange, check its official model card first.
 
-**Translation models must be fed the format they were trained on.** This one was learned the hard way: given an English system prompt, Hy-MT2-1.8B echoed short words back untranslated and ignored Traditional Chinese entirely; with the official Chinese template everything behaved normally. When a translation model acts strange, check its official model card first.
+**Size guidance**: 1.8B runs, 7B and up is noticeably steadier.
+`Hello world`-style micro-inputs may still come back unchanged on a 1.8B model
+— the quality check flags this. That's the model's ceiling, not a bug.
 
-## Architecture
+---
 
-```
-┌──────────────── WebView2 (React 19) ────────────────┐
-│  App.tsx: three pages mounted at once + tab bar      │
-│  lib/ipc.ts: every invoke command and event listener │
-└──────────────────────▲──────────────────────────────┘
-                       │ Tauri IPC (commands + events)
-┌──────────────────────┴──────────────────────────────┐
-│  Rust backend                                       │
-│  service.rs: engine/model lifecycle, streaming,     │
-│              translation pipeline                   │
-│  batch / translate / quality / prompts / runtime /  │
-│  models / params / sessions / paths / hardware      │
-└──────────────────────▲──────────────────────────────┘
-                       │ HTTP 127.0.0.1:<random port>, Bearer <local key>
-┌──────────────────────┴──────────────────────────────┐
-│  llama-server (router mode, resident shell, 0 VRAM) │
-│    └─ model child process: load on first request,   │
-│       unload when the TTL expires                   │
-└─────────────────────────────────────────────────────┘
-```
+## Where Files Live
 
-Three global constraints:
+Everything is under one data directory, sharing a root with the WebView2 cache.
+Nothing is written to `Roaming`.
 
-1. **Single inference lane** — translation, batch and chat share one lock, so only one request runs at a time (llama.cpp's KV pool is shared and easy to blow up)
-2. **Single resident model** — switching models unloads the previous one
-3. **Everything is cancellable** — one global cancel flag; loading, translation, batch and chat all exit at checkpoints and clean up child processes
-
-## Data & Files
-
-Everything lives under `%LOCALAPPDATA%\com.xieyi.translate`, the same root as the WebView2 cache. Nothing is written to `Roaming`.
-
-| Content | Path |
+| Platform | Data root |
 | :--- | :--- |
-| Settings (including engine info) | `<data root>\config.json` |
-| Chat sessions | `<data root>\sessions\<id>.json` |
-| Downloaded / selected runtime | `<data root>\runtime\llama-<version>-<backend>\` |
-| Default model folder | `models` **next to the executable** (falls back to `Documents\Xieyi\models`) |
+| Windows | `%LOCALAPPDATA%\com.xieyi.translate` |
+| Linux | `~/.local/share/com.xieyi.translate` |
+| macOS | `~/Library/Application Support/com.xieyi.translate` |
 
-> **Deleting the data root resets the app to factory state.** Model folders stored elsewhere are untouched.
+Inside:
 
-## Development
+| Content | Location |
+| :--- | :--- |
+| User config (incl. engine info) | `<data root>/config.json` |
+| Session history | `<data root>/sessions/<id>.json` |
+| Logs (7-day retention) | `<data root>/logs/xieyi-YYYY-MM-DD.log` |
+| Downloaded engine | `<data root>/runtime/llama-<version>-<backend>/` |
 
-```bash
-npm test                    # frontend: Vitest + Testing Library
-cd src-tauri && cargo test  # backend: Rust unit tests
-```
+> **Deleting the data root = factory reset.** Model directories live elsewhere
+> and are unaffected.
 
-> `cargo test` **must run from `src-tauri/`**; running it at the repo root fails.
-> Frontend tests stub `lib/ipc` entirely — no Tauri, no engine, done in seconds.
+---
 
-Verification order after a change: `npx tsc --noEmit` → `npm test` → `cargo test` → (if needed) `npm run tauri build`.
+## FAQ
 
-Deeper notes on architecture, mechanisms and past decisions live in `docs/` (local-only, not committed).
+**Q: Double-clicking does nothing / I get "resource in use"?**
+A previous crash left the WebView cache locked. Wait a few seconds and retry;
+or end all `msedgewebview2.exe` processes in Task Manager; or reboot once.
+
+**Q: Translation is slow.**
+First check that it's actually using the GPU — the settings drawer shows the
+engine backend and residency state. Pure CPU works but is far slower; a 1.8B
+model on CPU manages tens of tokens per second.
+
+**Q: VRAM is full / I want it released sooner.**
+Idle unload defaults to 120 seconds. Shorten the TTL in settings, or unload manually.
+
+**Q: I closed the app but VRAM wasn't released.**
+That shouldn't happen — Windows uses a Job Object and Linux uses
+`PR_SET_PDEATHSIG`, so the kernel terminates the whole process tree when the
+main process dies. If you hit this, send the logs (`<data root>/logs/`) —
+it's a bug worth fixing.
+
+**Q: Can I open two windows?**
+No, single instance. Clicking the icon again brings the existing window forward.
+
+**Q: Does it support AMD / Intel GPUs?**
+Yes, via Vulkan. Automatic VRAM estimation only works for NVIDIA (reads
+`nvidia-smi`); other GPUs fall back to "all layers on GPU" — not optimal, but
+it runs.
+
+**Q: Why no Markdown rendering?**
+The Chat page is a **post-editing workbench**, not a general agent. Full
+HTML/Markdown rendering adds security and performance complexity that
+conflicts with the "light and fast" positioning.
+
+---
 
 ## Known Limitations
 
-- **The runtime tracks a pinned llama.cpp build** — router mode is a recent feature; tracking `latest` would make behavior drift, so upgrades require re-testing the whole pipeline
-- **VRAM auto-estimation is NVIDIA-only** — uses `nvidia-smi`; AMD/Intel fall back to "all layers on GPU"
-- **Model detection relies on filenames** — renaming `Hy-MT2-7B.gguf` to `mymodel.gguf` makes it look generic (a deliberate trade-off: safer than guessing from unreliable metadata)
-- **Batch concurrency caps at 2** — 4 parallel requests hit `Context size has been exceeded`
-- **Translation cache is in-memory only** — cleared on restart, capped at 4000 entries
-- Very short inputs like `Hello world` may still come back untranslated on 1.8B models — quality checks catch and report it; it's a model capability limit, fine on 7B and up
+- **Engine version is pinned**: follows a fixed llama.cpp build number rather than `latest`, to avoid behavior drift
+- **VRAM estimation is NVIDIA-only**: AMD / Intel fall back to "all layers on GPU"
+- **Model detection depends on filenames**: renaming `Hy-MT2-7B.gguf` to `mymodel.gguf` makes it a general model
+- **Batch concurrency capped at 2**: 4-way triggers `Context size has been exceeded`
+- **Translation cache is memory-only**: gone on restart, capped at 4000 entries
+- **No window focus on Wayland**: the protocol forbids apps from manipulating other windows — a design choice, not a missing feature
 
-## Roadmap
+---
 
-- [ ] Show the active prompt mechanism on the translate page
-- [ ] Test `Delimiter` / `LanguagePair` against real models
-- [ ] End-to-end verification of engine switching
-- [ ] Distribution readiness: single instance, file logging, Job Object process cleanup, auto-update
-- [ ] Selection translate / global hotkey / floating window
+## Contributing
 
-## Acknowledgments
+See **[CONTRIBUTING.md](CONTRIBUTING.md)** — architecture, build pitfalls,
+verification gates, platform matrix.
 
-Design ideas were learned from these projects (**design only — no code copied**):
+The short version:
 
-| Project | License | What we learned |
+```bash
+npm install
+npm run tauri dev
+```
+
+> ⚠️ Always build with **`npx tauri build`**, never `cargo build --release`.
+> The latter doesn't bundle the frontend, so the app tries to reach a
+> non-existent dev server and shows a blank window.
+> Details in CONTRIBUTING.
+
+---
+
+## Acknowledgements
+
+Design ideas drawn from these excellent open-source projects (**design and
+usage only, no code copied**):
+
+| Project | License | What was borrowed |
 | :--- | :--- | :--- |
 | [llama-swap](https://github.com/mostlygeek/llama-swap) | MIT | Process-tree cleanup, load progress, TTL and router config |
-| [STranslate](https://github.com/STranslate/STranslate) | MIT | Translator interfaces, prompt sets, back-translation |
+| [STranslate](https://github.com/STranslate/STranslate) | MIT | Translation-source interface, prompt sets, back-translation idea |
 | [jan](https://github.com/janhq/jan) | Apache-2.0 | Tauri v2 project layout, message state model |
-| [LinguaGacha](https://github.com/neavo/LinguaGacha) | Unlicensed | Batch state machine, quality rules (ideas only) |
-| [pot-desktop](https://github.com/pot-app/pot-desktop) | GPL-3.0 | Hotkey and tray design (ideas only, **nothing copied**) |
+| [LinguaGacha](https://github.com/neavo/LinguaGacha) | Unspecified | Batch state machine, quality rules (ideas only) |
+| [pot-desktop](https://github.com/pot-app/pot-desktop) | GPL-3.0 | Hotkey and tray design ideas (**no code copied**) |
+
+The inference core is [llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT).
+
+---
 
 ## License
 
@@ -230,6 +330,6 @@ Released under the [MIT License](LICENSE).
 ---
 
 <p align="center">
-  <sub>Xieyi 写意 · local-first, quiet and accurate</sub><br />
-  <sub><a href="README.md">阅读中文版</a></sub>
+  <sub>Xieyi 写意 · local-first, quiet, accurate</sub><br />
+  <sub><a href="README.md">简体中文</a> · <a href="CONTRIBUTING.md">Contributing</a></sub>
 </p>
