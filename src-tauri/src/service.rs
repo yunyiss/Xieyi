@@ -112,10 +112,25 @@ fn escape_ps(s: &str) -> String {
     s.replace('\'', "''")
 }
 
-/// Unix：按进程组兜底。
+/// Unix：按命令行兜底。
 ///
 /// `PR_SET_PDEATHSIG` 已覆盖「父进程被 kill」的场景，这里是第二重保证：
-/// 遍历 `/proc`，找出命令行含本程序 api-key 的 llama-server 并终止。
+/// 找出命令行含本程序 api-key 的 llama-server 并终止。
+///
+/// ## 平台差异
+///
+/// **Linux**：遍历 `/proc/<pid>/cmdline`。
+///
+/// **macOS**：没有 `/proc`。原来这里用 `#[cfg(unix)]` 一律读 `/proc`，
+/// 在 macOS 上 `read_dir` 直接失败并静默 return——**整个兜底清理
+/// 在 macOS 上是死代码**。改用 `ps -Ao pid=,command=`：
+///
+/// - `ps` 是 POSIX 标准工具，macOS 与 Linux 都有；
+/// - `-Ao` 输出所有进程，`pid=` / `command=` 去掉表头；
+/// - 不需要 root，只能看到本用户进程——这正好是我们需要的范围。
+///
+/// 用 `ps` 而不是 `sysctl(KERN_PROC)`：后者要处理 `kinfo_proc`
+/// 的布局差异（不同 macOS 版本不同），维护成本超出收益。
 #[cfg(unix)]
 fn kill_llama_servers_spawned_by_us(api_key: &str) {
     if api_key.is_empty() {
@@ -123,24 +138,8 @@ fn kill_llama_servers_spawned_by_us(api_key: &str) {
     }
 
     let needle = format!("--api-key {api_key}");
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return;
-    };
 
-    for entry in entries.flatten() {
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|s| s.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        let cmdline_path = entry.path().join("cmdline");
-        let Ok(raw) = std::fs::read(&cmdline_path) else {
-            continue;
-        };
-        // /proc/<pid>/cmdline 用 NUL 分隔
-        let cmdline = String::from_utf8_lossy(&raw).replace('\0', " ");
+    for (pid, cmdline) in list_processes() {
         if !cmdline.contains(&needle) {
             continue;
         }
@@ -149,8 +148,70 @@ fn kill_llama_servers_spawned_by_us(api_key: &str) {
             continue;
         }
         let _ = std::process::Command::new("kill")
-            .args(["-KILL", &pid.to_string()])
+            .args(["-KILL", &pid])
             .status();
+    }
+}
+
+/// 列出「pid → 命令行」。Linux 走 `/proc`，macOS 走 `ps`。
+#[cfg(unix)]
+fn list_processes() -> Vec<(String, String)> {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for entry in entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let Ok(raw) = std::fs::read(entry.path().join("cmdline")) else {
+                continue;
+            };
+            // /proc/<pid>/cmdline 用 NUL 分隔
+            let cmdline = String::from_utf8_lossy(&raw).replace('\0', " ");
+            out.push((pid.to_string(), cmdline));
+        }
+        out
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // `command=` 后面是完整命令行，可能含空格，所以只切前两列
+        let Ok(output) = std::process::Command::new("ps")
+            .args(["-Ao", "pid=,command="])
+            .output()
+        else {
+            return Vec::new();
+        };
+        if !output.status.success() {
+            return Vec::new();
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut out = Vec::new();
+        for line in text.lines() {
+            let line = line.trim_start();
+            let Some((pid, cmd)) = line.split_once(char::is_whitespace) else {
+                continue;
+            };
+            if pid.is_empty() {
+                continue;
+            }
+            out.push((pid.to_string(), cmd.trim().to_string()));
+        }
+        out
+    }
+
+    // 其它 Unix（*BSD 等）：没有可靠实现，返回空。
+    // 兜底清理退化为「只靠 PDEATHSIG」，不阻断运行。
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Vec::new()
     }
 }
 
@@ -997,6 +1058,19 @@ async fn spawn(app: &AppHandle, gpu_layers: u64) -> Result<Service, String> {
         //
         // pre_exec 在 fork 之后、exec 之前执行，此时设置才有效：
         // PDEATHSIG 绑定的是「调用 prctl 那一刻的父进程」。
+        //
+        // **macOS 没有 PDEATHSIG**——`prctl` 是 Linux 专有的。
+        // macOS 上这一层保护不存在，只剩两道：
+        //   1. 正常退出时 `kill()` 走 `killpg`（进程组，可用）
+        //   2. 主进程被强杀时，孤儿留到**下次启动**由
+        //      `kill_llama_servers_spawned_by_us` 扫掉（已支持 macOS）
+        //
+        // 代价是一次启动前的残留：用户强杀后立刻重启，会在清理前
+        // 短暂看到旧进程占着显存。没有在 macOS 上硬造 watchdog：
+        // 那需要在子进程里起线程，而 `pre_exec` 里只能做
+        // async-signal-safe 的事，起线程是未定义行为。
+        //
+        // 详细的平台矩阵见 `docs/当前状态快照.md` 第七节。
         unsafe {
             cmd.pre_exec(|| {
                 #[cfg(target_os = "linux")]

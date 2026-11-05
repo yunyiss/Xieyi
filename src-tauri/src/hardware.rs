@@ -1,3 +1,8 @@
+// `Command` 只在 Windows / Linux 的 `query_nvidia_smi` 里用到；
+// macOS 上该函数被 `#[cfg]` 排除，导入会变成 unused warning。
+// 把 import 挂到同样的 cfg 上，而不是用 `#[allow(unused)]` 糊住——
+// 后者会让真正的忘记使用也一起被静音。
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 use std::process::Command;
 
 /// 查询当前空闲显存（MB）。拿不到时返回 `None`，上层会退化成「全 GPU 层」。

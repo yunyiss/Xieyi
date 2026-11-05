@@ -70,8 +70,13 @@ impl Drop for JobHandle {
     }
 }
 
-/// 非 Windows 平台：进程组（`process_group(0)` + `killpg`）已经提供了
-/// 等价的保证，不需要 Job Object。这里保留空类型让调用处无需 cfg。
+/// 非 Windows 平台：没有 Job Object，返回空类型让调用处无需 cfg。
+///
+/// Unix 侧的等价保证来自进程组（`process_group(0)` + `killpg`）；
+/// Linux 额外有 `PR_SET_PDEATHSIG`，**macOS 没有**（`prctl` 是 Linux
+/// 专有接口）。两台 Unix 都还有「下次启动时按 api-key 扫掉残留」
+/// 这层兜底，所以 macOS 上最坏情况是「强杀后重启前」会看到旧进程
+/// 占着显存，不会一直泄漏。
 #[cfg(not(windows))]
 pub struct JobHandle;
 

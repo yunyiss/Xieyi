@@ -394,6 +394,12 @@ mod tests {
         assert_ne!(simplified, traditional);
     }
 
+    /// 质检不通过时，重试请求必须在基础提示之上叠加纠正要求。
+    ///
+    /// **这条测试曾经漏了 `#[test]`**——函数体写好但从没被执行过，
+    /// 编译器只报了 `never used` 警告。2026-11-05 在 macOS 上跑
+    /// `cargo test` 时才发现。
+    #[test]
     fn retry_hint_builds_on_the_styled_base() {
         let report = quality::check(
             "- apple\n- banana",

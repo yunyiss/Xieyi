@@ -102,7 +102,10 @@ mod unix_impl {
         dir.join("com.xieyi.translate.lock")
     }
 
-    #[link(name = "c")]
+    // glibc 里 `flock` 属于 libc，要显式链接；macOS 的 libc 符号
+    // 统一在 libSystem（std 已链接），再写 `#[link(name = "c")]`
+    // 会找不到目标库。
+    #[cfg_attr(target_os = "linux", link(name = "c"))]
     unsafe extern "C" {
         fn flock(fd: i32, operation: i32) -> i32;
     }
@@ -171,15 +174,42 @@ mod unix_impl {
 
         crate::logging::info("single", format!("尝试聚焦已是实例的窗口 pid={pid}"));
 
-        if let Err(e) = x11::raise_window_of_pid(pid) {
+        if let Err(e) = raise_window_of_pid(pid) {
             crate::logging::warn("single", format!("聚焦窗口失败：{e}"));
         }
     }
 
+    /// 聚焦指定 PID 的窗口。
+    ///
+    /// - **Linux**：X11 的 `_NET_ACTIVE_WINDOW`
+    /// - **macOS**：Cocoa 的 `activateIgnoringOtherApps`
+    /// - **其它 Unix**：不支持，静默跳过
+    ///
+    /// 聚焦是锦上添花——失败只记日志，绝不影响「第二个实例正常退出」
+    /// 这条主路径。
+    #[cfg(target_os = "linux")]
+    fn raise_window_of_pid(pid: u32) -> Result<(), String> {
+        x11::raise_window_of_pid(pid)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn raise_window_of_pid(pid: u32) -> Result<(), String> {
+        macos::activate_app(pid)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn raise_window_of_pid(_pid: u32) -> Result<(), String> {
+        Ok(())
+    }
+
     /// 找出另一个同名可执行文件的进程 PID（排除自己）。
     ///
-    /// 读 `/proc/<pid>/exe` 的软链接目标做比较——这是 Linux 上判定
-    /// 「同一个程序」最可靠的方式，比命令行字符串匹配更准。
+    /// **Linux**：读 `/proc/<pid>/exe` 的软链接目标做比较——这是
+    /// Linux 上判定「同一个程序」最可靠的方式，比命令行字符串匹配更准。
+    ///
+    /// **macOS**：没有 `/proc`。改用 `ps -Ao pid=,comm=` 取每个进程的
+    /// 可执行文件路径。`comm` 在 macOS 上给出完整路径，正好可以比较。
+    #[cfg(target_os = "linux")]
     fn find_other_own_process() -> Option<u32> {
         let own = std::env::current_exe().ok()?;
         let own = std::fs::canonicalize(&own).ok()?;
@@ -206,7 +236,128 @@ mod unix_impl {
         None
     }
 
+    #[cfg(target_os = "macos")]
+    fn find_other_own_process() -> Option<u32> {
+        let own = std::fs::canonicalize(std::env::current_exe().ok()?).ok()?;
+        let self_pid = std::process::id();
+
+        let output = std::process::Command::new("ps")
+            .args(["-Ao", "pid=,comm="])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let line = line.trim_start();
+            let Some((pid, comm)) = line.split_once(char::is_whitespace) else {
+                continue;
+            };
+            let Ok(pid) = pid.parse::<u32>() else {
+                continue;
+            };
+            if pid == self_pid {
+                continue;
+            }
+            // comm 是完整路径；解析成规范形式再比，避免 /private/var
+            // 与 /var 这类符号链接差异导致漏判
+            if let Ok(target) = std::fs::canonicalize(comm.trim()) {
+                if target == own {
+                    return Some(pid);
+                }
+            }
+        }
+        None
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn find_other_own_process() -> Option<u32> {
+        None
+    }
+
+    /// macOS 窗口聚焦。
+    ///
+    /// ## 为什么用 `NSRunningApplication` 而不是 AXUIElement
+    ///
+    /// macOS 没有「把某个 PID 的窗口拉到前面」这种直接 API。
+    /// 官方推荐的无障碍接口（`AXUIElementPerformAction(kAXRaiseAction)`）
+    /// **需要用户手动在「系统设置 → 隐私与安全性 → 辅助功能」里授权**，
+    /// 一个翻译工具不该为「拉个窗口」要这种权限。
+    ///
+    /// 退一步用 `NSRunningApplication.activate`：它激活的是**整个应用**，
+    /// 不指定具体窗口。我们的应用只有一个窗口，所以效果等价。
+    /// 这个 API 不需要任何授权。
+    ///
+    /// ## 为什么用 objc_msgSend 手写
+    ///
+    /// 引 `objc2` / `cocoa` 会带进大量依赖。这里只要两次调用
+    /// （`runningApplicationWithProcessIdentifier:` + `activateWithOptions:`），
+    /// 手写 FFI 更划算——和本文件其它地方同一个思路。
+    #[cfg(target_os = "macos")]
+    mod macos {
+        use std::ffi::c_void;
+
+        /// `NSApplicationActivationOptions`：同时激活所有窗口
+        const ACTIVATE_ALL_WINDOWS: usize = 1 << 0;
+
+        #[link(name = "AppKit", kind = "framework")]
+        unsafe extern "C" {}
+
+        #[link(name = "objc")]
+        unsafe extern "C" {
+            fn objc_getClass(name: *const u8) -> *mut c_void;
+            fn sel_registerName(name: *const u8) -> *mut c_void;
+            fn objc_msgSend();
+        }
+
+        pub fn activate_app(pid: u32) -> Result<(), String> {
+            /// 把 `objc_msgSend` 转成具体签名再调。
+            ///
+            /// 直接调 `objc_msgSend` 在 ARM64 上会崩：它是个可变参数
+            /// 的跳板，必须 cast 成目标方法的真实签名。这里用到两种：
+            /// - 类方法：`id (Class, SEL, int) -> id`
+            /// - 实例方法：`BOOL (id, SEL, NSUInteger) -> BOOL`
+            type MsgSendClassId = unsafe extern "C" fn(*mut c_void, *mut c_void, i32) -> *mut c_void;
+            type MsgSendActivate =
+                unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> i8;
+
+            // SAFETY: 全部是 Foundation 的公开类与方法，参数类型与
+            // Objective-C 声明一致。对象生命周期由 autorelease pool 之外的
+            // 全局缓存管理（NSRunningApplication 是单例表），我们只读不持有。
+            unsafe {
+                let cls = objc_getClass(b"NSRunningApplication ".as_ptr());
+                if cls.is_null() {
+                    return Err("找不到 NSRunningApplication 类".into());
+                }
+
+                let sel_app = sel_registerName(
+                    b"runningApplicationWithProcessIdentifier: ".as_ptr(),
+                );
+                let msg_class: MsgSendClassId = std::mem::transmute(objc_msgSend as *const ());
+                let app = msg_class(cls, sel_app, pid as i32);
+                if app.is_null() {
+                    return Err(format!("PID {pid} 没有对应的 NSRunningApplication"));
+                }
+
+                let sel_activate = sel_registerName(b"activateWithOptions: ".as_ptr());
+                let msg_activate: MsgSendActivate =
+                    std::mem::transmute(objc_msgSend as *const ());
+                let ok = msg_activate(app, sel_activate, ACTIVATE_ALL_WINDOWS);
+                if ok == 0 {
+                    return Err("activateWithOptions: 返回 NO".into());
+                }
+            }
+            Ok(())
+        }
+    }
+
     /// X11 操作。全部通过 dlopen 动态解析符号。
+    ///
+    /// 只在 Linux 下编译：macOS 既没有 X11 运行时，也没有 `libdl`
+    /// （`dlopen` 在 libSystem 里），编进去只会得到一个必然失败的
+    /// 死模块。macOS 的聚焦走 [`macos::activate_app`]。
+    #[cfg(target_os = "linux")]
     mod x11 {
         use std::ffi::{c_char, c_int, c_ulong, c_void, CString};
 
@@ -270,8 +421,10 @@ mod unix_impl {
         // X11 的 map_state 取值
         const IS_VIEWABLE: c_int = 2;
 
-        // dlopen / dlsym
-        #[link(name = "dl")]
+        // dlopen / dlsym。`libdl` 是 glibc 的东西；macOS 没有它，
+        // 符号同样在 libSystem 里。这个 mod 本身只在 Linux 下编译
+        // （见上面的 cfg），属性也一并收窄更保险。
+        #[cfg_attr(target_os = "linux", link(name = "dl"))]
         unsafe extern "C" {
             fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
             fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;

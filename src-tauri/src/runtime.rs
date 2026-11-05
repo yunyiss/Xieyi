@@ -635,6 +635,13 @@ mod tests {
     }
 
     /// 后端名要真的体现在文件名里，否则「CPU / Vulkan」会下载同一个包。
+    ///
+    /// **仅 Windows / Linux**：macOS 上游只发布 `macos-arm64` 一个包
+    /// （Metal 后端，不走 Vulkan/CPU 之分），`asset_url` 有意忽略
+    /// `backend`。这条断言在 macOS 上不成立，是测试自己的平台假设错了，
+    /// 不是实现错了——2026-11-05 在 macOS 上实测发现。
+    /// macOS 的对应行为由 `macos_ignores_backend_choice` 覆盖。
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     #[test]
     fn different_backends_give_different_urls() {
         let a = asset_url("vulkan").unwrap();
