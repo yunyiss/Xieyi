@@ -98,12 +98,8 @@ mod windows_dwm {
         let size = std::mem::size_of::<i32>() as u32;
 
         unsafe {
-            let hr = DwmSetWindowAttribute(
-                hwnd.0 as isize,
-                DWMWA_USE_IMMERSIVE_DARK_MODE,
-                ptr,
-                size,
-            );
+            let hr =
+                DwmSetWindowAttribute(hwnd.0 as isize, DWMWA_USE_IMMERSIVE_DARK_MODE, ptr, size);
             if hr == 0 {
                 return Ok(());
             }
@@ -134,21 +130,46 @@ mod windows_dwm {
 const CANVAS_LIGHT: (u8, u8, u8) = (0xf6, 0xf7, 0xf9);
 const CANVAS_DARK: (u8, u8, u8) = (0x10, 0x12, 0x15);
 
-/// 按主题名取窗口背景色。`system` 时用系统当前的深浅判断。
-fn canvas_color(name: &str) -> tauri::window::Color {
-    let dark = match name {
+/// 按主题名取窗口背景色。
+///
+/// `system` / 未知值**必须真的去问窗口当前是什么主题**，不能假定浅色：
+/// 深色系统下选「跟随系统」时，若这里返回浅色，WebView 还没重绘完的那
+/// 一瞬底下就是 `#f6f7f9`，肉眼看到一次白闪。这是纯 CSS 修不了的
+/// ——底色是窗口属性，CSS 管不到。
+///
+/// `window.theme()` 拿不到时（平台不支持 / API 失败）退回浅色：
+/// 闪一下比设不上色好。
+fn canvas_color(window: &tauri::WebviewWindow, name: &str) -> tauri::window::Color {
+    canvas_for(resolve_dark(window, name))
+}
+
+/// 主题名 → 是否深色。抽成独立函数是为了能单测：
+/// 只有它需要 `WebviewWindow`，颜色映射本身是纯计算。
+fn resolve_dark(window: &tauri::WebviewWindow, name: &str) -> bool {
+    match name {
         "dark" => true,
         "light" => false,
-        // system / 未知：交给窗口当前的深浅状态判断
-        _ => false,
-    };
+        // system / 未知：问窗口真实的主题状态
+        _ => match window.theme() {
+            Ok(Theme::Dark) => true,
+            Ok(_) => false,
+            Err(e) => {
+                crate::logging::debug("window", format!("读取窗口主题失败，底色按浅色: {e}"));
+                false
+            }
+        },
+    }
+}
+
+/// 深浅 → RGBA。纯计算，无副作用，可单测。
+fn canvas_for(dark: bool) -> tauri::window::Color {
     let (r, g, b) = if dark { CANVAS_DARK } else { CANVAS_LIGHT };
     tauri::window::Color(r, g, b, 255)
 }
 
 /// 设置窗口背景色，减少加载与切换时的闪烁。
 pub fn set_window_background(window: &tauri::WebviewWindow, name: &str) {
-    if let Err(e) = window.set_background_color(Some(canvas_color(name))) {
+    if let Err(e) = window.set_background_color(Some(canvas_color(window, name))) {
         crate::logging::debug("window", format!("设置窗口背景色失败: {e}"));
     }
 }
@@ -184,5 +205,32 @@ mod tests {
     fn canvas_constants_match_css() {
         assert_eq!(CANVAS_LIGHT, (0xf6, 0xf7, 0xf9), "浅色 canvas 变了");
         assert_eq!(CANVAS_DARK, (0x10, 0x12, 0x15), "深色 canvas 变了");
+    }
+
+    /// 深浅两态必须给出**不同**的底色。
+    ///
+    /// 这条锁住一个真 bug：`canvas_color` 的 `system` 分支曾经直接
+    /// `_ => false`，等于永远返回浅色。深色系统下选「跟随系统」时，
+    /// WebView 重绘前底下是白底，肉眼看到一次白闪。如果哪天有人
+    /// 又把两条分支写成一样，这里会红。
+    #[test]
+    fn light_and_dark_canvas_differ() {
+        let light = canvas_for(false);
+        let dark = canvas_for(true);
+        assert_ne!(
+            (light.0, light.1, light.2),
+            (dark.0, dark.1, dark.2),
+            "浅色与深色的窗口底色不能相同"
+        );
+    }
+
+    /// `canvas_for` 必须常量映射，不受外部状态影响。
+    #[test]
+    fn canvas_for_is_deterministic() {
+        assert_eq!(canvas_for(true).0, CANVAS_DARK.0);
+        assert_eq!(canvas_for(false).0, CANVAS_LIGHT.0);
+        // alpha 恒为不透明：半透明底会透出桌面，闪得更明显
+        assert_eq!(canvas_for(true).3, 255);
+        assert_eq!(canvas_for(false).3, 255);
     }
 }
