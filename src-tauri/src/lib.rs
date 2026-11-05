@@ -16,7 +16,6 @@ mod translate;
 
 use serde::Serialize;
 
-
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AppInfo {
@@ -106,7 +105,11 @@ fn open_data_subdir(app: tauri::AppHandle, name: String) -> Result<String, Strin
     };
 
     let base = paths::app_data(&app)?;
-    let dir = if sub.is_empty() { base } else { base.join(&sub) };
+    let dir = if sub.is_empty() {
+        base
+    } else {
+        base.join(&sub)
+    };
     paths::ensure(&dir)?;
     let path = dir.to_string_lossy().to_string();
 
@@ -175,14 +178,38 @@ fn create_main_window(app: &tauri::App) -> Result<(), String> {
     // 在里面 sleep / 起 PowerShell 会把这个线程卡住，实测第一次失败后
     // 进程直接没了（日志只留下第 0 次那条 WARN）。
     // 重试与退避必须放在**事件循环启动之前**。
-    match tauri::WebviewWindowBuilder::from_config(app.handle(), &config)
-        .and_then(|b| b.build())
-    {
+    match tauri::WebviewWindowBuilder::from_config(app.handle(), &config).and_then(|b| b.build()) {
         Ok(window) => {
-            let _ = window.set_focus();
+            // 建出窗口对象 ≠ 上了屏幕。
+            //
+            // 2026-11-05 在一台 x86 黑苹果上实测：`build()` 返回 Ok，
+            // `is_visible()` 为 true，位置尺寸都正常，但 CGWindowList
+            // 里查不到该窗口、截图上也只有壁纸。那是那台 VM 的
+            // WindowServer 合成不可信，不是代码问题——但没有这几行
+            // 日志时完全无法区分「建窗失败」和「建窗成功但没显示」，
+            // 排查多花了半小时。
+            //
+            // 保留为 info 级：正常启动也就 4 行，不影响日志可读性。
+            crate::logging::info("window", "主窗口已创建");
+            if let Ok(pos) = window.outer_position() {
+                crate::logging::info("window", format!("窗口位置 {pos:?}"));
+            }
+            if let Ok(size) = window.outer_size() {
+                crate::logging::info("window", format!("窗口尺寸 {size:?}"));
+            }
+            match window.is_visible() {
+                Ok(v) => crate::logging::info("window", format!("可见性 {v}")),
+                Err(e) => crate::logging::warn("window", format!("读可见性失败: {e}")),
+            }
+            if let Err(e) = window.set_focus() {
+                crate::logging::warn("window", format!("聚焦失败: {e}"));
+            }
             Ok(())
         }
-        Err(e) => Err(e.to_string()),
+        Err(e) => {
+            crate::logging::error("window", format!("建窗失败: {e}"));
+            Err(e.to_string())
+        }
     }
 }
 
@@ -379,7 +406,8 @@ mod tests {
     fn default_window_label_is_main() {
         let raw = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tauri.conf.json"))
             .expect("读不到 tauri.conf.json");
-        let conf: serde_json::Value = serde_json::from_str(&raw).expect("tauri.conf.json 不是合法 JSON");
+        let conf: serde_json::Value =
+            serde_json::from_str(&raw).expect("tauri.conf.json 不是合法 JSON");
 
         let windows = conf["app"]["windows"]
             .as_array()
