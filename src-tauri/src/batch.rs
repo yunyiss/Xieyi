@@ -196,7 +196,10 @@ async fn process_file(
 
     if state.cancel.load(Ordering::Relaxed) {
         report!("skipped", 0, 0, 0, None, Some("已取消".into()));
-        return FileOutcome { skipped: true, ..Default::default() };
+        return FileOutcome {
+            skipped: true,
+            ..Default::default()
+        };
     }
 
     let source = PathBuf::from(path);
@@ -216,7 +219,10 @@ async fn process_file(
             Some(output.to_string_lossy().to_string()),
             Some("输出文件已存在".into())
         );
-        return FileOutcome { skipped: true, ..Default::default() };
+        return FileOutcome {
+            skipped: true,
+            ..Default::default()
+        };
     }
 
     let bytes = match std::fs::read(&source) {
@@ -269,7 +275,14 @@ async fn process_file(
     }
 
     if state.cancel.load(Ordering::Relaxed) {
-        report!("skipped", done, segments, failed, None, Some("已取消".into()));
+        report!(
+            "skipped",
+            done,
+            segments,
+            failed,
+            None,
+            Some("已取消".into())
+        );
         return FileOutcome {
             skipped: true,
             failed_segments: failed,
@@ -284,7 +297,14 @@ async fn process_file(
     let rendered = render(&assembled, &request.target);
 
     if let Err(e) = std::fs::write(&output, rendered.as_bytes()) {
-        report!("failed", done, segments, failed, None, Some(format!("写入失败: {e}")));
+        report!(
+            "failed",
+            done,
+            segments,
+            failed,
+            None,
+            Some(format!("写入失败: {e}"))
+        );
         return FileOutcome {
             failed_segments: failed,
             flagged_segments: flagged,
@@ -319,7 +339,7 @@ async fn translate_with_retry(
     glossary: &[GlossaryEntry],
     text: &str,
 ) -> Option<(String, SegmentStats)> {
-        let mut last_error = String::new();
+    let mut last_error = String::new();
 
     for attempt in 0..MAX_ATTEMPTS {
         if state.cancel.load(Ordering::Relaxed) {
@@ -394,10 +414,7 @@ fn split(content: &str, path: &Path) -> (Vec<String>, Assembled) {
         if let Some(blocks) = parse_srt(content) {
             let heads = blocks.iter().map(|b| b.head.clone()).collect();
             let bodies: Vec<String> = blocks.iter().map(|b| b.text.clone()).collect();
-            return (
-                bodies.clone(),
-                Assembled::Srt { heads, bodies },
-            );
+            return (bodies.clone(), Assembled::Srt { heads, bodies });
         }
     }
 
@@ -474,7 +491,10 @@ fn parse_srt(content: &str) -> Option<Vec<SrtBlock>> {
         let lines: Vec<&str> = block.lines().collect();
         let arrow = lines.iter().position(|l| l.contains("-->"))?;
 
-        let head: Vec<String> = lines[..=arrow].iter().map(|l| l.trim().to_string()).collect();
+        let head: Vec<String> = lines[..=arrow]
+            .iter()
+            .map(|l| l.trim().to_string())
+            .collect();
         let text = lines[arrow + 1..]
             .iter()
             .map(|l| l.trim())
@@ -513,7 +533,8 @@ mod tests {
 
     #[test]
     fn srt_render_round_trips_structure() {
-        let src = "1\n00:00:01,000 --> 00:00:03,500\nHello\n\n2\n00:00:04,000 --> 00:00:06,000\nWorld\n";
+        let src =
+            "1\n00:00:01,000 --> 00:00:03,500\nHello\n\n2\n00:00:04,000 --> 00:00:06,000\nWorld\n";
         let blocks = parse_srt(src).unwrap();
         let heads: Vec<Vec<String>> = blocks.iter().map(|b| b.head.clone()).collect();
         let bodies = vec!["你好".to_string(), "世界".to_string()];

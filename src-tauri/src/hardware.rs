@@ -24,10 +24,7 @@ pub fn free_vram_mb() -> Option<u64> {
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 fn query_nvidia_smi() -> Option<u64> {
     let mut cmd = Command::new("nvidia-smi");
-    cmd.args([
-        "--query-gpu=memory.free",
-        "--format=csv,noheader,nounits",
-    ]);
+    cmd.args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"]);
 
     #[cfg(target_os = "windows")]
     {

@@ -17,8 +17,8 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::OnceLock;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 保留多少天的日志。再久的对排查没意义，只占磁盘。
@@ -135,11 +135,7 @@ fn writer_loop(rx: Receiver<String>, dir: PathBuf) {
 
 fn open_for_day(dir: &Path, day: u64) -> Option<File> {
     let path = dir.join(format!("xieyi-{}.log", day_to_date(day)));
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .ok()
+    OpenOptions::new().create(true).append(true).open(path).ok()
 }
 
 /// 删掉超过 `KEEP_DAYS` 天的日志。
@@ -334,7 +330,10 @@ fn now_secs() -> u64 {
 /// 东八区凌晨 01:00 写的日志，时间戳是今天，文件名却是昨天，
 /// 用户按当天日期找文件会找不到。
 fn day_number() -> u64 {
-    (now_secs() as i64).saturating_add(local_offset_secs()).max(0) as u64 / 86_400
+    (now_secs() as i64)
+        .saturating_add(local_offset_secs())
+        .max(0) as u64
+        / 86_400
 }
 
 // ── 日期换算 ────────────────────────────────────────────────────────────

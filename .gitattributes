@@ -1,0 +1,26 @@
+# 统一换行符：仓库内一律 LF，避免跨平台 clone 时整文件「假改动」。
+#
+# 背景：项目只在 Windows 上开发，`core.autocrlf=true` 让 Git 在 checkout 时
+# 转成 CRLF、commit 时转回 LF。这本身没错，但缺了显式声明时：
+#   - `cargo fmt` 写出的 LF 与工作区 CRLF 不一致 → 每次 git 都报
+#     "LF will be replaced by CRLF" 警告
+#   - 一台机器 autocrlf=true、另一台 false 时，同一个文件会显示整文件重写
+# 显式写死 LF 后，行为与平台配置解耦。
+* text=auto eol=lf
+
+# Rust / TS 源码、配置、文档一律 LF
+*.rs    text eol=lf
+*.toml  text eol=lf
+*.ts    text eol=lf
+*.tsx   text eol=lf
+*.css   text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+
+# 二进制资产不要做换行转换
+*.png   binary
+*.ico   binary
+*.icns  binary
+*.gguf  binary

@@ -18,16 +18,20 @@ pub const PINNED_VERSION: &str = "b11714";
 ///
 /// **没有记录的组合会跳过校验**，只保存实际哈希。新增后端时记得补。
 fn expected_sha256(backend: &str) -> Option<&'static str> {
+    // 每个平台段都写成「表达式」而不是「语句 + return」：
+    // 用块表达式时整段就是这个分支的值，与有没有 return 无关，
+    // 也不会因为某个平台段多了 return 而让 clippy 在别的平台上报警
+    // （Windows 上曾因此报 0 条、Linux 上报 2 条，两边结果不一致）。
     #[cfg(target_os = "windows")]
     {
         match backend {
             "cpu" => {
                 // llama-b11714-bin-win-cpu-x64.zip
-                return Some("f78eded047061a3f86372db426797400a2f1bb0ec37868d5927dd820eb3386c0");
+                Some("f78eded047061a3f86372db426797400a2f1bb0ec37868d5927dd820eb3386c0")
             }
             _ => {
                 // llama-b11714-bin-win-vulkan-x64.zip
-                return Some("d4765447307f29fc0b4c8ae5b8b806c46b3e515d0ce5c2a54dd90d9b2c7a392f");
+                Some("d4765447307f29fc0b4c8ae5b8b806c46b3e515d0ce5c2a54dd90d9b2c7a392f")
             }
         }
     }
@@ -37,11 +41,11 @@ fn expected_sha256(backend: &str) -> Option<&'static str> {
         match backend {
             "cpu" => {
                 // llama-b11714-bin-ubuntu-x64.tar.gz
-                return Some("639059a1106e706810486285ec6d1d92c961f3f920ef78bbdd1ee359428679d0");
+                Some("639059a1106e706810486285ec6d1d92c961f3f920ef78bbdd1ee359428679d0")
             }
             _ => {
                 // llama-b11714-bin-ubuntu-vulkan-x64.tar.gz（发行版无 NVIDIA 驱动时的默认）
-                return Some("a41bc4a20dc7935492a7a1216aa10c39ff7919349864873a46c74022bcd28a26");
+                Some("a41bc4a20dc7935492a7a1216aa10c39ff7919349864873a46c74022bcd28a26")
             }
         }
     }
@@ -53,7 +57,7 @@ fn expected_sha256(backend: &str) -> Option<&'static str> {
         // 只支持 Apple Silicon：上游不再为 x86_64 macOS 出 Vulkan 包，
         // 而 Metal 后端在 arm64 上是唯一被验证过的路径。
         let _ = backend;
-        return Some("063f58b7d8458d89eacb2f28a10a6d6e0efa2a81866690b0f6f8ebac6e3846bb");
+        Some("063f58b7d8458d89eacb2f28a10a6d6e0efa2a81866690b0f6f8ebac6e3846bb")
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
@@ -127,7 +131,7 @@ fn write_info(app: &AppHandle, info: &RuntimeInfo) -> Result<(), String> {
 
 pub fn status(app: &AppHandle) -> RuntimeStatus {
     let info = read_info(app);
-    let models_dir = paths::models_dir(&app)
+    let models_dir = paths::models_dir(app)
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
 
@@ -243,8 +247,7 @@ fn extract_archive(path: &std::path::Path, dest: &std::path::Path) -> Result<(),
     #[cfg(target_os = "windows")]
     {
         let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-        let mut archive =
-            zip::ZipArchive::new(file).map_err(|e| format!("解析压缩包失败: {e}"))?;
+        let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("解析压缩包失败: {e}"))?;
         archive
             .extract(dest)
             .map_err(|e| format!("解压失败: {e}"))?;
@@ -254,10 +257,7 @@ fn extract_archive(path: &std::path::Path, dest: &std::path::Path) -> Result<(),
     #[cfg(not(target_os = "windows"))]
     {
         let mut cmd = std::process::Command::new("tar");
-        cmd.args(["-xzf"])
-            .arg(path)
-            .arg("-C")
-            .arg(dest);
+        cmd.args(["-xzf"]).arg(path).arg("-C").arg(dest);
 
         let out = cmd.output().map_err(|e| format!("调用 tar 失败: {e}"))?;
         if !out.status.success() {
@@ -390,13 +390,13 @@ pub async fn install_runtime(app: AppHandle, backend: String) -> Result<RuntimeS
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
     let actual = format!("{:x}", hasher.finalize());
-    if let Some(expected) = expected_sha256(&backend) {
-        if actual != expected {
-            let _ = std::fs::remove_file(&archive_path);
-            return Err(format!(
-                "下载包校验失败：期望 {expected}，实际 {actual}。文件已删除。"
-            ));
-        }
+    if let Some(expected) = expected_sha256(&backend)
+        && actual != expected
+    {
+        let _ = std::fs::remove_file(&archive_path);
+        return Err(format!(
+            "下载包校验失败：期望 {expected}，实际 {actual}。文件已删除。"
+        ));
     }
 
     // 解压

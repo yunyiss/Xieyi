@@ -75,7 +75,8 @@ pub fn list_sessions(app: AppHandle) -> Vec<Session> {
         .filter_map(|raw| serde_json::from_str::<Session>(&raw).ok())
         .collect();
 
-    out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    // 按更新时间倒序：最近用过的会话排最前
+    out.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
     out
 }
 

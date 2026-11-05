@@ -1,8 +1,8 @@
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -26,11 +26,7 @@ pub fn shutdown_blocking(app: &AppHandle, timeout: Duration) {
     let state = app.state::<AppState>();
 
     // 无锁读取：退出时 service 锁可能被推理请求持着
-    let api_key = state
-        .api_key
-        .lock()
-        .map(|k| k.clone())
-        .unwrap_or_default();
+    let api_key = state.api_key.lock().map(|k| k.clone()).unwrap_or_default();
 
     match state.service.try_lock() {
         Ok(mut guard) => {
@@ -41,9 +37,8 @@ pub fn shutdown_blocking(app: &AppHandle, timeout: Duration) {
                     .build();
                 match rt {
                     Ok(rt) => {
-                        let _ = rt.block_on(async {
-                            tokio::time::timeout(timeout, svc.kill()).await
-                        });
+                        let _ =
+                            rt.block_on(async { tokio::time::timeout(timeout, svc.kill()).await });
                     }
                     Err(_) => {
                         // 建不了运行时：退回按 PID 强杀孤儿
@@ -55,10 +50,7 @@ pub fn shutdown_blocking(app: &AppHandle, timeout: Duration) {
         Err(_) => {
             // 锁被推理请求持着：不能等（会拖死退出），直接按 PID 强杀。
             // `llama-server` 是我们自己起的子进程，按 PID 杀是安全的。
-            crate::logging::warn(
-                "app",
-                "退出时服务锁被占用，改为按 PID 强制回收推理进程",
-            );
+            crate::logging::warn("app", "退出时服务锁被占用，改为按 PID 强制回收推理进程");
             kill_llama_servers_spawned_by_us(&api_key);
         }
     }
@@ -214,7 +206,6 @@ fn list_processes() -> Vec<(String, String)> {
         Vec::new()
     }
 }
-
 
 use crate::params::{self, Thinking};
 use crate::paths;
@@ -505,15 +496,18 @@ pub struct Settings {
 
 /// 启动时把持久化设置装回内存。
 pub fn load_settings(app: &AppHandle) {
-    let state = app.state::<AppState>();
-
-    if let Some(ttl) = paths::config_value(app, "ttlSecs").and_then(|v| v.as_u64()) {
-        state.ttl_secs.store(ttl, Ordering::Relaxed);
+    // 用块作用域而不是 `drop(state)`：`State<AppState>` 只是借用包装，
+    // 并不实现 Drop，显式 drop 只是提前结束借用，编译器不会因此少活一秒。
+    // 块作用域表达同一意图，且不会被 clippy 当成无效调用。
+    {
+        let state = app.state::<AppState>();
+        if let Some(ttl) = paths::config_value(app, "ttlSecs").and_then(|v| v.as_u64()) {
+            state.ttl_secs.store(ttl, Ordering::Relaxed);
+        }
+        if let Some(layers) = paths::config_value(app, "gpuLayers").and_then(|v| v.as_u64()) {
+            state.gpu_layers.store(layers, Ordering::Relaxed);
+        }
     }
-    if let Some(layers) = paths::config_value(app, "gpuLayers").and_then(|v| v.as_u64()) {
-        state.gpu_layers.store(layers, Ordering::Relaxed);
-    }
-    drop(state);
 
     if let Some(list) = paths::config_value(app, "pinned").and_then(|v| v.as_array().cloned()) {
         let set: HashSet<String> = list
@@ -531,9 +525,12 @@ pub fn load_settings(app: &AppHandle) {
 }
 
 fn free_port() -> Result<u16, String> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")
-        .map_err(|e| format!("分配端口失败: {e}"))?;
-    listener.local_addr().map(|a| a.port()).map_err(|e| e.to_string())
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| format!("分配端口失败: {e}"))?;
+    listener
+        .local_addr()
+        .map(|a| a.port())
+        .map_err(|e| e.to_string())
 }
 
 fn local_key() -> String {
@@ -571,7 +568,10 @@ impl Service {
             for item in list {
                 out.push(RouterModel {
                     id: item["id"].as_str().unwrap_or_default().to_string(),
-                    state: item["status"]["value"].as_str().unwrap_or("unknown").to_string(),
+                    state: item["status"]["value"]
+                        .as_str()
+                        .unwrap_or("unknown")
+                        .to_string(),
                 });
             }
         }
@@ -678,7 +678,7 @@ impl Service {
                 "unloaded" | "failed" if seen_loading => {
                     return Err(format!(
                         "模型加载失败（{model}）。可能是该 GGUF 的量化格式不受当前 llama.cpp 版本支持，或显存不足。"
-                    ))
+                    ));
                 }
                 _ => {}
             }
@@ -692,7 +692,11 @@ impl Service {
 
     /// 预热：跑一次极短推理，把首推理开销（Vulkan 着色器编译约 3 秒）
     /// 从"用户看到的第一句话"挪到"加载阶段"。失败不影响使用，直接忽略。
-    async fn warmup(&self, model: &str, cancel: &std::sync::atomic::AtomicBool) -> Result<(), String> {
+    async fn warmup(
+        &self,
+        model: &str,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), String> {
         if cancel.load(Ordering::Relaxed) {
             return Err("已取消".into());
         }
@@ -767,14 +771,7 @@ impl Service {
         // 用错调用机制不会报错、只会静默给出错误结果，所以留一行痕迹方便排查。
         // 只在机制变化时打印：批量翻译有几十上百段，逐段刷屏没有意义。
         log_profile_once(model, &profile);
-        let request = prompts::build_request(
-            profile.style,
-            source,
-            target,
-            glossary,
-            text,
-            None,
-        );
+        let request = prompts::build_request(profile.style, source, target, glossary, text, None);
 
         let first = stream_completion_with(
             app,
@@ -1091,9 +1088,7 @@ async fn spawn(app: &AppHandle, gpu_layers: u64) -> Result<Service, String> {
     // **紧接 spawn 之后**加入 Job Object：这是内核级的进程树保护，
     // 覆盖「主进程被强杀」这类 `Service::kill()` 跑不到的路径。
     // 失败只记日志不阻断——没有 Job 时仍能靠 kill() 清理。
-    let job = child
-        .id()
-        .and_then(crate::job_object::JobHandle::assign);
+    let job = child.id().and_then(crate::job_object::JobHandle::assign);
 
     // 只记端口和路径，**不记 api-key**：日志可能被发出来排查问题，
     // 本地 key 虽然只在进程内有效，但没有理由写进磁盘。
@@ -1108,10 +1103,10 @@ async fn spawn(app: &AppHandle, gpu_layers: u64) -> Result<Service, String> {
 
     // 把 api-key 同步到 AppState，供退出清理无锁读取。
     // 退出时 service 锁可能被推理请求持着，那时拿不到 Service.key。
-    if let Some(state) = app.try_state::<AppState>() {
-        if let Ok(mut slot) = state.api_key.lock() {
-            *slot = key.clone();
-        }
+    if let Some(state) = app.try_state::<AppState>()
+        && let Ok(mut slot) = state.api_key.lock()
+    {
+        *slot = key.clone();
     }
 
     let service = Service {
@@ -1133,10 +1128,10 @@ async fn spawn(app: &AppHandle, gpu_layers: u64) -> Result<Service, String> {
             .timeout(Duration::from_secs(2))
             .send()
             .await;
-        if let Ok(r) = resp {
-            if r.status().is_success() {
-                break;
-            }
+        if let Ok(r) = resp
+            && r.status().is_success()
+        {
+            break;
         }
         if started.elapsed() > Duration::from_secs(30) {
             service.kill().await;
@@ -1153,10 +1148,10 @@ async fn spawn(app: &AppHandle, gpu_layers: u64) -> Result<Service, String> {
 pub async fn ensure(app: &AppHandle, state: &AppState) -> Result<Arc<Service>, String> {
     let mut guard = state.service.lock().await;
 
-    if let Some(existing) = guard.as_ref() {
-        if existing.is_alive().await {
-            return Ok(existing.clone());
-        }
+    if let Some(existing) = guard.as_ref()
+        && existing.is_alive().await
+    {
+        return Ok(existing.clone());
     }
 
     if let Some(old) = guard.take() {
@@ -1174,7 +1169,10 @@ pub async fn current(state: &AppState) -> Option<Arc<Service>> {
 }
 
 #[tauri::command]
-pub async fn service_status(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<ServiceStatus, String> {
+pub async fn service_status(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<ServiceStatus, String> {
     let models_dir = paths::models_dir(&app)
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
@@ -1196,7 +1194,10 @@ pub async fn service_status(app: AppHandle, state: tauri::State<'_, AppState>) -
 }
 
 #[tauri::command]
-pub async fn start_service(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<ServiceStatus, String> {
+pub async fn start_service(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<ServiceStatus, String> {
     ensure(&app, &state).await?;
     service_status(app, state).await
 }
@@ -1317,9 +1318,8 @@ pub struct CompactRequest {
 /// 也不要因为读不到元数据就让翻译直接失败。
 fn model_profile(app: &AppHandle, model: &str) -> models::ModelProfile {
     fn cache() -> &'static std::sync::Mutex<HashMap<String, models::ModelProfile>> {
-        static CACHE: std::sync::OnceLock<
-            std::sync::Mutex<HashMap<String, models::ModelProfile>>,
-        > = std::sync::OnceLock::new();
+        static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, models::ModelProfile>>> =
+            std::sync::OnceLock::new();
         CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
     }
 
@@ -1359,10 +1359,7 @@ fn log_profile_once(model: &str, profile: &models::ModelProfile) {
     }
 
     let key = format!("{}\u{1}{}", model, profile.style.as_str());
-    let first = logged()
-        .lock()
-        .map(|mut s| s.insert(key))
-        .unwrap_or(false);
+    let first = logged().lock().map(|mut s| s.insert(key)).unwrap_or(false);
     if first {
         eprintln!(
             "翻译 [{}] 家族={} 机制={} 可对话={}",
@@ -1376,6 +1373,11 @@ fn log_profile_once(model: &str, profile: &models::ModelProfile) {
 
 /// `thinking` 决定是否让思考型模型先输出思维链。翻译固定关闭：
 /// 界面不展示思维链，它只会吃光 `max_tokens` 并拖慢首字。
+/// 流式补全（不带模板参数的常用入口）。
+///
+/// 参数多的理由同 [`stream_completion_with`]：保持平铺比引入只在内部分流转的
+/// 参数结构体更易读，调用点能一眼看清每个值。
+#[allow(clippy::too_many_arguments)]
 async fn stream_completion(
     app: &AppHandle,
     s: &Service,
@@ -1387,7 +1389,19 @@ async fn stream_completion(
     thinking: Thinking,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<String, String> {
-    stream_completion_with(app, s, request_id, model, messages, temperature, max_tokens, thinking, None, cancel).await
+    stream_completion_with(
+        app,
+        s,
+        request_id,
+        model,
+        messages,
+        temperature,
+        max_tokens,
+        thinking,
+        None,
+        cancel,
+    )
+    .await
 }
 
 /// 同 [`stream_completion`]，但允许附加 `chat_template_kwargs`。
@@ -1395,6 +1409,10 @@ async fn stream_completion(
 /// 有些翻译模型（translategemma）的语言方向完全由模板参数决定，
 /// 不传就默认 en-GB，把任何输入都翻成英式英语。这类模型的参数
 /// 必须和思考参数合并进同一个对象——llama.cpp 只认一个 `chat_template_kwargs`。
+///
+/// 参数确实多（9 个）。不打包成结构体是因为调用点只有两处、
+/// 且其中一处是给默认参数用的薄包装；为了消警告引入一个只在内部流转的
+/// struct，读起来反而要多跳一层。保持平铺，让调用点一眼看清每个值。
 #[allow(clippy::too_many_arguments)]
 async fn stream_completion_with(
     app: &AppHandle,
@@ -1443,11 +1461,11 @@ async fn stream_completion_with(
     }
 
     // 模型专属参数（如 translategemma 的 source/target_lang_code）
-    if let Some(extra) = extra_template_kwargs {
-        if let Some(obj) = extra.as_object() {
-            for (k, v) in obj {
-                kwargs.insert(k.clone(), v.clone());
-            }
+    if let Some(extra) = extra_template_kwargs
+        && let Some(obj) = extra.as_object()
+    {
+        for (k, v) in obj {
+            kwargs.insert(k.clone(), v.clone());
         }
     }
 
@@ -1498,37 +1516,37 @@ async fn stream_completion_with(
 
                 // 思考型模型的思维链：内容照常推给对话页显示（用户需要知道模型还在思考），
                 // 同时记下长度用于"空正文"的诊断
-                if let Some(reasoning) = choice["delta"]["reasoning_content"].as_str() {
-                    if !reasoning.is_empty() {
-                        reasoning_chars += reasoning.chars().count();
-                        if !request_id.is_empty() {
-                            let _ = app.emit(
-                                "llm://reasoning",
-                                TokenPayload {
-                                    request_id: request_id.to_string(),
-                                    token: reasoning.to_string(),
-                                },
-                            );
-                        }
+                if let Some(reasoning) = choice["delta"]["reasoning_content"].as_str()
+                    && !reasoning.is_empty()
+                {
+                    reasoning_chars += reasoning.chars().count();
+                    if !request_id.is_empty() {
+                        let _ = app.emit(
+                            "llm://reasoning",
+                            TokenPayload {
+                                request_id: request_id.to_string(),
+                                token: reasoning.to_string(),
+                            },
+                        );
                     }
                 }
                 if let Some(reason) = choice["finish_reason"].as_str() {
                     finish_reason = reason.to_string();
                 }
 
-                if let Some(token) = choice["delta"]["content"].as_str() {
-                    if !token.is_empty() {
-                        full.push_str(token);
-                        // 空 request_id 表示"不需要推流"（批量任务），省掉无谓的事件
-                        if !request_id.is_empty() {
-                            let _ = app.emit(
-                                "llm://token",
-                                TokenPayload {
-                                    request_id: request_id.to_string(),
-                                    token: token.to_string(),
-                                },
-                            );
-                        }
+                if let Some(token) = choice["delta"]["content"].as_str()
+                    && !token.is_empty()
+                {
+                    full.push_str(token);
+                    // 空 request_id 表示"不需要推流"（批量任务），省掉无谓的事件
+                    if !request_id.is_empty() {
+                        let _ = app.emit(
+                            "llm://token",
+                            TokenPayload {
+                                request_id: request_id.to_string(),
+                                token: token.to_string(),
+                            },
+                        );
                     }
                 }
 
@@ -1536,7 +1554,9 @@ async fn stream_completion_with(
                 if let Some(u) = value["usage"].as_object() {
                     usage = Some((
                         u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                        u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                        u.get("completion_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0),
                         u.get("prompt_tokens_details")
                             .and_then(|d| d.get("cached_tokens"))
                             .and_then(|v| v.as_u64())
@@ -1549,20 +1569,20 @@ async fn stream_completion_with(
 
     // 上报真实用量，让界面能显示"上下文用了多少"。
     // 放在空回复判断之前：预算被思考吃光时，正是最需要看到用量的场景。
-    if !request_id.is_empty() {
-        if let Some((prompt_tokens, completion_tokens, cached_tokens)) = usage {
-            let _ = app.emit(
-                "llm://usage",
-                UsagePayload {
-                    request_id: request_id.to_string(),
-                    prompt_tokens,
-                    completion_tokens,
-                    cached_tokens,
-                    ctx_size: params::ctx_of(app, model),
-                    elapsed_ms: started.elapsed().as_millis() as u64,
-                },
-            );
-        }
+    if !request_id.is_empty()
+        && let Some((prompt_tokens, completion_tokens, cached_tokens)) = usage
+    {
+        let _ = app.emit(
+            "llm://usage",
+            UsagePayload {
+                request_id: request_id.to_string(),
+                prompt_tokens,
+                completion_tokens,
+                cached_tokens,
+                ctx_size: params::ctx_of(app, model),
+                elapsed_ms: started.elapsed().as_millis() as u64,
+            },
+        );
     }
 
     // 空正文绝不能当成功返回：上层会把它渲染成一个空气泡，用户以为"回复丢了"。
@@ -1641,7 +1661,10 @@ mod tests {
         // 实测 Qwen3.5 就是这个形态：思考 2985 字、正文 0 字
         assert!(message.contains("2985"), "应带上思考字数: {message}");
         assert!(message.contains("1024"), "应带上输出上限: {message}");
-        assert!(message.contains("思考"), "应指出是思考吃掉了预算: {message}");
+        assert!(
+            message.contains("思考"),
+            "应指出是思考吃掉了预算: {message}"
+        );
     }
 
     #[test]
@@ -1661,10 +1684,7 @@ mod tests {
     fn interrupted_stream_is_not_reported_as_budget_exhaustion() {
         // 思考只输出 6 字就被打断：真实形态是 finish_reason 为空/stop
         let message = empty_reply_message(6, 1536, "");
-        assert!(
-            !message.contains("预算"),
-            "中断不该说成预算耗尽: {message}"
-        );
+        assert!(!message.contains("预算"), "中断不该说成预算耗尽: {message}");
         assert!(!message.contains("调低"), "中断不该建议调低档位: {message}");
         assert!(message.contains("中断"), "应指出是中断: {message}");
         assert!(message.contains("6"), "应带上已输出的思考字数: {message}");
@@ -1970,10 +1990,7 @@ pub fn get_glossary(app: AppHandle) -> Vec<GlossaryEntry> {
 }
 
 #[tauri::command]
-pub fn set_glossary(
-    app: AppHandle,
-    entries: Vec<GlossaryEntry>,
-) -> Result<(), String> {
+pub fn set_glossary(app: AppHandle, entries: Vec<GlossaryEntry>) -> Result<(), String> {
     paths::set_config_value(&app, "glossary", serde_json::json!(entries))
 }
 
@@ -2002,7 +2019,8 @@ fn history_budget(ctx: u64) -> usize {
 /// 刻意**不是**编程 agent 那套（Goal/Progress/Blocked/文件路径）——
 /// 那是给改代码用的。这里是"改译文"，真正需要带下去的是：译的是什么、
 /// 定了哪些译法、试过哪些方向、当前版本长什么样。
-const COMPACT_PROMPT: &str = "The messages above are an earlier part of a translation revision session. \
+const COMPACT_PROMPT: &str =
+    "The messages above are an earlier part of a translation revision session. \
 Write a compact handover note so the work can continue without re-reading them.
 
 Use EXACTLY this format (skip a section only if it truly does not apply):

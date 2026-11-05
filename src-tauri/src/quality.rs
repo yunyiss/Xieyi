@@ -261,9 +261,7 @@ impl Report {
                         "上一次的译文不是{expected}，可能翻成了其他语言。请用{expected}重新翻译。"
                     )
                 } else {
-                    format!(
-                        "Your previous answer was not written in the expected target language. Re-translate it properly."
-                    )
+                    "Your previous answer was not written in the expected target language. Re-translate it properly.".to_string()
                 }),
                 Issue::WrongVariant { expected, .. } => lines.push(if zh {
                     format!(
@@ -327,22 +325,125 @@ const MAX_RATIO: f64 = 5.0;
 /// 长度 ≤ 2 的词不用进表（见 [`is_ignorable_word`]）。
 const IGNORE_WORDS: &[&str] = &[
     // 协议 / 格式 / 标准
-    "api", "url", "uri", "http", "https", "ftp", "ssh", "smtp", "dns", "tcp", "udp", "ip",
-    "html", "css", "xml", "json", "yaml", "toml", "sql", "csv", "pdf", "png", "jpg", "jpeg",
-    "gif", "svg", "zip", "tar", "exe", "dll", "iso", "mp3", "mp4", "wav", "mkv", "avi",
+    "api",
+    "url",
+    "uri",
+    "http",
+    "https",
+    "ftp",
+    "ssh",
+    "smtp",
+    "dns",
+    "tcp",
+    "udp",
+    "ip",
+    "html",
+    "css",
+    "xml",
+    "json",
+    "yaml",
+    "toml",
+    "sql",
+    "csv",
+    "pdf",
+    "png",
+    "jpg",
+    "jpeg",
+    "gif",
+    "svg",
+    "zip",
+    "tar",
+    "exe",
+    "dll",
+    "iso",
+    "mp3",
+    "mp4",
+    "wav",
+    "mkv",
+    "avi",
     // 硬件 / 系统
-    "cpu", "gpu", "ram", "rom", "usb", "ssd", "hdd", "bios", "os", "pc", "mac", "ios",
-    "android", "linux", "windows", "ubuntu", "docker", "kubernetes", "git", "github",
+    "cpu",
+    "gpu",
+    "ram",
+    "rom",
+    "usb",
+    "ssd",
+    "hdd",
+    "bios",
+    "os",
+    "pc",
+    "mac",
+    "ios",
+    "android",
+    "linux",
+    "windows",
+    "ubuntu",
+    "docker",
+    "kubernetes",
+    "git",
+    "github",
     // 软件 / 服务（只收"几乎没有普通含义"的品牌名；apple、windows 这类
     // 本身也是日常词汇，放进来会让 "Apple" 这种水果不翻译，所以不收）
-    "app", "apps", "sdk", "ide", "cli", "gui", "ui", "ux", "ai", "ml", "llm", "gpt",
-    "chatgpt", "openai", "github", "aws", "azure",
-    "facebook", "twitter", "instagram", "youtube", "tiktok", "wechat", "alipay",
+    "app",
+    "apps",
+    "sdk",
+    "ide",
+    "cli",
+    "gui",
+    "ui",
+    "ux",
+    "ai",
+    "ml",
+    "llm",
+    "gpt",
+    "chatgpt",
+    "openai",
+    "github",
+    "aws",
+    "azure",
+    "facebook",
+    "twitter",
+    "instagram",
+    "youtube",
+    "tiktok",
+    "wechat",
+    "alipay",
     // 常见界面词（很多语言直接沿用英文）
-    "email", "e-mail", "sms", "ok", "id", "uid", "uuid", "gps", "wifi", "bluetooth",
-    "nfc", "vpn", "cdn", "dns", "ssl", "tls", "oauth", "jwt", "sso", "2fa", "otp",
+    "email",
+    "e-mail",
+    "sms",
+    "ok",
+    "id",
+    "uid",
+    "uuid",
+    "gps",
+    "wifi",
+    "bluetooth",
+    "nfc",
+    "vpn",
+    "cdn",
+    "dns",
+    "ssl",
+    "tls",
+    "oauth",
+    "jwt",
+    "sso",
+    "2fa",
+    "otp",
     // 单位 / 量词
-    "mb", "gb", "tb", "kb", "hz", "khz", "mhz", "ghz", "px", "dpi", "fps", "ms", "ns",
+    "mb",
+    "gb",
+    "tb",
+    "kb",
+    "hz",
+    "khz",
+    "mhz",
+    "ghz",
+    "px",
+    "dpi",
+    "fps",
+    "ms",
+    "ns",
 ];
 
 /// 这个词是不是"不需要翻译"。
@@ -410,17 +511,19 @@ fn strip_placeholders(text: &str) -> String {
     while i < chars.len() {
         let c = chars[i];
         // ${...} / {{...}} / {...}
-        if c == '$' && i + 1 < chars.len() && chars[i + 1] == '{' {
-            if let Some(end) = find_closing(&chars, i + 1, '{', '}') {
-                i = end + 1;
-                continue;
-            }
+        if c == '$'
+            && i + 1 < chars.len()
+            && chars[i + 1] == '{'
+            && let Some(end) = find_closing(&chars, i + 1, '{', '}')
+        {
+            i = end + 1;
+            continue;
         }
-        if c == '{' {
-            if let Some(end) = find_closing(&chars, i, '{', '}') {
-                i = end + 1;
-                continue;
-            }
+        if c == '{'
+            && let Some(end) = find_closing(&chars, i, '{', '}')
+        {
+            i = end + 1;
+            continue;
         }
         // %s %d %1$s %(name)s
         if c == '%' && i + 1 < chars.len() {
@@ -433,15 +536,16 @@ fn strip_placeholders(text: &str) -> String {
                 j += 1;
             }
             // 括号形式 %(name)s
-            if j < chars.len() && chars[j] == '(' {
-                if let Some(close) = find_closing(&chars, j, '(', ')') {
-                    j = close + 1;
-                    if j < chars.len() && chars[j].is_ascii_alphabetic() {
-                        j += 1;
-                    }
-                    i = j;
-                    continue;
+            if j < chars.len()
+                && chars[j] == '('
+                && let Some(close) = find_closing(&chars, j, '(', ')')
+            {
+                j = close + 1;
+                if j < chars.len() && chars[j].is_ascii_alphabetic() {
+                    j += 1;
                 }
+                i = j;
+                continue;
             }
             // 简单形式：%s %d %f %.2f
             if j < chars.len() && (chars[j].is_ascii_alphabetic() || chars[j] == '.') {
@@ -512,12 +616,10 @@ fn strip_paths(text: &str) -> String {
 ///
 /// 返回 `true` 表示**应当忽略**（原样返回是合理的），
 /// 返回 `false` 表示这是一次真正的"没翻译"，要报 [`Issue::Untranslated`]。
-fn should_ignore_untranslated(source: &str) -> bool {    // 纯数字、标点、符号：没什么可翻的
+fn should_ignore_untranslated(source: &str) -> bool {
+    // 纯数字、标点、符号：没什么可翻的
     let stripped = strip_for_compare(source);
-    let meaningful: String = stripped
-        .chars()
-        .filter(|c| c.is_alphanumeric())
-        .collect();
+    let meaningful: String = stripped.chars().filter(|c| c.is_alphanumeric()).collect();
     if meaningful.chars().count() <= 1 {
         return true;
     }
@@ -569,9 +671,7 @@ fn list_marks(text: &str) -> usize {
             let t = line.trim_start();
             t.starts_with("- ") || t.starts_with("* ") || t.starts_with("+ ") || {
                 let digits: String = t.chars().take_while(|c| c.is_ascii_digit()).collect();
-                !digits.is_empty()
-                    && digits.len() <= 3
-                    && t[digits.len()..].starts_with(". ")
+                !digits.is_empty() && digits.len() <= 3 && t[digits.len()..].starts_with(". ")
             }
         })
         .count()
@@ -698,19 +798,19 @@ fn is_thai(c: char) -> bool {
 /// 只要一段译文里出现其中几个繁体形，就足以判断字形不对。
 /// 反过来，简体形出现在繁体译文里同理。
 const HAN_SIMPLIFIED: &[char] = &[
-    '设', '历', '网', '络', '简', '体', '关', '闭', '开', '启', '档', '案', '数', '据', '库',
-    '这', '个', '为', '与', '说', '时', '会', '经', '认', '证', '错', '误', '验', '测', '试',
-    '现', '点', '击', '选', '择', '项', '图', '标', '页', '面', '显', '示', '隐', '藏', '复',
-    '制', '粘', '贴', '删', '除', '修', '改', '查', '询', '过', '滤', '导', '出', '总', '结',
-    '报', '表', '统', '计', '计', '算', '应', '用', '软', '件', '系', '统', '机', '器', '学',
+    '设', '历', '网', '络', '简', '体', '关', '闭', '开', '启', '档', '案', '数', '据', '库', '这',
+    '个', '为', '与', '说', '时', '会', '经', '认', '证', '错', '误', '验', '测', '试', '现', '点',
+    '击', '选', '择', '项', '图', '标', '页', '面', '显', '示', '隐', '藏', '复', '制', '粘', '贴',
+    '删', '除', '修', '改', '查', '询', '过', '滤', '导', '出', '总', '结', '报', '表', '统', '计',
+    '计', '算', '应', '用', '软', '件', '系', '统', '机', '器', '学',
 ];
 
 const HAN_TRADITIONAL: &[char] = &[
-    '設', '歷', '網', '絡', '簡', '體', '關', '閉', '開', '啟', '檔', '案', '數', '據', '庫',
-    '這', '個', '為', '與', '說', '時', '會', '經', '認', '證', '錯', '誤', '驗', '測', '試',
-    '現', '點', '擊', '選', '擇', '項', '圖', '標', '頁', '面', '顯', '示', '隱', '藏', '複',
-    '製', '粘', '貼', '刪', '除', '修', '改', '查', '詢', '過', '濾', '導', '出', '總', '結',
-    '報', '表', '統', '計', '計', '算', '應', '用', '軟', '件', '系', '統', '機', '器', '學',
+    '設', '歷', '網', '絡', '簡', '體', '關', '閉', '開', '啟', '檔', '案', '數', '據', '庫', '這',
+    '個', '為', '與', '說', '時', '會', '經', '認', '證', '錯', '誤', '驗', '測', '試', '現', '點',
+    '擊', '選', '擇', '項', '圖', '標', '頁', '面', '顯', '示', '隱', '藏', '複', '製', '粘', '貼',
+    '刪', '除', '修', '改', '查', '詢', '過', '濾', '導', '出', '總', '結', '報', '表', '統', '計',
+    '計', '算', '應', '用', '軟', '件', '系', '統', '機', '器', '學',
 ];
 
 /// 数一数文本里出现了几个指定集合的字。
@@ -818,14 +918,15 @@ fn check_instruction_leak(translated: &str) -> Option<Issue> {
     ];
 
     let lower = translated.to_lowercase();
-    // 英文标记用小写比对，中文标记原样比对
+    // 统一转小写后做子串比对：英文标记因此大小写不敏感；
+    // 中文标记没有大小写概念，`to_lowercase` 对它们是恒等变换，
+    // 所以一条规则就能覆盖两种情况。
+    //
+    // 早先这里写成 `if marker.is_ascii() { marker.to_string() } else { marker.to_string() }`
+    // ——两个分支完全相同，判断毫无作用（clippy `if_same_then_else` 抓出来的）。
+    // 行为上没差别，但会让读代码的人以为中英文走了不同路径，白白多花时间确认。
     for marker in MARKERS {
-        let needle = if marker.is_ascii() {
-            marker.to_string()
-        } else {
-            marker.to_string()
-        };
-        if lower.contains(&needle.to_lowercase()) {
+        if lower.contains(&marker.to_lowercase()) {
             return Some(Issue::InstructionLeak);
         }
     }
@@ -835,8 +936,11 @@ fn check_instruction_leak(translated: &str) -> Option<Issue> {
     for segment in translated.split('[').skip(1) {
         if let Some(end) = segment.find([']', '】']) {
             let inner = &segment[..end];
-            if inner.contains("注意") || inner.contains("術語") || inner.contains("术语")
-                || inner.contains("糾正") || inner.contains("纠正")
+            if inner.contains("注意")
+                || inner.contains("術語")
+                || inner.contains("术语")
+                || inner.contains("糾正")
+                || inner.contains("纠正")
             {
                 return Some(Issue::InstructionLeak);
             }
@@ -950,8 +1054,17 @@ pub fn check(source: &str, target: &str, terms: &[Term], target_lang: &str) -> R
 }
 
 /// 两次质检谁更好：问题条数少者胜。用于决定重试结果要不要覆盖首次结果。
-pub fn better_than(candidate: &str, candidate_report: &Report, first: &str, first_report: &Report) -> bool {
-    match candidate_report.issues.len().cmp(&first_report.issues.len()) {
+pub fn better_than(
+    candidate: &str,
+    candidate_report: &Report,
+    first: &str,
+    first_report: &Report,
+) -> bool {
+    match candidate_report
+        .issues
+        .len()
+        .cmp(&first_report.issues.len())
+    {
         std::cmp::Ordering::Less => true,
         std::cmp::Ordering::Greater => false,
         // 问题一样多时，别用更短的那个（截断风险）
@@ -964,10 +1077,7 @@ mod tests {
     use super::*;
 
     fn terms(pairs: &[(&'static str, &'static str)]) -> Vec<Term<'static>> {
-        pairs
-            .iter()
-            .map(|(from, to)| Term { from, to })
-            .collect()
+        pairs.iter().map(|(from, to)| Term { from, to }).collect()
     }
 
     #[test]
@@ -982,12 +1092,26 @@ mod tests {
     #[test]
     fn normal_matches_are_clean() {
         // 英文→中文，字数约一半
-        assert!(check("Hello world, this is a test sentence.", "你好世界，这是一句测试文字。", &[], "")
-        .is_ok());
+        assert!(
+            check(
+                "Hello world, this is a test sentence.",
+                "你好世界，这是一句测试文字。",
+                &[],
+                ""
+            )
+            .is_ok()
+        );
 
         // 中文→英文，字数翻倍也是正常的
-        assert!(check("这是一句用来测试的中文句子，长度适中。", "This is a Chinese sentence used for testing, and its length is moderate.", &[], "")
-        .is_ok());
+        assert!(
+            check(
+                "这是一句用来测试的中文句子，长度适中。",
+                "This is a Chinese sentence used for testing, and its length is moderate.",
+                &[],
+                ""
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1003,7 +1127,12 @@ mod tests {
         let source = "Hello.";
         let target = "你好。".repeat(40);
         let report = check(source, &target, &[], "");
-        assert!(report.issues.iter().any(|i| matches!(i, Issue::TooLong { .. })));
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| matches!(i, Issue::TooLong { .. }))
+        );
     }
 
     #[test]
@@ -1011,10 +1140,12 @@ mod tests {
         let source = "- apple\n- banana\n- cherry";
         let target = "苹果香蕉樱桃";
         let report = check(source, target, &[], "");
-        assert!(report
-            .issues
-            .iter()
-            .any(|i| matches!(i, Issue::Structure(_))));
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| matches!(i, Issue::Structure(_)))
+        );
 
         // 保留列表标记就不该报
         assert!(check(source, "- 苹果\n- 香蕉\n- 樱桃", &[], "").is_ok());
@@ -1024,10 +1155,12 @@ mod tests {
     fn lost_code_fence_is_flagged() {
         let source = "用法：\n```\nrun --now\n```";
         let target = "用法：运行 --now";
-        assert!(check(source, target, &[], "")
-            .issues
-            .iter()
-            .any(|i| matches!(i, Issue::Structure(_))));
+        assert!(
+            check(source, target, &[], "")
+                .issues
+                .iter()
+                .any(|i| matches!(i, Issue::Structure(_)))
+        );
     }
 
     #[test]
@@ -1035,10 +1168,12 @@ mod tests {
         let source = "1\n00:00:01,000 --> 00:00:03,500\nHello";
         let target = "1\n你好";
         let report = check(source, target, &[], "");
-        assert!(report
-            .issues
-            .iter()
-            .any(|i| matches!(i, Issue::Structure(_))));
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| matches!(i, Issue::Structure(_)))
+        );
     }
 
     #[test]
@@ -1055,14 +1190,18 @@ mod tests {
             &terms(&[("server", "服务器")]),
             "",
         );
-        assert!(matches!(
-            report.issues.last(),
-            Some(Issue::Glossary(_))
-        ));
+        assert!(matches!(report.issues.last(), Some(Issue::Glossary(_))));
 
         // 用上了指定译法就通过
-        assert!(check("The server is down.", "服务器宕机了。", &terms(&[("server", "服务器")]), "")
-            .is_ok());
+        assert!(
+            check(
+                "The server is down.",
+                "服务器宕机了。",
+                &terms(&[("server", "服务器")]),
+                ""
+            )
+            .is_ok()
+        );
         // 原词没出现在原文里，不检查
         assert!(check("Hello.", "你好。", &terms(&[("server", "服务器")]), "").is_ok());
     }
@@ -1076,11 +1215,17 @@ mod tests {
             &terms(&[("apple", "苹果")]),
             "",
         );
-        let hint = report.retry_hint(HintLang::English).expect("有问题就该给出提示");
+        let hint = report
+            .retry_hint(HintLang::English)
+            .expect("有问题就该给出提示");
         assert!(hint.contains("list marker"), "提示应点名列表：{hint}");
         assert!(hint.contains("apple => 苹果"), "提示应带上具体术语：{hint}");
 
-        assert!(check("hello", "你好", &[], "").retry_hint(HintLang::English).is_none());
+        assert!(
+            check("hello", "你好", &[], "")
+                .retry_hint(HintLang::English)
+                .is_none()
+        );
     }
 
     #[test]
@@ -1193,20 +1338,26 @@ mod tests {
     #[test]
     fn placeholders_are_stripped_before_comparing() {
         // 只剩占位符 → 放过
-        assert!(!check("{{count}}", "{{count}}", &[], "")
-            .issues
-            .contains(&Issue::Untranslated));
+        assert!(
+            !check("{{count}}", "{{count}}", &[], "")
+                .issues
+                .contains(&Issue::Untranslated)
+        );
         // 占位符之外还有实词 → 报
-        assert!(check("Hello {{name}}", "Hello {{name}}", &[], "")
-            .issues
-            .contains(&Issue::Untranslated));
+        assert!(
+            check("Hello {{name}}", "Hello {{name}}", &[], "")
+                .issues
+                .contains(&Issue::Untranslated)
+        );
     }
 
     /// 重试提示必须明确说清"你在偷懒"，这是让它改对的关键。
     #[test]
     fn untranslated_retry_hint_says_what_went_wrong() {
         let report = check("hello", "hello", &[], "");
-        let hint = report.retry_hint(HintLang::English).expect("应当有重试提示");
+        let hint = report
+            .retry_hint(HintLang::English)
+            .expect("应当有重试提示");
         assert!(
             hint.to_lowercase().contains("identical to the source"),
             "提示要指出原样返回：{hint}"
@@ -1256,7 +1407,10 @@ mod tests {
         let report = check("hello world", "hello world", &[], "zh");
         // 同时命中 Untranslated 与 WrongScript，只要能报出来就行
         assert!(
-            report.issues.iter().any(|i| matches!(i, Issue::WrongScript { .. })),
+            report
+                .issues
+                .iter()
+                .any(|i| matches!(i, Issue::WrongScript { .. })),
             "应当报文字系统不对：{:?}",
             report.issues
         );
@@ -1266,7 +1420,12 @@ mod tests {
     #[test]
     fn chinese_target_with_han_is_clean() {
         let report = check("hello", "你好", &[], "zh");
-        assert!(!report.issues.iter().any(|i| matches!(i, Issue::WrongScript { .. })));
+        assert!(
+            !report
+                .issues
+                .iter()
+                .any(|i| matches!(i, Issue::WrongScript { .. }))
+        );
     }
 
     /// 日语必须有假名；只有汉字说明翻成了中文。
@@ -1275,13 +1434,20 @@ mod tests {
         // 只有汉字
         let report = check("good morning", "早上好", &[], "ja");
         assert!(
-            report.issues.iter().any(|i| matches!(i, Issue::WrongScript { .. })),
+            report
+                .issues
+                .iter()
+                .any(|i| matches!(i, Issue::WrongScript { .. })),
             "只有汉字的日译应当报错：{:?}",
             report.issues
         );
         // 有假名就对了
         let ok = check("good morning", "おはようございます", &[], "ja");
-        assert!(!ok.issues.iter().any(|i| matches!(i, Issue::WrongScript { .. })));
+        assert!(
+            !ok.issues
+                .iter()
+                .any(|i| matches!(i, Issue::WrongScript { .. }))
+        );
     }
 
     /// 技术文档里夹英文术语是正常的，不能因此报错。
@@ -1294,7 +1460,10 @@ mod tests {
             "zh",
         );
         assert!(
-            !report.issues.iter().any(|i| matches!(i, Issue::WrongScript { .. })),
+            !report
+                .issues
+                .iter()
+                .any(|i| matches!(i, Issue::WrongScript { .. })),
             "夹英文术语不应报错：{:?}",
             report.issues
         );
@@ -1310,7 +1479,10 @@ mod tests {
             "zh",
         );
         assert!(
-            report.issues.iter().any(|i| matches!(i, Issue::WrongVariant { .. })),
+            report
+                .issues
+                .iter()
+                .any(|i| matches!(i, Issue::WrongVariant { .. })),
             "要简体给繁体应当报错：{:?}",
             report.issues
         );
@@ -1326,7 +1498,10 @@ mod tests {
             "zh-tw",
         );
         assert!(
-            report.issues.iter().any(|i| matches!(i, Issue::WrongVariant { .. })),
+            report
+                .issues
+                .iter()
+                .any(|i| matches!(i, Issue::WrongVariant { .. })),
             "要繁体给简体应当报错：{:?}",
             report.issues
         );
@@ -1336,19 +1511,39 @@ mod tests {
     #[test]
     fn correct_variant_is_clean() {
         let simp = check("good", "很好，设定里的网络关闭了", &[], "zh");
-        assert!(!simp.issues.iter().any(|i| matches!(i, Issue::WrongVariant { .. })));
+        assert!(
+            !simp
+                .issues
+                .iter()
+                .any(|i| matches!(i, Issue::WrongVariant { .. }))
+        );
 
         let trad = check("good", "很好，設定裡的網路關閉了", &[], "zh-tw");
-        assert!(!trad.issues.iter().any(|i| matches!(i, Issue::WrongVariant { .. })));
+        assert!(
+            !trad
+                .issues
+                .iter()
+                .any(|i| matches!(i, Issue::WrongVariant { .. }))
+        );
     }
 
     /// 不认识的语言不做检查，避免误伤。
     #[test]
     fn unknown_language_skips_script_check() {
         let report = check("hello", "你好", &[], "");
-        assert!(!report.issues.iter().any(|i| matches!(i, Issue::WrongScript { .. })));
+        assert!(
+            !report
+                .issues
+                .iter()
+                .any(|i| matches!(i, Issue::WrongScript { .. }))
+        );
         let report = check("hello", "你好", &[], "xx");
-        assert!(!report.issues.iter().any(|i| matches!(i, Issue::WrongScript { .. })));
+        assert!(
+            !report
+                .issues
+                .iter()
+                .any(|i| matches!(i, Issue::WrongScript { .. }))
+        );
     }
 
     /// 翻错语言时的重试提示要说清楚。
@@ -1446,9 +1641,6 @@ mod tests {
             "英文提示要说明不要带方括号：{en}"
         );
         let zh = report.retry_hint(HintLang::Chinese).expect("应当有提示");
-        assert!(
-            zh.contains("方括号"),
-            "中文提示要说明不要带方括号：{zh}"
-        );
+        assert!(zh.contains("方括号"), "中文提示要说明不要带方括号：{zh}");
     }
 }

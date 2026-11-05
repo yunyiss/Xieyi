@@ -27,8 +27,6 @@
 //! 互斥量句柄故意不关闭（`Drop` 里只做 focus 不管句柄），
 //! 由进程退出时由系统回收——这是 Windows 命名互斥量的标准用法。
 
-
-
 /// 互斥量名字。带 `Local\` 前缀表示只在当前登录会话内互斥：
 /// 同一台机器上的不同用户各开一个是合理的，不该互相拦。
 ///
@@ -318,9 +316,9 @@ mod unix_impl {
             /// 的跳板，必须 cast 成目标方法的真实签名。这里用到两种：
             /// - 类方法：`id (Class, SEL, int) -> id`
             /// - 实例方法：`BOOL (id, SEL, NSUInteger) -> BOOL`
-            type MsgSendClassId = unsafe extern "C" fn(*mut c_void, *mut c_void, i32) -> *mut c_void;
-            type MsgSendActivate =
-                unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> i8;
+            type MsgSendClassId =
+                unsafe extern "C" fn(*mut c_void, *mut c_void, i32) -> *mut c_void;
+            type MsgSendActivate = unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> i8;
 
             // SAFETY: 全部是 Foundation 的公开类与方法，参数类型与
             // Objective-C 声明一致。对象生命周期由 autorelease pool 之外的
@@ -331,9 +329,8 @@ mod unix_impl {
                     return Err("找不到 NSRunningApplication 类".into());
                 }
 
-                let sel_app = sel_registerName(
-                    b"runningApplicationWithProcessIdentifier: ".as_ptr(),
-                );
+                let sel_app =
+                    sel_registerName(b"runningApplicationWithProcessIdentifier: ".as_ptr());
                 let msg_class: MsgSendClassId = std::mem::transmute(objc_msgSend as *const ());
                 let app = msg_class(cls, sel_app, pid as i32);
                 if app.is_null() {
@@ -341,8 +338,7 @@ mod unix_impl {
                 }
 
                 let sel_activate = sel_registerName(b"activateWithOptions: ".as_ptr());
-                let msg_activate: MsgSendActivate =
-                    std::mem::transmute(objc_msgSend as *const ());
+                let msg_activate: MsgSendActivate = std::mem::transmute(objc_msgSend as *const ());
                 let ok = msg_activate(app, sel_activate, ACTIVATE_ALL_WINDOWS);
                 if ok == 0 {
                     return Err("activateWithOptions: 返回 NO".into());
@@ -359,7 +355,7 @@ mod unix_impl {
     /// 死模块。macOS 的聚焦走 [`macos::activate_app`]。
     #[cfg(target_os = "linux")]
     mod x11 {
-        use std::ffi::{c_char, c_int, c_ulong, c_void, CString};
+        use std::ffi::{CString, c_char, c_int, c_ulong, c_void};
 
         /// `XWindowAttributes` 只需要 layout 正确，我们只用它的 map_state。
         /// 完整结构体字段很多，这里按 Xlib 的顺序声明到需要的字段为止。
@@ -431,13 +427,8 @@ mod unix_impl {
             fn dlerror() -> *mut c_char;
         }
 
-        type SendEventFn = unsafe extern "C" fn(
-            *mut c_void,
-            c_ulong,
-            c_int,
-            CLong,
-            *mut c_void,
-        ) -> c_int;
+        type SendEventFn =
+            unsafe extern "C" fn(*mut c_void, c_ulong, c_int, CLong, *mut c_void) -> c_int;
         type InternAtomFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_int) -> c_ulong;
         type FlushFn = unsafe extern "C" fn(*mut c_void) -> c_int;
 
@@ -582,14 +573,16 @@ mod unix_impl {
             let mut children: *mut c_ulong = std::ptr::null_mut();
             let mut nchildren: u32 = 0;
 
-            if unsafe { (x_query_tree)(
-                dpy,
-                parent,
-                &mut root_ret,
-                &mut parent_ret,
-                &mut children,
-                &mut nchildren,
-            ) } == 0
+            if unsafe {
+                (x_query_tree)(
+                    dpy,
+                    parent,
+                    &mut root_ret,
+                    &mut parent_ret,
+                    &mut children,
+                    &mut nchildren,
+                )
+            } == 0
             {
                 return;
             }
@@ -604,20 +597,22 @@ mod unix_impl {
                 let mut bytes_after: c_ulong = 0;
                 let mut prop: *mut u8 = std::ptr::null_mut();
 
-                let status = unsafe { (x_get_property)(
-                    dpy,
-                    win,
-                    net_wm_pid,
-                    0,
-                    1,
-                    0,
-                    xa_cardinal,
-                    &mut actual_type,
-                    &mut actual_format,
-                    &mut nitems,
-                    &mut bytes_after,
-                    &mut prop,
-                ) };
+                let status = unsafe {
+                    (x_get_property)(
+                        dpy,
+                        win,
+                        net_wm_pid,
+                        0,
+                        1,
+                        0,
+                        xa_cardinal,
+                        &mut actual_type,
+                        &mut actual_format,
+                        &mut nitems,
+                        &mut bytes_after,
+                        &mut prop,
+                    )
+                };
 
                 let mut matched = false;
                 if status == 0 && nitems > 0 && !prop.is_null() {
@@ -644,16 +639,16 @@ mod unix_impl {
                 // 继续往下找（无论本层是否匹配）
                 unsafe {
                     collect_best_window(
-                    dpy,
-                    win,
-                    pid,
-                    net_wm_pid,
-                    xa_cardinal,
-                    x_query_tree,
-                    x_get_property,
-                    x_get_attrs,
-                    x_free,
-                    best,
+                        dpy,
+                        win,
+                        pid,
+                        net_wm_pid,
+                        xa_cardinal,
+                        x_query_tree,
+                        x_get_property,
+                        x_get_attrs,
+                        x_free,
+                        best,
                         best_area,
                         depth + 1,
                     );
@@ -698,17 +693,12 @@ mod unix_impl {
                 ) -> c_int;
                 type XGetWindowAttributes =
                     unsafe extern "C" fn(*mut c_void, c_ulong, *mut XWindowAttributes) -> c_int;
-                        type XMapRaised = unsafe extern "C" fn(*mut c_void, c_ulong) -> c_int;
+                type XMapRaised = unsafe extern "C" fn(*mut c_void, c_ulong) -> c_int;
                 type XSetInputFocus =
                     unsafe extern "C" fn(*mut c_void, c_ulong, c_int, c_ulong) -> c_int;
-                        type XFlush = unsafe extern "C" fn(*mut c_void) -> c_int;
-                type XSendEvent = unsafe extern "C" fn(
-                    *mut c_void,
-                    c_ulong,
-                    c_int,
-                    CLong,
-                    *mut c_void,
-                ) -> c_int;
+                type XFlush = unsafe extern "C" fn(*mut c_void) -> c_int;
+                type XSendEvent =
+                    unsafe extern "C" fn(*mut c_void, c_ulong, c_int, CLong, *mut c_void) -> c_int;
                 type XSync = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
                 type XFree = unsafe extern "C" fn(*mut c_void) -> c_int;
                 type XCloseDisplay = unsafe extern "C" fn(*mut c_void) -> c_int;
@@ -780,14 +770,7 @@ mod unix_impl {
                 // 正确做法是走 EWMH 的标准流程：向 root 窗口发一条
                 // `_NET_ACTIVE_WINDOW` 客户端消息，由 WM 负责取消最小化
                 // 并聚焦。这是唯一跨 WM 通用的方式。
-                send_activate_request(
-                    dpy,
-                    root_win,
-                    found,
-                    x_send_event,
-                    x_intern_atom,
-                    x_flush,
-                );
+                send_activate_request(dpy, root_win, found, x_send_event, x_intern_atom, x_flush);
 
                 // 兜底：有些 WM 不响应激活请求，直接 map 一次
                 x_map_raised(dpy, found);

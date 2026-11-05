@@ -139,12 +139,7 @@ mod win {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn CreateJobObjectW(attrs: *const u8, name: *const u16) -> isize;
-        fn SetInformationJobObject(
-            job: isize,
-            info_class: i32,
-            info: *const u8,
-            len: u32,
-        ) -> i32;
+        fn SetInformationJobObject(job: isize, info_class: i32, info: *const u8, len: u32) -> i32;
         fn AssignProcessToJobObject(job: isize, process: isize) -> i32;
         fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
         fn CloseHandle(handle: isize) -> i32;

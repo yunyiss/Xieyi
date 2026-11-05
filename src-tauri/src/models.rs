@@ -29,7 +29,7 @@ pub fn scan(app: &AppHandle) -> Vec<ModelFile> {
     let _ = paths::ensure(&dir);
     let mut out = Vec::new();
     collect(&dir, 0, &mut out);
-    out.sort_by(|a, b| a.id.to_lowercase().cmp(&b.id.to_lowercase()));
+    out.sort_by_key(|a| a.id.to_lowercase());
     out
 }
 
@@ -79,7 +79,11 @@ fn stem(path: &Path) -> String {
 /// 生成路由模式用的 preset。
 /// 上下文按模型取用户配置（默认 4096），避免默认 262144 吃爆显存。
 /// `gpu_layers` 为 [`AUTO_LAYERS`] 时按模型体积和当前空闲显存自动估算。
-pub fn write_preset(app: &AppHandle, models: &[ModelFile], gpu_layers: u64) -> Result<PathBuf, String> {
+pub fn write_preset(
+    app: &AppHandle,
+    models: &[ModelFile],
+    gpu_layers: u64,
+) -> Result<PathBuf, String> {
     let root = paths::runtime_root(app)?;
     paths::ensure(&root)?;
     let path = root.join("presets.ini");
@@ -450,7 +454,11 @@ fn template_references(template: &str, name: &str) -> bool {
 ///
 /// 返回的 map 里键是**传入的 suffix 本身**（不是 GGUF 里的完整键名），
 /// 值统一用字符串表示，数字键由调用方自己解析。
-fn read_meta_many(path: &Path, string_suffixes: &[&str], numeric_suffixes: &[&str]) -> HashMap<String, String> {
+fn read_meta_many(
+    path: &Path,
+    string_suffixes: &[&str],
+    numeric_suffixes: &[&str],
+) -> HashMap<String, String> {
     let mut out = HashMap::new();
     let Ok(file) = std::fs::File::open(path) else {
         return out;
@@ -486,13 +494,13 @@ fn read_meta_many(path: &Path, string_suffixes: &[&str], numeric_suffixes: &[&st
         };
 
         // 字符串键：直接把值读出来
-        if let Some(suffix) = want_string(&key) {
-            if vtype == 8 {
-                if let Some(value) = read_string(&mut reader) {
-                    out.entry(suffix.to_string()).or_insert(value);
-                }
-                continue;
+        if let Some(suffix) = want_string(&key)
+            && vtype == 8
+        {
+            if let Some(value) = read_string(&mut reader) {
+                out.entry(suffix.to_string()).or_insert(value);
             }
+            continue;
         }
 
         // 数字键：读成字符串存（调用方自己 parse）
@@ -643,7 +651,7 @@ fn skip_value<R: Read>(r: &mut R, vtype: u32, depth: u8) -> Option<()> {
             let mut b = [0u8; 2];
             r.read_exact(&mut b).ok()?;
         }
-        4 | 5 | 6 => {
+        4..=6 => {
             let mut b = [0u8; 4];
             r.read_exact(&mut b).ok()?;
         }
@@ -662,7 +670,7 @@ fn skip_value<R: Read>(r: &mut R, vtype: u32, depth: u8) -> Option<()> {
                 skip_value(r, elem_type, depth + 1)?;
             }
         }
-        10 | 11 | 12 => {
+        10..=12 => {
             let mut b = [0u8; 8];
             r.read_exact(&mut b).ok()?;
         }
@@ -743,14 +751,20 @@ mod tests {
             "{%- if enable_thinking is defined %}",
             "enable_thinking"
         ));
-        assert!(template_references("{{ enable_thinking }}", "enable_thinking"));
+        assert!(template_references(
+            "{{ enable_thinking }}",
+            "enable_thinking"
+        ));
         // 注释里提到不算支持
         assert!(!template_references(
             "{# note: enable_thinking is supported #}",
             "enable_thinking"
         ));
         // 标签已闭合，变量在外面出现不算
-        assert!(!template_references("{%- if x %} enable_thinking", "enable_thinking"));
+        assert!(!template_references(
+            "{%- if x %} enable_thinking",
+            "enable_thinking"
+        ));
     }
 
     #[test]
@@ -769,8 +783,14 @@ mod tests {
     #[test]
     fn unknown_models_fall_back_to_generic_chat() {
         for (name, template) in [
-            ("Qwen3.5-9B", Some("<|im_start|>{{ message.role }}\n{{ message.content }}<|im_end|>")),
-            ("llama-3.1-8b", Some("{{ bos_token }}{% for m in messages %}...")),
+            (
+                "Qwen3.5-9B",
+                Some("<|im_start|>{{ message.role }}\n{{ message.content }}<|im_end|>"),
+            ),
+            (
+                "llama-3.1-8b",
+                Some("{{ bos_token }}{% for m in messages %}..."),
+            ),
             ("gemma-3-4b", None),
             ("", None),
         ] {
@@ -819,7 +839,10 @@ mod tests {
 
     #[test]
     fn index_translate_uses_chinese_prompt_and_can_chat() {
-        let p = profile_of("Index-Translate-9B", Some("<|im_start|>{{ message.content }}"));
+        let p = profile_of(
+            "Index-Translate-9B",
+            Some("<|im_start|>{{ message.content }}"),
+        );
         assert_eq!(p.style, PromptStyle::ChineseText);
         assert_eq!(p.family, "Index-Translate");
         // 实测能对话（「此功能颇为实用，不妨一试。」），只是要用中文约束格式
@@ -863,7 +886,10 @@ mod tests {
     #[test]
     fn family_detection_survives_useless_metadata_names() {
         // 文件名 + 无意义的元数据名拼在一起，仍要识别出家族
-        let p = profile_of("Hy-MT2-1.8B-Q8_0 Global_Step_300", Some("<|startoftext|>{{ x }}"));
+        let p = profile_of(
+            "Hy-MT2-1.8B-Q8_0 Global_Step_300",
+            Some("<|startoftext|>{{ x }}"),
+        );
         assert_eq!(p.family, "Hy-MT2");
 
         let p = profile_of("Index-Translate-9B 9b", Some("<|im_start|>{{ x }}"));
@@ -904,7 +930,8 @@ mod tests {
     }
 
     #[test]
-    fn prompt_style_wire_names_are_stable() {        // 线格式名一旦改了，前端与日志都得跟着改，所以钉住
+    fn prompt_style_wire_names_are_stable() {
+        // 线格式名一旦改了，前端与日志都得跟着改，所以钉住
         assert_eq!(PromptStyle::EnglishSystem.as_str(), "english-system");
         assert_eq!(PromptStyle::ChineseText.as_str(), "chinese-text");
         assert_eq!(PromptStyle::TemplateKwargs.as_str(), "template-kwargs");

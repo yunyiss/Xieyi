@@ -33,9 +33,7 @@ pub fn split_segments(input: &str, max_chars: usize) -> Vec<Segment> {
         let mut buffer = String::new();
 
         for sentence in sentences {
-            if !buffer.is_empty()
-                && buffer.chars().count() + sentence.chars().count() > max_chars
-            {
+            if !buffer.is_empty() && buffer.chars().count() + sentence.chars().count() > max_chars {
                 out.push(Segment {
                     text: std::mem::take(&mut buffer),
                     paragraph: false,
@@ -78,7 +76,10 @@ fn split_sentences(text: &str) -> Vec<String> {
         if ends {
             // 吸收紧跟的引用/括号，避免把标点留在下一句开头
             while let Some(&n) = chars.peek() {
-                if matches!(n, '”' | '’' | '"' | '\'' | '」' | '』' | '）' | ')' | '】' | ']') {
+                if matches!(
+                    n,
+                    '”' | '’' | '"' | '\'' | '」' | '』' | '）' | ')' | '】' | ']'
+                ) {
                     current.push(n);
                     chars.next();
                 } else {
@@ -147,9 +148,7 @@ mod tests {
     fn english_sentences_split_on_period() {
         let segments = split_segments("One. Two. Three.", 8);
         assert!(segments.len() >= 2);
-        assert!(segments
-            .iter()
-            .all(|s| s.text.chars().count() <= 8));
+        assert!(segments.iter().all(|s| s.text.chars().count() <= 8));
     }
 
     #[test]

@@ -62,7 +62,10 @@ impl Thinking {
 
     /// 是否让模型思考。
     pub fn enabled(self) -> bool {
-        matches!(self, Thinking::Low | Thinking::Medium | Thinking::High | Thinking::Max)
+        matches!(
+            self,
+            Thinking::Low | Thinking::Medium | Thinking::High | Thinking::Max
+        )
     }
 
     /// 思考预算（token）。`None` 表示不设置，交给服务端或模板。
@@ -93,6 +96,7 @@ impl Thinking {
     /// - 有限预算的档位：正文基准 + 该档思考预算
     /// - **不限档：直接把上下文的可用部分全给它**，否则思考必然把正文挤空
     /// - 关闭 / 默认：只留正文基准
+    ///
     /// 最后统一夹到 `ctx / 2`，给提问内容留出另一半空间。
     pub fn output_budget(self, ctx: u64) -> u32 {
         let room = (ctx / 2).max(512);
@@ -156,11 +160,7 @@ pub fn ctx_of(app: &AppHandle, model: &str) -> u64 {
 ///
 /// `None` 表示恢复自动识别。单独提供这个函数是为了避免调用方
 /// 为了改一个布尔值而重新拼一份完整的 ModelParams（容易漏字段）。
-pub fn set_chat_override(
-    app: &AppHandle,
-    model: &str,
-    value: Option<bool>,
-) -> Result<(), String> {
+pub fn set_chat_override(app: &AppHandle, model: &str, value: Option<bool>) -> Result<(), String> {
     let mut params = get(app, model);
     params.chat_override = value;
     set(app, model, &params)?;
@@ -292,14 +292,14 @@ mod tests {
             chat_override: Some(true),
             ..Default::default()
         };
-        assert_eq!(forced_on.chat_override.unwrap_or(auto_false), true);
+        assert!(forced_on.chat_override.unwrap_or(auto_false));
 
         // 手动设为不可用：即使自动判为可用，也要挡掉
         let forced_off = ModelParams {
             chat_override: Some(false),
             ..Default::default()
         };
-        assert_eq!(forced_off.chat_override.unwrap_or(auto_true), false);
+        assert!(!forced_off.chat_override.unwrap_or(auto_true));
     }
 
     /// 覆盖值不该影响上下文夹取这类既有行为。
@@ -315,9 +315,15 @@ mod tests {
     }
 
     #[test]
-    fn enabled_only_for_thinking_tiers() {        assert!(!Thinking::Off.enabled());
+    fn enabled_only_for_thinking_tiers() {
+        assert!(!Thinking::Off.enabled());
         assert!(!Thinking::Default.enabled());
-        for mode in [Thinking::Low, Thinking::Medium, Thinking::High, Thinking::Max] {
+        for mode in [
+            Thinking::Low,
+            Thinking::Medium,
+            Thinking::High,
+            Thinking::Max,
+        ] {
             assert!(mode.enabled(), "{mode:?} 应被视为开启思考");
         }
     }

@@ -35,7 +35,6 @@ Output only the translation, without explanations, notes, or quotation marks."
         )
     };
 
-
     if !glossary.is_empty() {
         prompt.push_str("\nUse these term mappings when they appear:\n");
         for entry in glossary {
@@ -194,7 +193,9 @@ pub fn build_request(
             // 自动检测时不写源语言：写"原文"这种占位词对它没帮助，
             // 直接说"把下面的文本翻译为 X"更明确。
             let mut user = if source == "auto" {
-                format!("请将以下文本翻译为{tgt}，直接输出翻译结果，不要进行任何解释。\n\n【源文】\n{text}")
+                format!(
+                    "请将以下文本翻译为{tgt}，直接输出翻译结果，不要进行任何解释。\n\n【源文】\n{text}"
+                )
             } else {
                 let src = language_name_zh(source).unwrap_or(source);
                 format!(
@@ -366,7 +367,10 @@ mod tests {
             "不该出现裸语种代码: {prompt}"
         );
         // 通用风格不追加任何额外要求
-        assert!(!prompt.contains("This is"), "通用风格不该带附加要求: {prompt}");
+        assert!(
+            !prompt.contains("This is"),
+            "通用风格不该带附加要求: {prompt}"
+        );
     }
 
     /// 自动检测时不提源语言——写 `the source language` 或 `auto-detect`
@@ -390,7 +394,10 @@ mod tests {
         let simplified = system_prompt("en", "zh", &[]);
         let traditional = system_prompt("en", "zh-tw", &[]);
         assert!(simplified.contains("Chinese (Simplified)"), "{simplified}");
-        assert!(traditional.contains("Chinese (Traditional)"), "{traditional}");
+        assert!(
+            traditional.contains("Chinese (Traditional)"),
+            "{traditional}"
+        );
         assert_ne!(simplified, traditional);
     }
 
@@ -427,14 +434,22 @@ mod tests {
             "zh",
             &glossary(),
             "hello",
-            report.retry_hint(crate::quality::HintLang::English).as_deref(),
+            report
+                .retry_hint(crate::quality::HintLang::English)
+                .as_deref(),
         );
 
         let base_sys = base.messages[0]["content"].as_str().unwrap();
         let hinted_sys = hinted.messages[0]["content"].as_str().unwrap();
-        assert!(hinted_sys.starts_with(base_sys), "重试提示应建立在基础提示之上");
+        assert!(
+            hinted_sys.starts_with(base_sys),
+            "重试提示应建立在基础提示之上"
+        );
         assert!(hinted_sys.contains("Your previous attempt had problems."));
-        assert!(hinted_sys.contains("apple => 苹果"), "应带上具体术语：{hinted_sys}");
+        assert!(
+            hinted_sys.contains("apple => 苹果"),
+            "应带上具体术语：{hinted_sys}"
+        );
     }
 
     // ---- 按调用机制生成请求 ----
@@ -477,7 +492,10 @@ mod tests {
         assert_eq!(req.messages[0]["role"], "user");
 
         let content = req.messages[0]["content"].as_str().unwrap();
-        assert!(content.contains("翻译为简体中文"), "应指定目标语言: {content}");
+        assert!(
+            content.contains("翻译为简体中文"),
+            "应指定目标语言: {content}"
+        );
         assert!(content.contains("英语"), "应指定源语言: {content}");
         assert!(content.contains("hello"), "应带上原文");
         // 术语按它的【硬性要求】格式给出
@@ -525,14 +543,7 @@ mod tests {
 
     #[test]
     fn delimiter_variant_embeds_language_markers() {
-        let req = build_request(
-            PromptStyle::Delimiter,
-            "en",
-            "zh",
-            &[],
-            "hello world",
-            None,
-        );
+        let req = build_request(PromptStyle::Delimiter, "en", "zh", &[], "hello world", None);
         let content = req.messages[0]["content"].as_str().unwrap();
         assert!(content.starts_with("<<<source>>>en<<<target>>>zh<<<text>>>"));
         assert!(content.ends_with("hello world"));
@@ -541,14 +552,7 @@ mod tests {
     /// Riva-Translate 的模板拿 system 内容去查语言对表，格式必须严格是 en-zh。
     #[test]
     fn language_pair_puts_code_in_system() {
-        let req = build_request(
-            PromptStyle::LanguagePair,
-            "en",
-            "zh",
-            &[],
-            "hello",
-            None,
-        );
+        let req = build_request(PromptStyle::LanguagePair, "en", "zh", &[], "hello", None);
         assert_eq!(req.messages[0]["role"], "system");
         assert_eq!(req.messages[0]["content"], "en-zh");
         assert_eq!(req.messages[1]["content"], "hello");
@@ -557,14 +561,7 @@ mod tests {
     /// 官方中文模板必须逐字贴近原文：Hy-MT2 就是按这个格式训练的。
     #[test]
     fn chinese_official_matches_the_trained_template() {
-        let req = build_request(
-            PromptStyle::ChineseOfficial,
-            "en",
-            "zh",
-            &[],
-            "hello",
-            None,
-        );
+        let req = build_request(PromptStyle::ChineseOfficial, "en", "zh", &[], "hello", None);
 
         // 单条 user 消息，提示词和原文在同一个 content 里（与官方示例一致）
         assert_eq!(req.messages.as_array().unwrap().len(), 1);
@@ -576,24 +573,27 @@ mod tests {
             content.starts_with("把下面的"),
             "必须是官方句式开头: {content}"
         );
-        assert!(content.contains("不要额外解释"), "官方模板的收尾句: {content}");
-        assert!(content.contains("简体中文"), "目标语言要用中文名: {content}");
+        assert!(
+            content.contains("不要额外解释"),
+            "官方模板的收尾句: {content}"
+        );
+        assert!(
+            content.contains("简体中文"),
+            "目标语言要用中文名: {content}"
+        );
         assert!(content.ends_with("hello"), "原文在最后: {content}");
         // 通用风格不加任何附注
-        assert!(!content.contains("术语"), "无术语表时不该出现附注: {content}");
+        assert!(
+            !content.contains("术语"),
+            "无术语表时不该出现附注: {content}"
+        );
     }
 
     /// 繁体目标必须说清楚，这正是英文提示做不到的地方。
     #[test]
     fn chinese_official_distinguishes_traditional() {
-        let simplified = build_request(
-            PromptStyle::ChineseOfficial,
-            "en",
-            "zh",
-            &[],
-            "hello",
-            None,
-        );
+        let simplified =
+            build_request(PromptStyle::ChineseOfficial, "en", "zh", &[], "hello", None);
         let traditional = build_request(
             PromptStyle::ChineseOfficial,
             "en",
@@ -645,7 +645,10 @@ mod tests {
         // 术语与纠正附注在原文之后（风格已移除）
         let after = content.split("hello").nth(1).unwrap_or("");
         assert!(after.contains("apple→苹果"), "术语附注: {content}");
-        assert!(after.contains("keep every list marker"), "纠正附注: {content}");
+        assert!(
+            after.contains("keep every list marker"),
+            "纠正附注: {content}"
+        );
     }
 
     // ---- TranslateGemma（实测驱动）----
@@ -670,7 +673,10 @@ mod tests {
         );
 
         let content = req.messages[0]["content"].as_str().unwrap();
-        assert_eq!(content, "The server is down.", "不能有任何附加内容: {content}");
+        assert_eq!(
+            content, "The server is down.",
+            "不能有任何附加内容: {content}"
+        );
         assert_eq!(req.messages.as_array().unwrap().len(), 1, "不能发 system");
     }
 
@@ -699,14 +705,10 @@ mod tests {
     /// 简体用 zh-Hans，英文用 en-GB。
     #[test]
     fn template_kwargs_language_codes() {
-        let simp = build_request(
-            PromptStyle::TemplateKwargs, "en", "zh", &[], "x", None,
-        );
+        let simp = build_request(PromptStyle::TemplateKwargs, "en", "zh", &[], "x", None);
         assert_eq!(simp.template_kwargs.unwrap()["target_lang_code"], "zh-Hans");
 
-        let en = build_request(
-            PromptStyle::TemplateKwargs, "zh", "en", &[], "x", None,
-        );
+        let en = build_request(PromptStyle::TemplateKwargs, "zh", "en", &[], "x", None);
         let kw = en.template_kwargs.unwrap();
         assert_eq!(kw["source_lang_code"], "zh-Hans");
         assert_eq!(

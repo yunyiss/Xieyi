@@ -19,9 +19,7 @@ use tauri::{AppHandle, Manager};
 /// ```
 /// 卸载或重置只需删掉这个根目录。
 pub fn app_data(app: &AppHandle) -> Result<PathBuf, String> {
-    app.path()
-        .app_local_data_dir()
-        .map_err(|e| e.to_string())
+    app.path().app_local_data_dir().map_err(|e| e.to_string())
 }
 
 /// 应用标识符。**必须与 `tauri.conf.json` 的 `identifier` 一致**。
@@ -86,7 +84,6 @@ pub fn data_root_early() -> Option<PathBuf> {
     }
 }
 
-
 pub fn runtime_root(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(app_data(app)?.join("runtime"))
 }
@@ -138,10 +135,10 @@ pub fn models_dir(app: &AppHandle) -> Result<PathBuf, String> {
     }
 
     // 程序目录优先
-    if let Some(dir) = exe_dir().map(|d| d.join("models")) {
-        if dir.is_dir() || dir_is_writable(dir.parent().unwrap_or(&dir)) {
-            return Ok(dir);
-        }
+    if let Some(dir) = exe_dir().map(|d| d.join("models"))
+        && (dir.is_dir() || dir_is_writable(dir.parent().unwrap_or(&dir)))
+    {
+        return Ok(dir);
     }
 
     // 回退：程序目录不可写时用文档目录
@@ -261,9 +258,7 @@ mod tests {
         let conf: serde_json::Value =
             serde_json::from_str(&raw).expect("tauri.conf.json 不是合法 JSON");
 
-        let configured = conf["identifier"]
-            .as_str()
-            .expect("配置里没有 identifier");
+        let configured = conf["identifier"].as_str().expect("配置里没有 identifier");
 
         assert_eq!(
             configured, IDENTIFIER,
