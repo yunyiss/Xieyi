@@ -32,3 +32,7 @@ docs/
 *.njsproj
 *.sln
 *.sw?
+
+# cargo vendor 的 source 替换配置：只在离线构建时存在，
+# 指向本地 vendor/ 目录（该目录本身也已忽略）
+src-tauri/.cargo/

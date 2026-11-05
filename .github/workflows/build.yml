@@ -1,0 +1,131 @@
+name: build
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # 减少 macOS/Windows runner 上的 LTO 内存峰值
+  CARGO_PROFILE_RELEASE_LTO: thin
+
+jobs:
+  # ── 三平台测试 ─────────────────────────────────────────────────────
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: Windows
+          - os: ubuntu-22.04
+            name: Linux
+          - os: macos-latest
+            name: macOS
+
+    name: test (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # Linux 需要 Tauri 的系统依赖（webkit2gtk 等）
+      - name: Install Linux deps
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libxdo-dev \
+            libssl-dev
+
+      - run: npm ci
+
+      - name: TypeScript
+        run: npx tsc --noEmit
+
+      - name: Frontend tests
+        run: npm test
+
+      # 格式门禁：项目首次全量格式化后（commit 8329ee8）加进来，
+      # 防止后续提交把未格式化的代码带回来。
+      - name: rustfmt
+        working-directory: src-tauri
+        run: cargo fmt --check
+
+      # clippy 门禁：-D warnings 让警告变成错误。
+      # 加这条之前项目积累了 27 条警告，噪音里看不出真问题
+      # （其中 `if_same_then_else` 那条就是真实的死代码）。
+      - name: clippy
+        working-directory: src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Rust tests
+        working-directory: src-tauri
+        run: cargo test
+
+  # ── macOS 打包（只在手动触发或打 tag 时） ──────────────────────────
+  #
+  # 这个 job 存在的意义：macOS 代码路径**必须在真机编译一次**。
+  # 之前整个平台是「未测」状态，连能不能编译都没人知道。
+  # 现在至少保证「编译通过 + 产物能出来」，运行行为仍需人工验证。
+  bundle-macos:
+    name: bundle (macOS)
+    runs-on: macos-latest
+    needs: test
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: npm ci
+
+      - name: Build app bundle
+        run: npx tauri build --target aarch64-apple-darwin --no-bundle
+
+      # 硬闸门：exe 里必须嵌了前端资源，否则运行时会白屏。
+      # 这条在 Windows 上踩过六次（cargo build 不嵌 dist），
+      # 在 macOS 上同样成立。
+      - name: Verify frontend is embedded
+        run: |
+          APP=$(find src-tauri/target/aarch64-apple-darwin/release -maxdepth 1 -name 'xieyi' -type f)
+          echo "binary: $APP"
+          COUNT=$(strings "$APP" | grep -cE 'index-[A-Za-z0-9_-]+\.js' || true)
+          echo "embedded asset refs: $COUNT"
+          if [ "$COUNT" -lt 1 ]; then
+            echo "::error::前端资源没有嵌进二进制（应为 npm run build 的产物）"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xieyi-macos-arm64
+          path: src-tauri/target/aarch64-apple-darwin/release/xieyi
+          if-no-files-found: error
