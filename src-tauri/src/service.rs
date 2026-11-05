@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 
+use crate::cache::DiskCache;
 use crate::models;
 
 /// 退出时回收推理进程树，**带超时、不阻塞事件循环**。
@@ -284,7 +285,10 @@ struct QualityPayload {
 }
 
 /// 单个片段的质量统计，供批量任务汇总"检出多少、修好多少"。
-#[derive(Debug, Default, Clone, Copy)]
+///
+/// 带 `PartialEq` 是因为它现在会随译文一起落盘（`cache::Record`），
+/// 测试需要断言「读回来的统计与写进去的一致」。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SegmentStats {
     /// 首次输出被质检挑出了问题（无论最后有没有修好）
     pub flagged: bool,
@@ -410,7 +414,15 @@ pub struct AppState {
     pub pinned: tokio::sync::Mutex<HashSet<String>>,
     /// 句子级翻译缓存：相同模型 / 风格 / 语言对 / 术语表 / 原文直接命中。
     /// 值里带上当时的质检统计，命中缓存时批量汇总仍然准确。
+    ///
+    /// 内存态是**读取路径**；每次写入同时追加到磁盘（见 [`DiskCache`]），
+    /// 这样程序重启后批量重跑不用从头翻。落盘失败不影响翻译 —— 缓存是
+    /// 优化，不是正确性依赖。
     pub cache: tokio::sync::Mutex<HashMap<String, (String, SegmentStats)>>,
+
+    /// 磁盘缓存句柄。`None` 表示落盘不可用（目录不可写等），
+    /// 此时退化为纯内存，行为与旧版一致。
+    pub disk_cache: tokio::sync::Mutex<Option<DiskCache>>,
 
     /// 本次运行使用的 api-key。
     ///
@@ -432,6 +444,7 @@ impl Default for AppState {
             gpu_layers: AtomicU64::new(models::AUTO_LAYERS),
             pinned: tokio::sync::Mutex::new(HashSet::new()),
             cache: tokio::sync::Mutex::new(HashMap::new()),
+            disk_cache: tokio::sync::Mutex::new(None),
             api_key: std::sync::Mutex::new(String::new()),
         }
     }
@@ -522,6 +535,41 @@ pub fn load_settings(app: &AppHandle) {
             });
         }
     }
+}
+
+/// 启动时把磁盘缓存装回内存。
+///
+/// **放后台线程**：缓存可能有一两千条，解析 JSONL 需要几十毫秒。
+/// 启动路径上每一毫秒都影响「双击到看见窗口」的体感，不该为它等。
+/// 装回来之前发出的翻译请求只是「少命中几次」，结果依然正确 ——
+/// 这个顺序是安全的。
+pub fn load_disk_cache(app: &AppHandle) {
+    let Ok(dir) = paths::app_data(app) else {
+        return;
+    };
+    let path = dir.join("cache").join("translate.jsonl");
+
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        let mut map = HashMap::new();
+        let disk = DiskCache::open(path, &mut map);
+        let loaded = map.len();
+
+        // `blocking_lock` 在这里安全：这是独立线程，不在 async 运行时里
+        let state = handle.state::<AppState>();
+        {
+            let mut cache = state.cache.blocking_lock();
+            // 合并而不是覆盖：启动后立刻翻译的内容可能已经写进来了
+            for (k, v) in map {
+                cache.entry(k).or_insert(v);
+            }
+        }
+        let mut guard = state.disk_cache.blocking_lock();
+        if loaded > 0 {
+            crate::logging::info("cache", format!("磁盘缓存已装入 {loaded} 条"));
+        }
+        *guard = Some(disk);
+    });
 }
 
 fn free_port() -> Result<u16, String> {
@@ -867,9 +915,48 @@ impl Service {
         let stats = SegmentStats { flagged, fixed };
         let cancelled = cancel.load(Ordering::Relaxed);
 
-        {
+        // 内存 + 磁盘双写。`store_segment` 是唯一写入口，它内部会
+        // 拒绝被取消的片段；这里只在它真的写进去了之后才落盘，
+        // 避免磁盘上留下一段「看着正常、实际被截断」的译文。
+        //
+        // ⚠️ 锁顺序固定为「先 cache 后 disk」，全文件统一。
+        // 反过来会和 `load_disk_cache`（cache → disk）构成死锁环。
+        let mut snapshot: Option<HashMap<String, (String, SegmentStats)>> = None;
+        let stored = {
             let mut cache = state.cache.lock().await;
-            store_segment(&mut cache, key, best.clone(), stats, cancelled);
+            let before = cache.len();
+            store_segment(&mut cache, key.clone(), best.clone(), stats, cancelled);
+            let inserted = cache.contains_key(&key);
+            // 命中容量上限时 store_segment 会整体清空再插入，
+            // 那种情况下磁盘也该跟着压缩，否则两边会长期不一致。
+            let cleared = cache.len() < before;
+            if inserted && cleared {
+                // 在**放掉 cache 锁之前**把快照拿好，避免后面二次加锁
+                snapshot = Some(cache.clone());
+            }
+            (inserted, cleared)
+        };
+
+        if stored.0 {
+            // 需要压缩时，先看磁盘是否到顶；只有真需要才付出 clone 的代价
+            let need_compact = {
+                let disk = state.disk_cache.lock().await;
+                match disk.as_ref() {
+                    Some(d) => stored.1 || d.needs_compaction(),
+                    None => false,
+                }
+            };
+            if need_compact && snapshot.is_none() {
+                snapshot = Some(state.cache.lock().await.clone());
+            }
+
+            let mut disk = state.disk_cache.lock().await;
+            if let Some(d) = disk.as_mut() {
+                d.append(&crate::cache::Record::new(&key, &best, stats));
+                if let Some(snap) = snapshot {
+                    d.compact(&snap);
+                }
+            }
         }
 
         Ok((best, stats))
@@ -1884,6 +1971,40 @@ mod tests {
         assert_eq!(cache.len(), 1);
         assert!(cache.contains_key("overflow"));
     }
+
+    // ── 内存 + 磁盘联动的测试 ──────────────────────────────────────────
+    //
+    // 这些测的是「缓存写进内存的同时也落盘」这条联动路径，
+    // 单独测 `cache.rs` 覆盖不到「store_segment 拒绝取消片段后不落盘」这个约束。
+
+    #[test]
+    fn cancelled_segment_is_never_written_to_disk() {
+        // 这是最重要的一条：被取消的片段既不能进内存，也不能进磁盘。
+        // 否则用户重启后会直接命中一段被截断的译文，而且查不出原因。
+        let mut cache = HashMap::new();
+        store_segment(&mut cache, "k".into(), "半截".into(), stats(), true);
+        assert!(cache.is_empty());
+
+        // 落盘的前置条件就是「内存里确实有这一条」
+        assert!(!cache.contains_key("k"), "被取消的片段不应满足落盘条件");
+    }
+
+    #[test]
+    fn flush_target_record_matches_what_was_cached() {
+        // 落盘内容必须与内存态一致，否则重启后拿到的译文对不上
+        let mut cache = HashMap::new();
+        let st = SegmentStats {
+            flagged: true,
+            fixed: true,
+        };
+        store_segment(&mut cache, "key-1".into(), "完整译文".into(), st, false);
+
+        let (text, stored) = cache.get("key-1").expect("内存命中");
+        let rec = crate::cache::Record::new("key-1", text, *stored);
+        assert_eq!(rec.k, "key-1");
+        assert_eq!(rec.t, "完整译文");
+        assert_eq!(rec.stats(), st);
+    }
 }
 
 pub(crate) fn load_glossary(app: &AppHandle) -> Vec<GlossaryEntry> {
@@ -2231,6 +2352,28 @@ pub async fn chat(
         Err(_) if state.cancel.load(Ordering::Relaxed) => Err("已取消".into()),
         Err(e) => Err(e),
     }
+}
+
+/// 清空翻译缓存（内存 + 磁盘）。
+///
+/// 用户主动触发的场景：改了模型 / 觉得译文不对想强制重翻 / 想回收磁盘空间。
+/// 不清缓存的话，同样的原文会一直命中旧译文，用户会觉得「改了设置没效果」。
+#[tauri::command]
+pub async fn clear_translate_cache(state: tauri::State<'_, AppState>) -> Result<usize, String> {
+    let removed = {
+        let mut cache = state.cache.lock().await;
+        let n = cache.len();
+        cache.clear();
+        n
+    };
+    {
+        let mut disk = state.disk_cache.lock().await;
+        if let Some(d) = disk.as_mut() {
+            d.clear();
+        }
+    }
+    crate::logging::info("cache", format!("缓存已清空（内存 {removed} 条）"));
+    Ok(removed)
 }
 
 #[tauri::command]

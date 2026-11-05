@@ -1,4 +1,5 @@
 mod batch;
+mod cache;
 mod hardware;
 mod job_object;
 mod logging;
@@ -319,6 +320,9 @@ pub fn run() {
             }
 
             service::load_settings(app.handle());
+            // 磁盘缓存放后台线程装回：解析 JSONL 要几十毫秒，
+            // 不该拖慢「双击到看见窗口」。装回来之前翻译只是少命中几次。
+            service::load_disk_cache(app.handle());
             service::spawn_ttl_watcher(app.handle().clone());
             Ok(())
         })
@@ -348,6 +352,7 @@ pub fn run() {
             service::compact_history,
             service::abort,
             service::set_ttl,
+            service::clear_translate_cache,
             service::set_gpu_layers,
             service::set_pinned,
             service::get_settings,
