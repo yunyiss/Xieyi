@@ -1,10 +1,13 @@
 import { useCallback, useEffect, useState } from "react";
 import {
+  clearTranslateCache,
   getAppInfo,
+  getCacheStatus,
   getRuntimeStatus,
   openDataSubdir,
   openEngineDir,
   type AppInfo,
+  type CacheStatus,
   type RuntimeStatus,
 } from "../lib/ipc";
 
@@ -122,7 +125,9 @@ export function StorageInfo({ refreshToken = 0 }: { refreshToken?: number }) {
           <Sub label="配置" name="config.json" />
           <Sub label="会话" name={"sessions\\"} />
           <Sub label="日志" name={"logs\\"} />
-          <Sub label="缓存" name={"EBWebView\\"} />
+          <Sub label="译文缓存" name={"cache\\"} />
+          {/* 这条是 WebView2 自己的，与译文缓存无关，早先笼统叫「缓存」容易混 */}
+          <Sub label="界面缓存" name={"EBWebView\\"} />
         </div>
 
         {/* 引擎：显示真正在运行的那个可执行文件，而不是存放目录 */}
@@ -161,6 +166,135 @@ export function StorageInfo({ refreshToken = 0 }: { refreshToken?: number }) {
         >
           清除数据目录可恢复默认设置；模型目录由用户指定，不受影响。
         </p>
+      </div>
+
+      <TranslateCache refreshToken={refreshToken} />
+    </div>
+  );
+}
+
+/** 字节数转成人看的单位。缓存文件通常几百 KB，只在异常大时才到 MB。 */
+function formatBytes(n: number): string {
+  if (n <= 0) return "0 B";
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+/**
+ * 「批量翻译缓存」区块：显示条数与占用，并提供清空。
+ *
+ * 为什么叫「批量」：**只有批量会落盘**。
+ * 翻译页的临时小翻译只进内存，关掉程序就没了——
+ * 那是有意的：用户用它做一次性小翻译，不该在磁盘上攒垃圾。
+ *
+ * 为什么值得暴露给用户：批量落盘后有一个新的失败模式——
+ * 改了模型或觉得译文不对，但同样的原文会一直命中旧译文，
+ * 用户会觉得「改了设置没效果」，而且从界面上看不出原因。
+ * 给一个条数 + 一个清空按钮，这个问题就有了自助解法。
+ *
+ * 落盘不可用时（`persistent = false`）要明确说出来，否则用户
+ * 以为「翻过的下次还在」，结果重启后从头再来。
+ */
+function TranslateCache({ refreshToken = 0 }: { refreshToken?: number }) {
+  const [status, setStatus] = useState<CacheStatus | null>(null);
+  const [clearing, setClearing] = useState(false);
+  const [cleared, setCleared] = useState<number | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      setStatus(await getCacheStatus());
+      setError(null);
+    } catch (e) {
+      // 后端还没起来时拿不到，不阻塞其它设置项
+      setError(String(e));
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh, refreshToken]);
+
+  const onClear = async () => {
+    setClearing(true);
+    setError(null);
+    try {
+      const removed = await clearTranslateCache();
+      setCleared(removed);
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setClearing(false);
+    }
+  };
+
+  const entries = status?.entries ?? 0;
+  const disabled = clearing || entries === 0;
+
+  return (
+    <div className="mt-3">
+      <div className="mb-1 flex items-baseline gap-2">
+        <span className="section-title">批量翻译缓存</span>
+        <span className="text-[10px]" style={{ color: "var(--text-muted)" }}>
+          批量翻过的段落重跑时直接复用；翻译页的临时译文不入此
+        </span>
+      </div>
+
+      <div
+        className="rounded-[10px] border p-2.5 text-[11px]"
+        style={{
+          background: "var(--surface-muted)",
+          borderColor: "var(--border)",
+        }}
+      >
+        <div className="flex items-center gap-2">
+          <span style={{ color: "var(--text-muted)" }}>条数</span>
+          <span style={{ ...mono, color: "var(--text)" }}>
+            {status ? entries : "—"}
+          </span>
+          <span className="ml-2" style={{ color: "var(--text-muted)" }}>
+            占用
+          </span>
+          <span style={{ ...mono, color: "var(--text)" }}>
+            {status ? formatBytes(status.bytes) : "—"}
+          </span>
+          <button
+            className={`${btnClass} ml-auto`}
+            style={btnStyle}
+            onClick={() => void onClear()}
+            disabled={disabled}
+            title={
+              entries === 0
+                ? "还没有缓存内容"
+                : "清空后同样的原文会重新请求模型"
+            }
+          >
+            {clearing ? "清理中…" : "清空"}
+          </button>
+        </div>
+
+        {status && !status.persistent && (
+          <p className="m-0 mt-1.5" style={{ color: "var(--danger)" }}>
+            落盘不可用，缓存只在本次运行内有效（重启即失效）。
+          </p>
+        )}
+
+        {cleared !== null && entries === 0 && (
+          <p
+            className="m-0 mt-1.5"
+            style={{ color: "var(--brand-text)" }}
+          >
+            已清空 {cleared} 条。
+          </p>
+        )}
+
+        {error && (
+          <p className="m-0 mt-1.5" style={{ color: "var(--danger)" }}>
+            {error}
+          </p>
+        )}
       </div>
     </div>
   );

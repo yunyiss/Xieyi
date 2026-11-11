@@ -392,6 +392,27 @@ pub struct TranslateRequest {
     /// 翻译风格（general/formal/technical/literary/subtitle），空值按 general。
     #[serde(default)]
     pub text: String,
+    /// 跳过缓存重新生成。对应界面上的「重新翻译」。
+    ///
+    /// 默认 `false`：普通翻译走缓存（同一次运行内翻过同一段会秒出）。
+    /// 用户觉得译文不合意时点「重新翻译」，这里置 true，**不读缓存**
+    /// 重新请求模型 —— 否则点了跟没点一样（业界踩过的坑）。
+    #[serde(default)]
+    pub skip_cache: bool,
+}
+
+/// 翻译结果 + 是否来自缓存。
+///
+/// 带上 `from_cache` 是为了让界面能明确告诉用户「这是旧结果」。
+/// 不提供这个信息时，用户点「重新翻译」拿到相同文本会以为程序坏了。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranslateResult {
+    pub text: String,
+    /// 整段文本是否**全部**来自缓存。
+    /// 多段文本只要有一段重新生成过就是 false —— 否则用户会误以为
+    /// 「全都命中」，而实际部分是新生成的。
+    pub from_cache: bool,
 }
 
 pub struct AppState {
@@ -494,6 +515,38 @@ fn store_segment(
         cache.clear();
     }
     cache.insert(key, (text, stats));
+}
+
+/// 片段翻译时怎么对待缓存。
+///
+/// 拆成枚举而不是两个布尔（`skip_cache` / `persist`）：
+/// 组合里有「跳过缓存但仍落盘」这种自相矛盾的状态，
+/// 用一个类型把合法组合钉死，调用点也不会传反参数。
+///
+/// 三个变体对应三个真实场景：
+/// - 翻译页普通翻译：内存命中即可，但**不留痕**（用户临时用用，不该攒垃圾）
+/// - 翻译页「重新翻译」：跳过缓存重新生成，结果仍只留在内存
+/// - 批量：命中 + 落盘（这是落盘唯一有价值的场景：耗时长、会中断）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheMode {
+    /// 允许读内存缓存，结果只写内存，不落盘。翻译页默认走这条。
+    MemoryOnly,
+    /// 不读缓存，重新生成；结果写内存但不落盘。对应「重新翻译」。
+    Refresh,
+    /// 允许读缓存，结果同时写内存与磁盘。批量走这条。
+    Persistent,
+}
+
+impl CacheMode {
+    /// 是否允许读缓存。
+    pub fn reads_cache(self) -> bool {
+        !matches!(self, CacheMode::Refresh)
+    }
+
+    /// 结果是否要落盘。
+    pub fn persists(self) -> bool {
+        matches!(self, CacheMode::Persistent)
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -785,11 +838,14 @@ impl Service {
         target: &str,
         glossary: &[GlossaryEntry],
         text: &str,
+        mode: CacheMode,
         cancel: &std::sync::atomic::AtomicBool,
-    ) -> Result<(String, SegmentStats), String> {
+    ) -> Result<(String, SegmentStats, bool), String> {
         let key = cache_key(model, source, target, glossary, text);
 
-        if let Some((hit, stats)) = state.cache.lock().await.get(&key).cloned() {
+        if mode.reads_cache()
+            && let Some((hit, stats)) = state.cache.lock().await.get(&key).cloned()
+        {
             if let Some(id) = request_id {
                 let _ = app.emit(
                     "llm://token",
@@ -801,7 +857,10 @@ impl Service {
             }
             // 缓存里的结果在写入前已经过了质检，不必再查一次；
             // 统计沿用首次生成时的结果，重复跑批量不会把"检出的段"算丢。
-            return Ok((hit, stats));
+            //
+            // 第三个返回值 `true` = 这次是从缓存拿的。界面据此显示
+            // 「来自缓存」，否则用户会以为点了「重新翻译」却没变化。
+            return Ok((hit, stats, true));
         }
 
         let terms: Vec<quality::Term> = glossary
@@ -919,6 +978,10 @@ impl Service {
         // 拒绝被取消的片段；这里只在它真的写进去了之后才落盘，
         // 避免磁盘上留下一段「看着正常、实际被截断」的译文。
         //
+        // **落盘与否由 `mode` 决定**：翻译页的临时译文只进内存，
+        // 关掉程序就没了 —— 用户用它做一次性小翻译，不该在磁盘上攒垃圾。
+        // 只有批量才写盘（耗时长、会中断，重来一遍代价高）。
+        //
         // ⚠️ 锁顺序固定为「先 cache 后 disk」，全文件统一。
         // 反过来会和 `load_disk_cache`（cache → disk）构成死锁环。
         let mut snapshot: Option<HashMap<String, (String, SegmentStats)>> = None;
@@ -937,7 +1000,7 @@ impl Service {
             (inserted, cleared)
         };
 
-        if stored.0 {
+        if stored.0 && mode.persists() {
             // 需要压缩时，先看磁盘是否到顶；只有真需要才付出 clone 的代价
             let need_compact = {
                 let disk = state.disk_cache.lock().await;
@@ -959,7 +1022,7 @@ impl Service {
             }
         }
 
-        Ok((best, stats))
+        Ok((best, stats, false))
     }
 
     pub async fn load(
@@ -1989,6 +2052,38 @@ mod tests {
         assert!(!cache.contains_key("k"), "被取消的片段不应满足落盘条件");
     }
 
+    // -- CacheMode: 三种缓存策略的行为契约 --
+    //
+    // 这三条定住的是「谁能读缓存、谁能写磁盘」。
+    // 它们一旦被改坏，用户会遇到两种难查的问题：
+    // 点「重新翻译」没反应（还是命中旧缓存），
+    // 或者一次性小翻译在磁盘上越攒越多。
+
+    #[test]
+    fn memory_only_reads_cache_but_never_persists() {
+        // 翻译页默认：同一次运行内重翻可以命中，但不落盘
+        let mode = CacheMode::MemoryOnly;
+        assert!(mode.reads_cache(), "翻译页应该允许命中内存缓存");
+        assert!(!mode.persists(), "翻译页的临时译文不该写磁盘");
+    }
+
+    #[test]
+    fn refresh_skips_cache_and_stays_in_memory() {
+        // 「重新翻译」：必须跳过缓存，否则点了跟没点一样
+        // （LunaTranslator 就发过这个 bug）
+        let mode = CacheMode::Refresh;
+        assert!(!mode.reads_cache(), "重新翻译必须跳过缓存");
+        assert!(!mode.persists(), "重新翻译也不该把结果写磁盘");
+    }
+
+    #[test]
+    fn persistent_reads_and_writes_disk() {
+        // 批量：命中 + 落盘。这是落盘唯一有价值的场景
+        let mode = CacheMode::Persistent;
+        assert!(mode.reads_cache());
+        assert!(mode.persists());
+    }
+
     #[test]
     fn flush_target_record_matches_what_was_cached() {
         // 落盘内容必须与内存态一致，否则重启后拿到的译文对不上
@@ -2036,10 +2131,19 @@ pub async fn translate(
     app: AppHandle,
     state: tauri::State<'_, AppState>,
     request: TranslateRequest,
-) -> Result<String, String> {
+) -> Result<TranslateResult, String> {
     if request.text.trim().is_empty() {
         return Err("请输入要翻译的内容".into());
     }
+
+    // 翻译页的缓存策略：默认只读内存、**不落盘**。
+    // 用户用它做一次性小翻译，不该在磁盘上攒垃圾；
+    // 点「重新翻译」时走 Refresh，跳过缓存重新生成。
+    let mode = if request.skip_cache {
+        CacheMode::Refresh
+    } else {
+        CacheMode::MemoryOnly
+    };
 
     let service = ensure(&app, &state).await?;
     let _infer = state.infer_lock.lock().await;
@@ -2053,13 +2157,16 @@ pub async fn translate(
     let _ = app.emit("translate://progress", TranslateProgress { done: 0, total });
 
     let mut output = String::new();
+    // 整段全部命中才算「来自缓存」。
+    // 多段文本里只要有一段重新生成，就不能告诉用户「都是旧的」。
+    let mut all_cached = !segments.is_empty();
 
     for (index, segment) in segments.iter().enumerate() {
         if state.cancel.load(Ordering::Relaxed) {
             break;
         }
 
-        let (translated, _stats) = service
+        let (translated, _stats, from_cache) = service
             .translate_segment(
                 &app,
                 &state,
@@ -2069,9 +2176,11 @@ pub async fn translate(
                 &request.target,
                 &glossary,
                 &segment.text,
+                mode,
                 &state.cancel,
             )
             .await?;
+        all_cached = all_cached && from_cache;
 
         output.push_str(&translated);
 
@@ -2102,7 +2211,10 @@ pub async fn translate(
         return Err("已取消".into());
     }
 
-    Ok(output)
+    Ok(TranslateResult {
+        text: output,
+        from_cache: all_cached,
+    })
 }
 
 #[tauri::command]
@@ -2352,6 +2464,47 @@ pub async fn chat(
         Err(_) if state.cancel.load(Ordering::Relaxed) => Err("已取消".into()),
         Err(e) => Err(e),
     }
+}
+
+/// 清空翻译缓存（内存 + 磁盘）。
+///
+/// 用户主动触发的场景：改了模型 / 觉得译文不对想强制重翻 / 想回收磁盘空间。
+/// 翻译缓存的当前状态，供设置面板显示。
+///
+/// 只暴露「有多少条、占多少字节」这类无损信息 —— 不返回缓存内容本身：
+/// 那是几千段用户文本，既没有展示价值，也不该走 IPC。
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheStatus {
+    /// 内存里的条目数（实际可命中的数量）
+    pub entries: usize,
+    /// 磁盘文件字节数；文件不存在时为 0
+    pub bytes: u64,
+    /// 落盘是否可用。不可用时退化为纯内存，重启即失效
+    pub persistent: bool,
+}
+
+#[tauri::command]
+pub async fn cache_status(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<CacheStatus, String> {
+    let entries = state.cache.lock().await.len();
+
+    let bytes = paths::app_data(&app)
+        .ok()
+        .map(|d| d.join("cache").join("translate.jsonl"))
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    let persistent = state.disk_cache.lock().await.is_some();
+
+    Ok(CacheStatus {
+        entries,
+        bytes,
+        persistent,
+    })
 }
 
 /// 清空翻译缓存（内存 + 磁盘）。

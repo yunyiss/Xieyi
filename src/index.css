@@ -327,6 +327,30 @@
 }
 
 /* 系统里关了动效就别硬来 */
+/*
+ * 「来自缓存」浮层的入场。
+ *
+ * 只动 transform 与 opacity（合成层属性），不触发重排 ——
+ * 这是项目的硬约束：浮层出现的那一瞬不能让正在看的译文抖一下。
+ *
+ * 原地放大 4% + 上浮 2px，比纯淡入更有「弹出来」的感觉，
+ * 但幅度很小，不会像弹簧那样跳跃——工具类软件不该活泼过头。
+ */
+@keyframes toast-pop {
+  from {
+    opacity: 0;
+    transform: translateY(-2px) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.toast-pop {
+  animation: toast-pop 180ms var(--ease-out) both;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .card,
   .popover,
@@ -334,7 +358,8 @@
   .field,
   .btn,
   .drawer,
-  .backdrop {
+  .backdrop,
+  .toast-pop {
     animation: none !important;
     transition: none !important;
   }

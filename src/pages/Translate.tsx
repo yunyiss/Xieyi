@@ -108,6 +108,22 @@ export function Translate({
   });
   /** 本次翻译里被质检挑出问题、已自动重试的片段 */
   const [quality, setQuality] = useState<QualityReport[]>([]);
+  /**
+   * 当前译文是否整段来自缓存。
+   *
+   * 只用于显示「重新翻译」按钮的可用性判断：
+   * 命中缓存时按钮更有意义（用户按下去才可能得到不同结果）；
+   * 没命中时也能点，只是效果等于再跑一次。
+   */
+  const [fromCache, setFromCache] = useState(false);
+  /**
+   * 瞬时提示文案。`null` 表示不显示。
+   *
+   * 用完即消失，不常住——用户只需要知道「这次是缓存」，
+   * 不需要它一直占着标题栏。定时器在组件卸载时清掉。
+   */
+  const [toast, setToast] = useState<string | null>(null);
+  const toastTimer = useRef<number | null>(null);
 
   const unlistenRef = useRef<UnlistenFn | null>(null);
 
@@ -208,7 +224,29 @@ export function Translate({
     };
   }, [adoptDroppedPath]);
 
-  const handleRun = async () => {
+  /**
+   * 弹一个 1.8 秒后自动消失的提示。
+   *
+   * 为什么用瞬时提示而不是常驻徽章：用户只需要**知道这一次**是缓存，
+   * 知道了就够了。常驻会让标题栏一直多一块，视觉噪音大于信息量。
+   */
+  const showToast = useCallback((text: string) => {
+    setToast(text);
+    if (toastTimer.current !== null) window.clearTimeout(toastTimer.current);
+    toastTimer.current = window.setTimeout(() => {
+      setToast(null);
+      toastTimer.current = null;
+    }, 1800);
+  }, []);
+
+  useEffect(
+    () => () => {
+      if (toastTimer.current !== null) window.clearTimeout(toastTimer.current);
+    },
+    [],
+  );
+
+  const handleRun = async (opts?: { skipCache?: boolean }) => {
     if (!model) {
       setError("请先选择模型");
       return;
@@ -223,6 +261,14 @@ export function Translate({
     setBusy(true);
     setSegmentProgress({ done: 0, total: 0 });
     setQuality([]);
+    setFromCache(false);
+    // 上一次的「来自缓存」提示要立刻撤掉。
+    // 否则重新翻译（这次没命中）时，旧提示会挂到新结果上，说的是反话。
+    setToast(null);
+    if (toastTimer.current !== null) {
+      window.clearTimeout(toastTimer.current);
+      toastTimer.current = null;
+    }
 
     const id = newRequestId();
     unlistenRef.current?.();
@@ -231,14 +277,21 @@ export function Translate({
     });
 
     try {
-      const text = await translate({
+      const result = await translate({
         requestId: id,
         model,
         source,
         target,
         text: input,
+        skipCache: opts?.skipCache,
       });
+      // 后端返回结构：text + fromCache。
+      // 早先直接拿字符串，于是无法告诉用户「这条是缓存的」——
+      // 用户点「重新翻译」看到一样的译文会以为按钮坏了。
+      const text = result.text ?? "";
       setOutput(text);
+      setFromCache(Boolean(result.fromCache));
+      if (result.fromCache) showToast("来自缓存");
     } catch (e) {
       setError(String(e));
     } finally {
@@ -274,6 +327,22 @@ export function Translate({
 
   return (
     <div className="flex h-full flex-col gap-3 p-4">
+      {/*
+        「来自缓存」提示浮层。
+
+        为什么是绝对定位的浮层而不是塞进标题栏：
+        塞进 flex 布局会**挤动旁边的元素**，出现「顶一下」的跳动，
+        这正是它看起来廉价的原因。浮层脱离文档流，不参与布局。
+        web.dev 的 toast 规范也明确要求定位到视口而不是父容器。
+
+        定位放在**底部居中**，不是右上角。
+        右上角虽然贴近译文卡片的标题栏，但会盖住右侧的模型名 ——
+        实测截图里「Hy-MT2-1.8B-Q8_0」被浮层遮掉一半。
+        底部居中是译文与操作按钮之间的空白区，不会遮挡任何可交互元素。
+        距底部 96px（而非 64px）：64px 时浮层恰好压在卡片下边框上，
+        边框从浮层底下穿过去，看着像错位。抬高一档后完全落在卡片的空白里。
+        `pointer-events-none` 保证它不抢点击（否则会挡住下面的按钮）。
+      */}
       {/*
         配置引导已移到全屏覆盖层（Onboarding），
         这里只保留一条单行提示 + 重新打开的入口。
@@ -364,12 +433,61 @@ export function Translate({
           />
         </section>
 
-        <section className="card flex min-h-0 flex-col overflow-hidden">
+        <section className="card relative flex min-h-0 flex-col overflow-hidden">
+          {/*
+            「来自缓存」浮层：贴在**译文卡片右下角**。
+
+            为什么在卡片内而不是标题栏：塞进标题栏会挤动右侧元素，
+            出现「顶一下」的跳动。绝对定位脱离文档流，不参与布局。
+
+            为什么右下角：这是 toast 的惯例位置（Fluent 2 建议顶/底且靠右），
+            目光扫完译文时自然落在这里；左下角会跟正文的起始位置承接上，
+            反而像正文的一部分。四周留 12px，不贴边。
+
+            `pointer-events-none` 保证它不抢点击（否则会挡住下面的按钮）。
+          */}
+          {toast && (
+            <div
+              className="pointer-events-none absolute bottom-3 right-3 z-20"
+              role="status"
+              aria-live="polite"
+            >
+              <span
+                className="toast-pop inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px]"
+                style={{
+                  background: "var(--surface)",
+                  border: "1px solid var(--border)",
+                  color: "var(--brand-text)",
+                  boxShadow: "var(--shadow-3)",
+                }}
+              >
+                {/* 小圆点：暗示「这是状态标记」而不是一段文字 */}
+                <span
+                  className="inline-block h-1.5 w-1.5 rounded-full"
+                  style={{ background: "var(--brand)" }}
+                />
+                {toast}
+              </span>
+            </div>
+          )}
           <header className="panel-head">
             <span>译文</span>
             <span className="flex min-w-0 items-center gap-2.5">
               {quality.length > 0 && (
                 <QualityNote reports={quality} total={segmentProgress.total} />
+              )}
+              {output && !busy && (
+                <button
+                  className="btn rounded px-1 text-[11px] opacity-70 hover:opacity-100"
+                  onClick={() => void handleRun({ skipCache: true })}
+                  title={
+                    fromCache
+                      ? "跳过缓存，重新翻译（结果可能不同）"
+                      : "重新翻译"
+                  }
+                >
+                  重新翻译
+                </button>
               )}
               {output && !busy && (
                 <button

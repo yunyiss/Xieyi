@@ -148,6 +148,25 @@ export interface TranslateRequest {
   source: string;
   target: string;
   text: string;
+  /**
+   * 跳过缓存重新生成。对应界面上的「重新翻译」。
+   *
+   * 默认 false：同一次运行内翻过同一段会秒出（内存缓存）。
+   * 置 true 时不读缓存、重新请求模型——否则用户点了会拿到一模一样的译文，
+   * 看起来像按钮坏了。
+   */
+  skipCache?: boolean;
+}
+
+/**
+ * 翻译结果。
+ *
+ * `fromCache` 表示整段文本**全部**来自缓存。界面上只在它为 true 时
+ * 提示「来自缓存」，让用户知道这不是新生成的结果。
+ */
+export interface TranslateResult {
+  text: string;
+  fromCache: boolean;
 }
 
 export interface ChatMessage {
@@ -232,10 +251,11 @@ export const openEngineDir = () => invoke<string>("open_engine_dir");
  * 在系统文件管理器里打开数据目录的某个子目录。
  *
  * `root` 是整个数据根目录（删掉它等于还原出厂），其余是它下面的子项。
- * 后端只接受这三个名字，不接受任意路径。
+ * 后端只接受这几个名字，不接受任意路径。
  */
-export const openDataSubdir = (name: "root" | "sessions" | "runtime") =>
-  invoke<string>("open_data_subdir", { name });
+export const openDataSubdir = (
+  name: "root" | "sessions" | "runtime" | "logs" | "cache",
+) => invoke<string>("open_data_subdir", { name });
 export const setModelsDir = (path: string) =>
   invoke<string>("set_models_dir", { path });
 export const setTtl = (seconds: number) => invoke<void>("set_ttl", { seconds });
@@ -260,6 +280,23 @@ export const setPinned = (model: string, pinned: boolean) =>
   invoke<string[]>("set_pinned", { model, pinned });
 export const getSettings = () => invoke<Settings>("get_settings");
 export const listLocalModels = () => invoke<LocalModel[]>("list_local_models");
+
+/**
+ * 翻译缓存的当前状态。
+ *
+ * `persistent` 为 false 表示落盘不可用（目录不可写等），
+ * 此时缓存退化成纯内存，重启即失效——设置面板要把这点说清楚，
+ * 否则用户会以为「翻过的下次还在」，结果白等。
+ */
+export interface CacheStatus {
+  entries: number;
+  bytes: number;
+  persistent: boolean;
+}
+
+export const getCacheStatus = () => invoke<CacheStatus>("cache_status");
+/** 清空翻译缓存（内存 + 磁盘），返回被清掉的条数。 */
+export const clearTranslateCache = () => invoke<number>("clear_translate_cache");
 /** 思考档位表（预算数值由后端给出，前端不另抄一份）。 */
 export const thinkingTiers = () => invoke<ThinkingTier[]>("thinking_tiers");
 
@@ -273,7 +310,7 @@ export const restartService = () => invoke<ServiceStatus>("restart_service");
 export const unloadModel = (model: string) =>
   invoke<void>("unload_model", { model });
 export const translate = (request: TranslateRequest) =>
-  invoke<string>("translate", { request });
+  invoke<TranslateResult>("translate", { request });
 export const chat = (request: ChatRequest) =>
   invoke<string>("chat", { request });
 
@@ -363,6 +400,13 @@ export interface BatchFileProgress {
   done: number;
   segments: number;
   failedSegments: number;
+  /**
+   * 有多少段是从上次的进度里恢复的。
+   *
+   * 大于 0 表示这次是「接着上次翻」，界面要告诉用户，
+   * 否则他会奇怪为什么一开始就是 250/300。
+   */
+  resumedSegments?: number;
   output?: string;
   error?: string;
 }
