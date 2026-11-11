@@ -5,6 +5,7 @@ mod job_object;
 mod logging;
 mod models;
 mod params;
+mod partial;
 mod paths;
 mod prompts;
 mod quality;
@@ -102,6 +103,7 @@ fn open_data_subdir(app: tauri::AppHandle, name: String) -> Result<String, Strin
         "sessions" => "sessions".to_string(),
         "runtime" => "runtime".to_string(),
         "logs" => "logs".to_string(),
+        "cache" => "cache".to_string(),
         _ => return Err(format!("不支持的目录: {name}")),
     };
 
@@ -120,8 +122,17 @@ fn open_data_subdir(app: tauri::AppHandle, name: String) -> Result<String, Strin
 }
 
 #[tauri::command]
-fn probe_vram() -> Option<u64> {
-    hardware::free_vram_mb()
+fn probe_vram(app: tauri::AppHandle) -> Option<u64> {
+    // 优先问引擎自己：它对 AMD / Intel / Metal 都能报，
+    // 不像 nvidia-smi 只认 NVIDIA 一家。
+    hardware::free_vram_mb(engine_server_path(&app).as_deref())
+}
+
+/// 当前配置的推理引擎可执行文件路径。没配置时返回 `None`。
+fn engine_server_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    runtime::read_info(app)
+        .map(|i| std::path::PathBuf::from(i.server_path))
+        .filter(|p| p.is_file())
 }
 
 /// 让系统窗口（标题栏）跟随界面主题。
@@ -353,6 +364,7 @@ pub fn run() {
             service::abort,
             service::set_ttl,
             service::clear_translate_cache,
+            service::cache_status,
             service::set_gpu_layers,
             service::set_pinned,
             service::get_settings,

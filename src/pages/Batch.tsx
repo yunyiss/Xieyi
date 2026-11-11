@@ -43,6 +43,8 @@ interface QueueItem {
   done: number;
   segments: number;
   failedSegments: number;
+  /** 有多少段来自上次进度（断点续传） */
+  resumedSegments?: number;
   output?: string;
   error?: string;
 }
@@ -138,6 +140,7 @@ export function Batch({ refreshSignal = 0, active = true }: Props) {
               done: p.done,
               segments: p.segments,
               failedSegments: p.failedSegments,
+              resumedSegments: p.resumedSegments ?? item.resumedSegments,
               output: p.output ?? item.output,
               error: p.error,
             }
@@ -391,6 +394,24 @@ export function Batch({ refreshSignal = 0, active = true }: Props) {
                       >
                         {item.name}
                       </span>
+
+                      {/*
+                        续传标记：不标的话用户会奇怪
+                        「为什么一开始就是 250/300」。
+                      */}
+                      {(item.resumedSegments ?? 0) > 0 &&
+                        item.stage === "translating" && (
+                          <span
+                            className="shrink-0 rounded px-1 text-[10px]"
+                            style={{
+                              background: "var(--brand-soft)",
+                              color: "var(--brand-text)",
+                            }}
+                            title={`上次已完成 ${item.resumedSegments} 段，这次接着翻`}
+                          >
+                            续
+                          </span>
+                        )}
 
                       <span
                         className="shrink-0 text-[12px] tabular-nums"

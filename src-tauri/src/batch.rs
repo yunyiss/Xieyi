@@ -48,6 +48,10 @@ struct BatchProgress {
     /// 总片段数（解析完成后才知道）
     segments: usize,
     failed_segments: usize,
+    /// 这个文件有多少段是**从上次进度里恢复**的。
+    /// 用于告诉用户「正在接着上次的翻」，而不是重头开始。
+    #[serde(default)]
+    resumed_segments: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     output: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -173,6 +177,10 @@ async fn process_file(
     index: usize,
     total: usize,
 ) -> FileOutcome {
+    // 从上次进度里恢复的片段数。在读取源文件后才知道真值，
+    // 先给 0（此时进度事件还没有 segments 信息）。
+    let mut resumed_count = 0usize;
+
     macro_rules! report {
         ($stage:expr, $done:expr, $segments:expr, $failed:expr, $out:expr, $err:expr) => {
             let _ = app.emit(
@@ -185,6 +193,7 @@ async fn process_file(
                     done: $done,
                     segments: $segments,
                     failed_segments: $failed,
+                    resumed_segments: resumed_count,
                     output: $out,
                     error: $err,
                 },
@@ -243,14 +252,51 @@ async fn process_file(
     let segments = units.len();
     report!("translating", 0, segments, 0, None, None);
 
-    let mut done = 0usize;
     let mut failed = 0usize;
     let mut flagged = 0usize;
     let mut fixed = 0usize;
 
+    // ── 断点续传 ────────────────────────────────────────────────────
+    //
+    // 每翻完一段就把结果写进旁路进度文件。中断后重新拖入同一个文件，
+    // 已完成的段直接从进度文件回填，不再请求模型。
+    //
+    // 为什么不能只靠翻译缓存：失败片段（模型返回空）不进缓存，
+    // 且缓存有 4000 条上限、会被压缩，长文档跨天续跑时不保证还在。
+    let partial = crate::partial::partial_path(&output);
+    let fp = crate::partial::fingerprint(&source).unwrap_or_default();
+    let resumed = crate::partial::load(&partial, &fp, &request.target, segments);
+    resumed_count = resumed.len();
+
+    // 已有的进度直接回填到装配结构里：SRT 的序号/时间轴保持不变
+    for (i, text) in &resumed {
+        set_body(&mut assembled, *i, text.clone());
+    }
+    let mut done = resumed.len();
+    if !resumed.is_empty() {
+        report!("translating", done, segments, 0, None, None);
+    }
+
+    // 续传时沿用旧进度文件；全新任务则重建一份（覆盖可能残留的旧文件）
+    if resumed.is_empty() {
+        let _ = crate::partial::remove(&partial);
+        let _ = crate::partial::create(
+            &partial,
+            &crate::partial::Meta {
+                fingerprint: fp.clone(),
+                target: request.target.clone(),
+                segments,
+            },
+        );
+    }
+
     for (i, text) in units.iter().enumerate() {
         if state.cancel.load(Ordering::Relaxed) {
             break;
+        }
+        // 这一段上次已经翻好了，跳过（不回填，前面已经处理过）
+        if resumed.contains_key(&i) {
+            continue;
         }
 
         match translate_with_retry(service, app, state, request, glossary, text).await {
@@ -261,20 +307,27 @@ async fn process_file(
                 if stats.fixed {
                     fixed += 1;
                 }
-                set_body(&mut assembled, i, translated);
+                set_body(&mut assembled, i, translated.clone());
+                // 立刻落盘，不等整个文件翻完。
+                // 写失败不影响翻译（进度是优化，不是正确性依赖）。
+                let _ =
+                    crate::partial::append(&partial, &crate::partial::Entry { i, t: translated });
+                done += 1;
             }
-            // 保留原文：宁可混一段原文，也不要静默丢内容
+            // 保留原文：宁可混一段原文，也不要静默丢内容。
+            // 失败的不写进度 —— 下次续传会重试这一段。
             None => {
                 failed += 1;
                 set_body(&mut assembled, i, text.clone());
             }
         }
 
-        done = i + 1;
         report!("translating", done, segments, failed, None, None);
     }
 
     if state.cancel.load(Ordering::Relaxed) {
+        // **保留进度文件**：这是断点续传的关键 —— 下次拖入同一个文件
+        // 能接着翻。删掉就等于强制从头再来。
         report!(
             "skipped",
             done,
@@ -312,6 +365,9 @@ async fn process_file(
             ..Default::default()
         };
     }
+
+    // 全部翻完并写出成品：进度文件没用了，删掉不给用户留垃圾
+    let _ = crate::partial::remove(&partial);
 
     report!(
         "done",
@@ -360,11 +416,14 @@ async fn translate_with_retry(
                 &request.target,
                 glossary,
                 text,
+                // 批量是落盘唯一的真实场景：耗时长、会中断，重来代价高。
+                // 翻译页的临时译文不该写盘。
+                crate::service::CacheMode::Persistent,
                 &state.cancel,
             )
             .await
         {
-            Ok((translated, stats)) if !translated.trim().is_empty() => {
+            Ok((translated, stats, _from_cache)) if !translated.trim().is_empty() => {
                 return Some((translated, stats));
             }
             Ok(_) => last_error = "模型返回空内容".into(),
@@ -543,6 +602,59 @@ mod tests {
             out,
             "1\n00:00:01,000 --> 00:00:03,500\n你好\n\n2\n00:00:04,000 --> 00:00:06,000\n世界\n\n"
         );
+    }
+
+    // -- 断点续传：与切分/回填的协同 --
+
+    #[test]
+    fn partial_progress_aligns_with_units() {
+        // 进度里的索引必须就是 units 的下标。
+        // 这条锁住「两边用同一套切分」这个前提 ——
+        // 一旦切分规则变了，续传会串位。
+        let content = "第一段
+
+第二段
+
+第三段";
+        let (units, mut assembled) = split(content, Path::new("a.md"));
+        assert_eq!(units.len(), 3);
+
+        // 模拟：只完成了第 0 和第 2 段
+        let mut done = std::collections::BTreeMap::new();
+        done.insert(0usize, "译文一".to_string());
+        done.insert(2usize, "译文三".to_string());
+
+        for (i, text) in &done {
+            set_body(&mut assembled, *i, text.clone());
+        }
+        let rendered = render(&assembled, "zh");
+        assert!(rendered.contains("译文一"));
+        assert!(rendered.contains("译文三"));
+        // 未完成的那段保留原文（不能出现空段）
+        assert!(rendered.contains("第二段"));
+    }
+
+    #[test]
+    fn srt_resume_preserves_index_and_timeline() {
+        // SRT 续传时，序号与时间轴必须原样保留
+        let srt =
+            "1\n00:00:01,000 --> 00:00:03,500\nHello\n\n2\n00:00:04,000 --> 00:00:06,000\nWorld\n";
+        let (units, mut assembled) = split(srt, Path::new("m.srt"));
+        assert_eq!(units.len(), 2);
+
+        // 只续上第二段
+        let mut done = std::collections::BTreeMap::new();
+        done.insert(1usize, "世界".to_string());
+        for (i, text) in &done {
+            set_body(&mut assembled, *i, text.clone());
+        }
+
+        let rendered = render(&assembled, "zh");
+        assert!(rendered.contains("00:00:01,000 --> 00:00:03,500"));
+        assert!(rendered.contains("00:00:04,000 --> 00:00:06,000"));
+        assert!(rendered.contains("世界"));
+        // 未完成的保留原文
+        assert!(rendered.contains("Hello"));
     }
 
     #[test]
