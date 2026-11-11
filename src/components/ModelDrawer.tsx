@@ -503,7 +503,7 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
             <p className="m-0 mt-1 text-[11px]" style={{ color: "var(--text-muted)" }}>
               {freeVram != null
                 ? `当前可用显存 ${freeVram} MB`
-                : "未检测到可用显存（非 NVIDIA 或无驱动）"}
+                : "未能读取显存信息（纯 CPU 运行，或引擎尚未配置）"}
               {settings?.gpuLayers === 1001 ? " · 自动档按模型体积分配层数" : ""}
             </p>
 

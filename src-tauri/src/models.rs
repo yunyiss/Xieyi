@@ -89,7 +89,12 @@ pub fn write_preset(
     let path = root.join("presets.ini");
 
     let free_vram = if gpu_layers == AUTO_LAYERS {
-        hardware::free_vram_mb()
+        // 传引擎路径 → 走 `--list-devices`，AMD / Intel / Metal 都能拿到。
+        // 拿不到再退回 nvidia-smi（见 hardware.rs 的兜底顺序）。
+        let server = crate::runtime::read_info(app)
+            .map(|i| std::path::PathBuf::from(i.server_path))
+            .filter(|p| p.is_file());
+        hardware::free_vram_mb(server.as_deref())
     } else {
         None
     };
