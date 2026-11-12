@@ -43,6 +43,12 @@ const btnStyle = {
   color: "var(--text)",
 };
 
+/// 候选列表超过这个数量才限高滚动。
+///
+/// 参考 Semrush Intergalactic 的 Select 规范：菜单超过 7 项才需要
+/// 限高 + 滚动，否则列表本身就能一眼看完，滚动条是多余噪音。
+const MAX_VISIBLE_ENGINES = 7;
+
 function stageLabel(stage: RuntimeProgress["stage"]): string {
   switch (stage) {
     case "downloading":
@@ -62,6 +68,11 @@ export function Onboarding({ onDone, onChanged }: Props) {
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
   const [models, setModels] = useState<RouterModel[]>([]);
   const [discovered, setDiscovered] = useState<DiscoveredRuntime[]>([]);
+  /// 模型扫描中。
+  ///
+  /// 扫描要读每个 GGUF 的元数据，模型多的用户会等几秒。
+  /// 不给提示时，用户只看到「开始使用」灰着，不知道在等什么。
+  const [scanning, setScanning] = useState(false);
   const [progress, setProgress] = useState<RuntimeProgress | null>(null);
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
@@ -76,10 +87,13 @@ export function Onboarding({ onDone, onChanged }: Props) {
         setModels([]);
         return;
       }
+      setScanning(true);
       try {
         setModels(await listRouterModels());
       } catch {
         setModels([]);
+      } finally {
+        setScanning(false);
       }
     } catch (e) {
       setError(String(e));
@@ -173,7 +187,16 @@ export function Onboarding({ onDone, onChanged }: Props) {
 
   const engineReady = Boolean(runtime?.installed);
   const modelReady = models.length > 0;
-  const allReady = engineReady && modelReady;
+
+  /// 用户是否已经指定过模型目录。
+  ///
+  /// 为什么要单独判断它：扫描要读每个 GGUF 的元数据，
+  /// 模型多的用户会等几秒。用户已经选了目录 = 已经做出决定，
+  /// 没理由让他等扫描完才能进。
+  const dirChosen = Boolean(runtime?.modelsDir);
+
+  // 开始使用的条件：引擎就绪 + （已选目录 或 已扫到模型）
+  const allReady = engineReady && (dirChosen || modelReady);
 
   return (
     <div
@@ -185,18 +208,20 @@ export function Onboarding({ onDone, onChanged }: Props) {
         flex 居中在内容高于视口时会顶掉上边距、且横向滚动条出现时
         会把整块推偏。auto 外边距 + 自身限宽在任何窗口尺寸下都居中。
       */}
-      <div className="mx-auto w-full max-w-[560px] px-6 py-10">
+      <div
+        className="onboarding-pad mx-auto flex min-h-full w-full max-w-[560px] flex-col justify-center px-6 py-6"
+      >
         {/* 标题 */}
-        <div className="mb-7 text-center">
+        <div className="onboarding-head mb-5 text-center">
           <img
             src="/swallow.png"
             alt=""
-            width={72}
-            height={72}
-            className="mx-auto mb-3"
+            width={64}
+            height={64}
+            className="onboarding-logo mx-auto mb-2.5"
             aria-hidden
           />
-          <div className="text-[26px] font-semibold tracking-tight">
+          <div className="onboarding-title text-[24px] font-semibold tracking-tight">
             Xieyi
             <span
               className="ml-2 text-[15px] font-normal"
@@ -213,8 +238,14 @@ export function Onboarding({ onDone, onChanged }: Props) {
           </p>
         </div>
 
+        {/*
+          内容区可滚动，但**标题与主按钮固定**。
+          整页滚动时用户会不知道「开始使用」在哪——
+          小窗口下那个按钮可能在视口外。
+        */}
+        <div className="min-h-0 flex-1 overflow-y-auto">
         {/* ① 推理引擎 */}
-        <section className="card mb-3 p-4">
+        <section className="onboarding-card card mb-3 p-4">
           <div className="mb-3 flex items-center gap-2">
             <span
               className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[11px]"
@@ -271,7 +302,16 @@ export function Onboarding({ onDone, onChanged }: Props) {
                 现在随时能在候选之间来回换。
               */}
               {discovered.length > 0 && (
-                <ul className="m-0 mb-2.5 flex list-none flex-col gap-1.5 p-0">
+                <ul
+                  className="m-0 mb-2.5 flex list-none flex-col gap-1.5 p-0"
+                  style={
+                    // 超过 7 项才限高滚动（业界惯例）。
+                    // 多数用户只有 1-3 个引擎，滚动条纯属噪音。
+                    discovered.length > MAX_VISIBLE_ENGINES
+                      ? { maxHeight: 7 * 44, overflowY: "auto" }
+                      : undefined
+                  }
+                >
                   {discovered.map((d) => {
                     const current = d.path === runtime?.serverPath;
                     return (
@@ -348,7 +388,7 @@ export function Onboarding({ onDone, onChanged }: Props) {
         </section>
 
         {/* ② 模型 */}
-        <section className="card mb-3 p-4">
+        <section className="onboarding-card card mb-3 p-4">
           <div className="mb-3 flex items-center gap-2">
             <span
               className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[11px]"
@@ -362,11 +402,19 @@ export function Onboarding({ onDone, onChanged }: Props) {
               {modelReady ? "✓" : "2"}
             </span>
             <span className="text-[13px] font-medium">模型</span>
-            {modelReady && (
+            {/*
+              扫描中要有反馈：模型多的用户要等几秒，
+              不说的话只看到按钮灰着，不知道在等什么。
+            */}
+            {scanning ? (
+              <span className="text-[11px]" style={{ color: "var(--text-muted)" }}>
+                正在扫描…
+              </span>
+            ) : modelReady ? (
               <span className="text-[11px]" style={{ color: "var(--text-muted)" }}>
                 已发现 {models.length} 个
               </span>
-            )}
+            ) : null}
           </div>
 
           {!engineReady ? (
@@ -403,11 +451,31 @@ export function Onboarding({ onDone, onChanged }: Props) {
             </>
           )}
         </section>
+        </div>
 
+        {/*
+          错误提示做成不占布局的浮条。
+          原来它插在按钮上方，一出现就把「开始使用」往下推，
+          整个引导层的视觉重心跟着跳。
+        */}
         {error && (
-          <p className="m-0 mb-3 text-[12px]" style={{ color: "var(--danger)" }}>
-            {error}
-          </p>
+          <div
+            className="pointer-events-none fixed inset-x-0 bottom-6 z-50 flex justify-center px-4"
+            role="alert"
+          >
+            <p
+              className="m-0 rounded-lg border px-3 py-2 text-[12px]"
+              style={{
+                background: "var(--surface)",
+                borderColor: "var(--danger)",
+                color: "var(--danger)",
+                boxShadow: "var(--shadow-2)",
+                maxWidth: 520,
+              }}
+            >
+              {error}
+            </p>
+          </div>
         )}
 
         {/*
@@ -428,7 +496,7 @@ export function Onboarding({ onDone, onChanged }: Props) {
                   }
             }
             onClick={onDone}
-            title={allReady ? "进入主界面" : "配置会被保留，可稍后继续"}
+            title="随时可以进主界面，配置会保留"
           >
             {allReady ? "开始使用" : "稍后配置"}
           </button>

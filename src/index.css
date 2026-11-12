@@ -351,6 +351,41 @@
   animation: toast-pop 180ms var(--ease-out) both;
 }
 
+/*
+ * 引导层的窗口高度自适应。
+ *
+ * 窗口最小 600 高，而内容约 700，必然溢出。
+ * 不用 `transform: scale`：那是位图放大，文字会糊，
+ * 而且它不改变布局盒——点击热区会错位。
+ * 媒体查询是真实重排，字号、间距都重算，清晰且准确。
+ *
+ * 为什么不直接改 Tailwind 类：这些值只在引导层用，
+ * 写成类名会让 JSX 里堆一层层 `max-h-[700px]:...`，反而难读。
+ */
+@media (max-height: 700px) {
+  .onboarding-pad {
+    padding-block: 16px;
+  }
+  .onboarding-logo {
+    width: 48px;
+    height: 48px;
+    margin-bottom: 8px;
+  }
+  .onboarding-title {
+    font-size: 20px;
+  }
+  .onboarding-subtitle {
+    margin-top: 4px;
+    font-size: 12px;
+  }
+  .onboarding-head {
+    margin-bottom: 14px;
+  }
+  .onboarding-card {
+    padding: 12px;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .card,
   .popover,

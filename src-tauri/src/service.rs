@@ -1142,13 +1142,15 @@ async fn spawn(app: &AppHandle, gpu_layers: u64) -> Result<Service, String> {
     let models_dir = paths::models_dir(app)?;
     paths::ensure(&models_dir)?;
 
+    // 空目录不拦人：路由模式允许一个模型都没有，
+    // 进程照样能起来，只是暂时没东西可加载。
+    // 用户可能只是还没下完模型，或想先进界面看看——
+    // 在这里拦住他，引导层就成了死循环（不放模型就进不去，
+    // 进不去就看不到模型目录在哪）。
+    //
+    // 真正需要模型的地方（翻译/批量/对话）会自己报错，
+    // 那里报错比这里有用得多。
     let files = models::scan(app);
-    if files.is_empty() {
-        return Err(format!(
-            "模型目录为空：{}。请放入 .gguf 模型文件后重试。",
-            models_dir.display()
-        ));
-    }
     let preset = models::write_preset(app, &files, gpu_layers)?;
 
     let port = free_port()?;
