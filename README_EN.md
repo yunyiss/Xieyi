@@ -214,6 +214,35 @@ model list** (new models ship monthly; a list would always lag).
 `Hello world`-style micro-inputs may still come back unchanged on a 1.8B model
 — the quality check flags this. That's the model's ceiling, not a bug.
 
+### Wrong guess? One checkbox in Settings
+
+Detection reads the filename plus the `chat_template` fingerprint, and
+**maintains no model-name list**. That has a necessary cost: rename
+`Hy-MT2-7B.gguf` to `mymodel.gguf`, or use some obscure model nobody has seen,
+and it gets treated as a **generic chat model** — it still translates, just not
+through the best call format for that family.
+
+You don't have to rename files or dig through documentation. Open
+**Settings → Models & Glossary**; each model row has two checkboxes:
+
+| Checkbox | Effect |
+| :--- | :--- |
+| **Chat** | Checked = allowed on the Chat page; unchecked = Translate/Batch only |
+| **Pinned** | Checked = never auto-unloaded, keeps holding VRAM while idle |
+
+A manually-changed value shows a `·manual` marker, meaning your choice wins over
+detection. **To go back to automatic**: set the checkbox back to whatever
+detection would have chosen (e.g. if detection said "chat-capable", uncheck then
+re-check it) — the override record is cleared and detection takes over again.
+
+> **Why this escape hatch exists**: detection will be wrong sometimes (renamed
+> files, obscure models, new quantization variants). Leaving the user stuck, or
+> forcing them to rename model files, is not acceptable.
+>
+> **The default leans toward "recognize rather than hide"**: anything
+> unrecognized is treated as a generic chat model and never disappears from the
+> UI. The worst case is a suboptimal prompt, never "my model is gone".
+
 ---
 
 ## Where Files Live
@@ -265,9 +294,11 @@ it's a bug worth fixing.
 No, single instance. Clicking the icon again brings the existing window forward.
 
 **Q: Does it support AMD / Intel GPUs?**
-Yes, via Vulkan. Automatic VRAM estimation only works for NVIDIA (reads
-`nvidia-smi`); other GPUs fall back to "all layers on GPU" — not optimal, but
-it runs.
+Yes, via Vulkan. VRAM is queried straight from the engine
+(`llama-server --list-devices`), which reports free memory for CUDA / Vulkan /
+ROCm / Metal alike, so automatic layer placement works on all of them. If that
+is unavailable (older engine, a non-llama.cpp program you pointed at), it falls
+back to `nvidia-smi`, and only then to "all layers on GPU".
 
 **Q: Why no Markdown rendering?**
 The Chat page is a **post-editing workbench**, not a general agent. Full
@@ -279,10 +310,9 @@ conflicts with the "light and fast" positioning.
 ## Known Limitations
 
 - **Engine version is pinned**: follows a fixed llama.cpp build number rather than `latest`, to avoid behavior drift
-- **VRAM estimation is NVIDIA-only**: AMD / Intel fall back to "all layers on GPU"
 - **Model detection depends on filenames**: renaming `Hy-MT2-7B.gguf` to `mymodel.gguf` makes it a general model
 - **Batch concurrency capped at 2**: 4-way triggers `Context size has been exceeded`
-- **Translation cache is memory-only**: gone on restart, capped at 4000 entries
+- **VRAM estimation errs low on purpose**: when both the engine and `nvidia-smi` report a figure, the smaller one wins — a few layers fewer (slower) beats an out-of-memory load failure
 - **No window focus on Wayland**: the protocol forbids apps from manipulating other windows — a design choice, not a missing feature
 
 ---
