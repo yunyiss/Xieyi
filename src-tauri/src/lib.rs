@@ -164,6 +164,46 @@ fn init_early_logging() {
     }
 }
 
+/// 给 WebView2 进程附加的启动参数。
+///
+/// ## 为什么要关掉这几个组件
+///
+/// WebView2 默认会把 Chrome 的全套组件下载下来，其中包括本工具
+/// 完全用不到的：
+///
+/// | 组件 | 默认体积 | 本工具需要吗 |
+/// |---|---|---|
+/// | WidevineCdm（DRM 解密） | ~22 MB | 不需要：不播放受保护内容 |
+/// | Subresource Filter（广告过滤规则） | ~13 MB | 不需要：界面是本地资源 |
+/// | Speech Recognition（语音识别） | ~2.6 MB | 不需要：没有语音入口 |
+///
+/// ## 一旦调用 additional_browser_args，就会覆盖 wry 的默认值
+///
+/// Tauri 文档明确警告：wry 默认会传
+/// `--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection`，
+/// 我们自己指定后必须把这三个也写上，否则它们会重新启用。
+pub const WEBVIEW_ARGS: &str = concat!(
+    // 保留 wry 的三个默认禁用项
+    "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,",
+    // 本工具额外禁用的
+    "MediaRouter,WidevineCdm,",
+    "msWebView2EnableShoppingFeatures,msWebView2EnableFamilySafety",
+    // 关掉后台组件更新检查：本地工具无需跟随 Edge 更新组件
+    " --disable-component-update",
+    // 不做首次运行向导（那是浏览器的玩意）
+    " --no-first-run --no-default-browser-check",
+);
+
+/// 把 `WEBVIEW_ARGS` 应用到建窗构造器。
+///
+/// 单独抽成函数是为了让「传了什么」可以被测试断言，
+/// 而不必真去建一个窗口。
+fn apply_webview_args(
+    builder: tauri::WebviewWindowBuilder<'_, tauri::Wry, tauri::AppHandle>,
+) -> tauri::WebviewWindowBuilder<'_, tauri::Wry, tauri::AppHandle> {
+    builder.additional_browser_args(WEBVIEW_ARGS)
+}
+
 /// 创建主窗口，失败时清理残留并重试。
 ///
 /// ## 为什么要重试
@@ -190,7 +230,9 @@ fn create_main_window(app: &tauri::App) -> Result<(), String> {
     // 在里面 sleep / 起 PowerShell 会把这个线程卡住，实测第一次失败后
     // 进程直接没了（日志只留下第 0 次那条 WARN）。
     // 重试与退避必须放在**事件循环启动之前**。
-    match tauri::WebviewWindowBuilder::from_config(app.handle(), &config).and_then(|b| b.build()) {
+    match tauri::WebviewWindowBuilder::from_config(app.handle(), &config)
+        .and_then(|b| apply_webview_args(b).build())
+    {
         Ok(window) => {
             // 建出窗口对象 ≠ 上了屏幕。
             //
@@ -413,6 +455,50 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    /// WebView2 启动参数必须保留 wry 的默认禁用项。
+    ///
+    /// `additional_browser_args` 会**整体覆盖** wry 的默认值。
+    /// 漏掉 `msWebOOUI` / `msPdfOOUI` / `msSmartScreenProtection` 中的
+    /// 任何一个，对应的组件就会重新启用并下载——用户在磁盘上看到
+    /// 多出来的几十 MB，却不知道是哪来的。
+    #[test]
+    fn webview_args_keep_wry_defaults() {
+        for feature in ["msWebOOUI", "msPdfOOUI", "msSmartScreenProtection"] {
+            assert!(
+                super::WEBVIEW_ARGS.contains(feature),
+                "wry 默认禁用的 {feature} 被覆盖掉了，组件会重新下载"
+            );
+        }
+    }
+
+    /// 本工具额外禁用的组件都在参数里。
+    #[test]
+    fn webview_args_disable_unused_components() {
+        for feature in ["WidevineCdm", "MediaRouter"] {
+            assert!(
+                super::WEBVIEW_ARGS.contains(feature),
+                "{feature} 应当被禁用（本工具用不到）"
+            );
+        }
+        assert!(
+            super::WEBVIEW_ARGS.contains("--disable-component-update"),
+            "后台组件更新会持续下载用不到的东西"
+        );
+    }
+
+    /// 参数里不能有空格分隔的多个 `--disable-features`。
+    ///
+    /// Chromium 只认最后一个 `--disable-features`，出现两次会让前一组
+    /// 静默失效——这种问题不会报错，只会让组件莫名其妙又回来。
+    #[test]
+    fn webview_args_have_single_disable_features_flag() {
+        let count = super::WEBVIEW_ARGS.matches("--disable-features=").count();
+        assert_eq!(
+            count, 1,
+            "只允许一个 --disable-features（Chromium 只认最后一个），实际 {count} 个"
+        );
+    }
+
     /// `focus_main_window` 靠 label `"main"` 找窗口。
     ///
     /// 配置里没写 label 时 Tauri 默认就是 `main`，但只要有人显式改成别的
