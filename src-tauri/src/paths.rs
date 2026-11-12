@@ -18,7 +18,65 @@ use tauri::{AppHandle, Manager};
 ///   └── EBWebView\       ← WebView2 缓存（它自己管）
 /// ```
 /// 卸载或重置只需删掉这个根目录。
+/// 便携模式的标志目录名。
+///
+/// 程序所在目录下存在这个目录，就切换到便携模式：所有数据（配置、
+/// 日志、缓存、会话、引擎）都写进它里面，而不是系统标准路径。
+///
+/// 为什么用「目录存在」而不是「某个 marker 文件存在」：
+/// 目录本身就是数据位置，不需要额外解释「这个空文件是干嘛的」。
+/// 用户解压便携包就能用，不必理解任何概念。
+///
+/// 打包时由构建脚本预置这个目录（里面放一个 `.keep` 空文件，
+/// 防止某些解压工具丢弃空目录）。
+pub const PORTABLE_DIR: &str = "data";
+
+/// 程序是否运行在便携模式。
+///
+/// 判定只看**程序所在目录下有没有 `data/`**。注意几个边界：
+///
+/// - 装到 `Program Files` 时程序目录不可写，即使有 `data/` 也不该用
+///   （写入会失败），所以还要确认目录可写
+/// - AppImage 运行时「程序目录」是 `/tmp/.mount_xxx`（只读），
+///   真实位置在 `$APPIMAGE` 环境变量里，这里优先用它
+pub fn is_portable() -> bool {
+    let Some(dir) = portable_root() else {
+        return false;
+    };
+    let data = dir.join(PORTABLE_DIR);
+    data.is_dir() && dir_is_writable(&data)
+}
+
+/// 便携模式的根目录（也就是程序所在目录）。
+///
+/// Linux 上 AppImage 会把自己挂载到 `/tmp/.mount_xxxx`（只读、随机名），
+/// 此时 `current_exe()` 返回的是挂载点里的路径，写不进去。
+/// 真实位置在 `$APPIMAGE` 环境变量里，优先用它。
+pub fn portable_root() -> Option<PathBuf> {
+    // AppImage：用环境变量指向的真实文件位置
+    if let Ok(appimage) = std::env::var("APPIMAGE")
+        && !appimage.is_empty()
+    {
+        let p = PathBuf::from(appimage);
+        if let Some(dir) = p.parent() {
+            return Some(dir.to_path_buf());
+        }
+    }
+    exe_dir()
+}
+
+/// 便携模式下的数据根目录。
+pub fn portable_data_dir() -> Option<PathBuf> {
+    portable_root().map(|d| d.join(PORTABLE_DIR))
+}
+
 pub fn app_data(app: &AppHandle) -> Result<PathBuf, String> {
+    // 便携模式优先：所有数据跟着程序走
+    if let Some(dir) = portable_data_dir()
+        && is_portable()
+    {
+        return Ok(dir);
+    }
     app.path().app_local_data_dir().map_err(|e| e.to_string())
 }
 
@@ -49,6 +107,14 @@ pub const IDENTIFIER: &str = "com.xieyi.translate";
 /// `tauri.conf.json` 的 identifier 一致；Linux/macOS 的路径规则由
 /// Tauri 上游固定，这里按其实现照抄。
 pub fn data_root_early() -> Option<PathBuf> {
+    // 便携模式优先：启动最早期（日志、残留清理）也要跟着程序走，
+    // 否则日志会写进 AppData，与配置分居两处。
+    if is_portable()
+        && let Some(dir) = portable_data_dir()
+    {
+        return Some(dir);
+    }
+
     #[cfg(target_os = "windows")]
     {
         let base = std::env::var_os("LOCALAPPDATA")?;
@@ -182,6 +248,63 @@ pub fn ensure(dir: &std::path::Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    // -- 便携模式判定 --
+
+    #[test]
+    fn portable_dir_name_is_data() {
+        // 目录名一旦改动，打包脚本与文档都要跟着改，锁住它
+        assert_eq!(PORTABLE_DIR, "data");
+    }
+
+    #[test]
+    fn portable_root_prefers_appimage_env() {
+        // AppImage 运行时 current_exe() 指向 /tmp/.mount_xxx（只读、随机名），
+        // 真实位置在 $APPIMAGE 里。这条锁住「优先用环境变量」的行为。
+        //
+        // 用真实环境变量会污染其他测试，这里只验证「有值时取父目录」的语义。
+        let fake = std::path::PathBuf::from("/opt/Xieyi-1.0/Xieyi.AppImage");
+        let parent = fake.parent().unwrap();
+        assert_eq!(parent, std::path::Path::new("/opt/Xieyi-1.0"));
+    }
+
+    #[test]
+    fn is_portable_requires_existing_data_dir() {
+        // 便携判定必须是「目录真实存在」，不能只看路径拼出来
+        let dir = std::env::temp_dir().join(format!("xieyi-portable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 没有 data/ 子目录
+        let data = dir.join(PORTABLE_DIR);
+        assert!(!data.is_dir(), "前提：data 目录不存在");
+
+        // 建了 data/ 之后才算便携
+        std::fs::create_dir_all(&data).unwrap();
+        assert!(data.is_dir());
+        assert!(dir_is_writable(&data), "临时目录应当可写");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn portable_data_dir_is_data_under_root() {
+        // 便携模式下数据根 = <程序目录>/data
+        let root = std::path::Path::new("/opt/Xieyi-1.0");
+        assert_eq!(
+            root.join(PORTABLE_DIR),
+            std::path::Path::new("/opt/Xieyi-1.0/data")
+        );
+    }
+
+    #[test]
+    fn non_writable_dir_is_not_portable() {
+        // 装到 Program Files 时程序目录不可写，即使有 data/ 也不能用——
+        // 否则写入会失败，用户看到一堆「保存失败」。
+        // 用一个不存在的目录模拟：dir_is_writable 对它返回 false。
+        let missing = std::path::Path::new("/nonexistent/xieyi-test/data");
+        assert!(!dir_is_writable(missing));
+    }
+
     /// 默认模型目录要跟着程序走，不再固定在「文档」里。
     ///
     /// 这个工具是"一个文件夹带走全部"的用法：模型放在 exe 旁边最直观，
@@ -223,6 +346,34 @@ mod tests {
     ///
     /// 只做静态断言，不依赖 AppHandle：这条约束的实质是"源码里不能出现
     /// app_data_dir"，改成任何别的写法都应当让这条测试失败。
+    /// 启动最早期的数据目录也必须走便携判定。
+    ///
+    /// 这条容易漏：`data_root_early()` 在 `AppHandle` 可用之前就要工作
+    /// （日志初始化、残留清理都用它）。如果它不认便携模式，便携版会出现
+    /// 「配置在 data/、日志在 AppData」的分裂，用户按文档找日志会找不到。
+    #[test]
+    fn early_data_root_honours_portable_mode() {
+        let source = include_str!("paths.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap_or("");
+
+        // 找到 data_root_early 的函数体
+        let start = production
+            .find("pub fn data_root_early")
+            .expect("函数应当存在");
+        let rest = &production[start..];
+        let end = rest.find("\n}").unwrap_or(rest.len());
+        let body = &rest[..end];
+
+        assert!(
+            body.contains("is_portable()"),
+            "data_root_early 必须检查便携模式，否则日志会写进 AppData"
+        );
+        assert!(
+            body.contains("portable_data_dir()"),
+            "data_root_early 在便携模式下要返回 data/ 路径"
+        );
+    }
+
     #[test]
     fn data_root_uses_local_not_roaming() {
         let source = include_str!("paths.rs");

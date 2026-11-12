@@ -23,6 +23,7 @@ vi.mock("../lib/ipc", async (importOriginal) => {
       dataDir: "C:/data/com.xieyi.translate",
       modelsDir: "D:/models",
       runtimeVersion: "b11714",
+      portable: false,
     })),
     getRuntimeStatus: vi.fn(async () => ({
       installed: true,
@@ -109,6 +110,31 @@ describe("StorageInfo · 翻译缓存", () => {
     expect(ipc.clearTranslateCache).toHaveBeenCalledTimes(1);
     await waitFor(() => {
       expect(screen.getByText(/已清空 12 条/)).toBeTruthy();
+    });
+  });
+
+  it("标准模式显示「标准模式」标签", async () => {
+    render(<StorageInfo />);
+    await waitFor(() => {
+      expect(screen.getByText("标准模式")).toBeInTheDocument();
+    });
+  });
+
+  it("便携模式显示「便携模式」标签", async () => {
+    // 用户把 exe 拖走后会从便携变回标准模式，
+    // 标签是唯一能告诉他「现在在哪种模式」的地方
+    vi.mocked(ipc.getAppInfo).mockResolvedValueOnce({
+      os: "windows",
+      arch: "x86_64",
+      version: "0.1.0",
+      dataDir: "D:/Xieyi-0.1.0-win64/data",
+      modelsDir: "D:/Xieyi-0.1.0-win64/models",
+      runtimeVersion: "b11714",
+      portable: true,
+    });
+    render(<StorageInfo />);
+    await waitFor(() => {
+      expect(screen.getByText("便携模式")).toBeInTheDocument();
     });
   });
 

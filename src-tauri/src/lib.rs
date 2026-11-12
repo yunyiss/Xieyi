@@ -27,6 +27,12 @@ struct AppInfo {
     data_dir: String,
     models_dir: String,
     runtime_version: Option<String>,
+    /// 是否运行在便携模式。
+    ///
+    /// 界面据此显示「便携模式」/ 「标准模式」标签。
+    /// 没有这个标签时，用户把 exe 拖到桌面后会发现设置全没了，
+    /// 却不知道原因是「不在便携目录里了」。
+    portable: bool,
 }
 
 #[tauri::command]
@@ -38,6 +44,7 @@ fn app_info(app: tauri::AppHandle) -> Result<AppInfo, String> {
     Ok(AppInfo {
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
+        portable: paths::is_portable(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         data_dir: data_dir.to_string_lossy().to_string(),
         models_dir: models_dir.to_string_lossy().to_string(),
@@ -194,10 +201,23 @@ pub const WEBVIEW_ARGS: &str = concat!(
     " --no-first-run --no-default-browser-check",
 );
 
-/// 把 `WEBVIEW_ARGS` 应用到建窗构造器。
+/// 把浏览器参数应用到建窗构造器。
 ///
 /// 单独抽成函数是为了让「传了什么」可以被测试断言，
 /// 而不必真去建一个窗口。
+///
+/// ## 为什么便携模式下也不搬 WebView 缓存
+///
+/// 便携模式只搬**我们自己的数据**（配置、日志、会话、缓存、引擎）。
+/// WebView2 的缓存目录保持 Tauri 默认位置（`app_local_data_dir`）。
+///
+/// 理由：
+/// - 它纯粹是界面缓存，删掉程序重开就会重建，搬走没有实际收益
+/// - 跨平台差异大：macOS 的 WKWebView 根本不支持自定义数据目录，
+///   只有 `data_store_identifier`（16 字节标识，不是路径），
+///   强行统一会让三端行为不一致
+/// - 卸载时清两处（程序目录 + AppData）本来就是常规操作，
+///   多这一层不会带来困扰
 fn apply_webview_args(
     builder: tauri::WebviewWindowBuilder<'_, tauri::Wry, tauri::AppHandle>,
 ) -> tauri::WebviewWindowBuilder<'_, tauri::Wry, tauri::AppHandle> {

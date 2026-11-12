@@ -101,6 +101,29 @@ export function StorageInfo({ refreshToken = 0 }: { refreshToken?: number }) {
           >
             数据
           </span>
+          {/*
+            模式标签。用户把 exe 单独拖到桌面后，会发现设置全没了，
+            却不知道原因是「已经不在便携目录里了」。标出来就能自己判断。
+          */}
+          {info && (
+            <span
+              className="shrink-0 rounded px-1 text-[10px]"
+              style={{
+                background: info.portable
+                  ? "var(--brand-soft)"
+                  : "var(--surface)",
+                color: info.portable ? "var(--brand-text)" : "var(--text-muted)",
+                border: info.portable ? "none" : "1px solid var(--border)",
+              }}
+              title={
+                info.portable
+                  ? "数据存在程序目录下的 data/ 里，整个文件夹可以直接搬走"
+                  : "数据存在系统标准位置（与安装版相同）"
+              }
+            >
+              {info.portable ? "便携模式" : "标准模式"}
+            </span>
+          )}
           <span
             className="min-w-0 flex-1 truncate"
             style={{ ...mono, color: "var(--text)" }}

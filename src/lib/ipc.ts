@@ -9,6 +9,13 @@ export interface AppInfo {
   dataDir: string;
   modelsDir: string;
   runtimeVersion: string | null;
+  /**
+   * 是否运行在便携模式（程序目录下有 data/ 目录）。
+   *
+   * 界面据此显示模式标签：用户把 exe 单独拖走后，
+   * 会发现设置全没了，却不知道原因是「已经不在便携目录里了」。
+   */
+  portable: boolean;
 }
 
 export interface RuntimeStatus {
