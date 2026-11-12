@@ -6,6 +6,8 @@ import { ModelStateBadge, stateLabel } from "../components/ModelStateBadge";
 import { RunButton } from "../components/RunButton";
 import { Select } from "../components/Select";
 import { SOURCE_LANGUAGES, TARGET_LANGUAGES } from "../lib/languages";
+import { computeReadiness } from "../lib/readiness";
+import { mergeModelStates } from "../lib/modelState";
 import { useTauriEvent } from "../lib/useTauriEvent";
 import {
   baseName,
@@ -13,11 +15,10 @@ import {
   batchTranslate,
   filterBatchPaths,
   getRuntimeStatus,
-  listRouterModels,
+  listLocalModels,
   onBatchProgress,
   onModelState,
   pickBatchFiles,
-  startService,
   type BatchStage,
   type BatchSummary,
   type RouterModel,
@@ -99,6 +100,13 @@ export function Batch({ refreshSignal = 0, active = true }: Props) {
   const [summary, setSummary] = useState<BatchSummary | null>(null);
   const [load, setLoad] = useState<LoadState | null>(null);
 
+  /**
+   * 准备模型列表：**只扫目录，不启动引擎**（与翻译页同理）。
+   *
+   * 早先这里 `startService()` + `listRouterModels()`，页面一挂载就把
+   * 引擎拉起来。批量页和翻译页都是常驻挂载的，等于启动瞬间拉起两次。
+   * 引擎改由用户真正开始批量翻译时按需启动。
+   */
   const bootstrap = useCallback(async () => {
     setError("");
     try {
@@ -106,13 +114,18 @@ export function Batch({ refreshSignal = 0, active = true }: Props) {
       setRuntime(rt);
       if (!rt.installed) return;
 
-      await startService();
-      const list = await listRouterModels();
+      const local = await listLocalModels();
+      // 保留已有状态，别一律重置成 unloaded（见 lib/modelState.ts）
+      const list: RouterModel[] = mergeModelStates(
+        models,
+        local.map((m) => m.id),
+      );
       setModels(list);
       setModel((prev) => prev || list[0]?.id || "");
     } catch (e) {
       setError(String(e));
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -264,7 +277,12 @@ export function Batch({ refreshSignal = 0, active = true }: Props) {
     }
   };
 
-  const ready = runtime?.installed && models.length > 0;
+  // 与翻译页同一份判定，见 lib/readiness.ts
+  const readiness = computeReadiness({
+    installed: Boolean(runtime?.installed),
+    modelCount: models.length,
+  });
+  const ready = readiness.ready;
   const currentModelState = models.find((m) => m.id === model)?.state ?? "unloaded";
   const finished = queue.filter((i) => i.stage === "done").length;
   const failed = queue.filter((i) => i.stage === "failed").length;

@@ -75,11 +75,9 @@ const compactMock = vi.mocked(ipc.compactHistory);
 const saveMock = vi.mocked(ipc.saveSession);
 const abortMock = vi.mocked(ipc.abort);
 const listLocalMock = vi.mocked(ipc.listLocalModels);
-const listRouterMock = vi.mocked(ipc.listRouterModels);
 
 /** 默认的"一个通用对话模型"环境；个别用例会覆盖它。 */
 function useDefaultModels() {
-  listRouterMock.mockResolvedValue([{ id: "demo.gguf", state: "loaded" }]);
   listLocalMock.mockResolvedValue([
     {
       id: "demo.gguf",
@@ -116,9 +114,9 @@ beforeEach(() => {
 async function renderReady() {
   render(<Chat />);
   await waitFor(() => expect(screen.getByLabelText("发送")).toBeEnabled());
-  // `refresh()` 里 listRouterModels / listSessions / listLocalModels 是三个
-  // 独立 await，发送按钮只依赖第一个。localModels 决定 ctxSize（进而决定
-  // 是否压缩），所以要把剩余两个也等完——用一个微任务轮次即可。
+  // `refresh()` 里 listLocalModels / listSessions 是多个独立 await，
+  // 发送按钮只依赖模型列表。localModels 决定 ctxSize（进而决定是否压缩），
+  // 所以要把剩余几个也等完——用一个微任务轮次即可。
   await act(async () => {
     await Promise.resolve();
     await Promise.resolve();
@@ -140,10 +138,6 @@ describe("Chat", () => {
    * 或者编造身份，放在对话页只会让用户以为工具坏了。
    */
   it("翻译专用模型不出现在对话页的模型列表", async () => {
-    listRouterMock.mockResolvedValue([
-      { id: "qwen.gguf", state: "unloaded" },
-      { id: "hy-mt2.gguf", state: "unloaded" },
-    ]);
     listLocalMock.mockResolvedValue([
       {
         id: "qwen.gguf",
@@ -177,18 +171,23 @@ describe("Chat", () => {
 
     await renderReady();
 
-    // 打开模型选择器：只应看到通用模型，翻译模型被过滤掉。
-    // 注意两点：界面会把 ".gguf" 去掉再显示；选中项在触发器和列表里各出现一次，
-    // 所以按"至少出现一次"断言。
+    // `ModelPicker` 是**两级菜单**：点触发器只展开「模型 / 思考强度」
+    // 两行，必须再点「模型」才列出模型列表。
+    //
+    // 早先这里只点了触发器就断言"查不到 hy-mt2"——面板根本没展开，
+    // 当然查不到。过滤逻辑整个删掉，这条测试照样通过（实测确认）。
+    // 少点这一下，它就是个假测试。
     const user = userEvent.setup();
     await user.click(screen.getByLabelText("模型与思考强度"));
-    expect(screen.queryByText("hy-mt2")).not.toBeInTheDocument();
-    expect(screen.getAllByText("qwen").length).toBeGreaterThan(0);
+    await user.click(screen.getByText("模型"));
+
+    // 面板已展开：通用模型必须出现，翻译专用模型必须不出现
+    expect(screen.getAllByText(/qwen/).length).toBeGreaterThan(0);
+    expect(screen.queryByText(/hy-mt2/)).not.toBeInTheDocument();
   });
 
   /** 目录里只有翻译模型时，要明确告诉用户为什么对话页用不了。 */
   it("只有翻译模型时给出明确说明", async () => {
-    listRouterMock.mockResolvedValue([{ id: "hy-mt2.gguf", state: "unloaded" }]);
     listLocalMock.mockResolvedValue([
       {
         id: "hy-mt2.gguf",
@@ -217,10 +216,6 @@ describe("Chat", () => {
    * 在设置里打个勾就行。
    */
   it("手动放开能力限制后，翻译模型也能进对话页", async () => {
-    listRouterMock.mockResolvedValue([
-      { id: "qwen.gguf", state: "unloaded" },
-      { id: "tg.gguf", state: "unloaded" },
-    ]);
     listLocalMock.mockResolvedValue([
       {
         id: "qwen.gguf",
@@ -262,6 +257,57 @@ describe("Chat", () => {
     // 手动放开的那个也出现了（列表里会把 .gguf 后缀去掉）
     expect(screen.getAllByText("tg").length).toBeGreaterThan(0);
   }, 20000);
+
+  /**
+   * 手动把某个模型改成"不能对话"后，它应当从对话页消失。
+   *
+   * 这是兜底机制的另一半。上面那条测"自动判否 → 手动放开"，
+   * 这条测"自动判是 → 手动排除"。两条合起来才说明：
+   * **用户的选择永远优先于自动识别**。
+   */
+  it("手动排除后，通用模型也会从对话页消失", async () => {
+    listLocalMock.mockResolvedValue([
+      {
+        id: "qwen.gguf",
+        path: "C:/models/qwen.gguf",
+        sizeMb: 4000,
+        ctxSize: 8192,
+        trainedCtx: 32768,
+        supportsThinking: true,
+        thinking: "off" as const,
+        chatCapable: true,
+        family: "通用",
+        unsupportedReason: null,
+        chatAuto: true,
+        chatOverridden: false,
+      },
+      {
+        // 自动判定是可对话的通用模型，但用户手动关掉了
+        id: "banned.gguf",
+        path: "C:/models/banned.gguf",
+        sizeMb: 4000,
+        ctxSize: 4096,
+        trainedCtx: 8192,
+        supportsThinking: false,
+        thinking: "off" as const,
+        chatCapable: false,
+        family: "通用",
+        unsupportedReason: null,
+        chatAuto: true, // 自动说能用
+        chatOverridden: true, // 但用户说不
+      },
+    ]);
+
+    await renderReady();
+
+    const user = userEvent.setup();
+    await user.click(screen.getByLabelText("模型与思考强度"));
+    await user.click(screen.getByText("模型"));
+
+    // 正常模型在，被手动手动排除的不在
+    expect(screen.getAllByText(/qwen/).length).toBeGreaterThan(0);
+    expect(screen.queryByText(/banned/)).not.toBeInTheDocument();
+  });
 
   /**
    * 快捷指令曾经完全无效：它被当成独立的 system 消息插在对话中间，

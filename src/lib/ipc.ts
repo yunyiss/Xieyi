@@ -8,6 +8,13 @@ export interface AppInfo {
   version: string;
   dataDir: string;
   modelsDir: string;
+  /**
+   * 用户是否**显式设过**模型目录。
+   *
+   *  永远有值（配置或程序目录下的默认 models），
+   * 不能靠它判断「用户做过选择」。
+   */
+  modelsDirConfigured: boolean;
   runtimeVersion: string | null;
   /**
    * 是否运行在便携模式（程序目录下有 data/ 目录）。
@@ -240,9 +247,6 @@ export const installRuntime = (backend: string) =>
   invoke<RuntimeStatus>("install_runtime", { backend });
 export const setManualRuntime = (serverPath: string) =>
   invoke<RuntimeStatus>("set_manual_runtime", { serverPath });
-/** 只自检、不改配置。用于界面上"先试试这个文件行不行"。 */
-export const probeRuntime = (serverPath: string) =>
-  invoke<RuntimeProbe>("probe_runtime", { serverPath });
 /** 扫一遍磁盘，找现成可切换的 llama-server。 */
 export const discoverRuntimes = () =>
   invoke<DiscoveredRuntime[]>("discover_runtimes");
@@ -289,6 +293,15 @@ export const getSettings = () => invoke<Settings>("get_settings");
 export const listLocalModels = () => invoke<LocalModel[]>("list_local_models");
 
 /**
+ * 只数模型目录里有几个 .gguf，**不启动引擎**。
+ *
+ * 启动时判断「要不要弹引导层」只需要这个数量。用 `listRouterModels`
+ * 会连带 `ensure()` 拉起 llama-server——那是 4-6 秒的等待，且用户
+ * 可能只是想看一眼界面。见 service.rs 里 `count_local_models` 的注释。
+ */
+export const countLocalModels = () => invoke<number>("count_local_models");
+
+/**
  * 翻译缓存的当前状态。
  *
  * `persistent` 为 false 表示落盘不可用（目录不可写等），
@@ -314,8 +327,6 @@ export interface ThinkingTier {
 }
 
 export const restartService = () => invoke<ServiceStatus>("restart_service");
-export const unloadModel = (model: string) =>
-  invoke<void>("unload_model", { model });
 export const translate = (request: TranslateRequest) =>
   invoke<TranslateResult>("translate", { request });
 export const chat = (request: ChatRequest) =>

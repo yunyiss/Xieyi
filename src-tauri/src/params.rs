@@ -141,7 +141,11 @@ impl Default for ModelParams {
     }
 }
 
-/// 所有模型的参数（键是模型 ID）。
+/// 一次性取回所有模型的参数。
+///
+/// **循环里不要反复调 [`get`]**：它每次都重新读 `config.json` 并解析整份
+/// JSON。`write_preset` 和 `list_local_models` 都要按模型取参数，模型多
+/// 的时候就是「一个模型读一次盘」。这里先取一份 map，循环里查表即可。
 pub fn all(app: &AppHandle) -> HashMap<String, ModelParams> {
     paths::config_value(app, "modelParams")
         .and_then(|v| serde_json::from_value(v).ok())
@@ -150,6 +154,13 @@ pub fn all(app: &AppHandle) -> HashMap<String, ModelParams> {
 
 pub fn get(app: &AppHandle, model: &str) -> ModelParams {
     all(app).remove(model).unwrap_or_default()
+}
+
+/// 从已取回的 map 里查单个模型的参数，缺失时用默认值。
+///
+/// 与 [`get`] 的区别：不碰磁盘。循环场景请先 [`all`] 再逐项调用它。
+pub fn from_map(map: &HashMap<String, ModelParams>, model: &str) -> ModelParams {
+    map.get(model).cloned().unwrap_or_default()
 }
 
 pub fn ctx_of(app: &AppHandle, model: &str) -> u64 {

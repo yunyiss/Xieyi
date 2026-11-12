@@ -41,17 +41,6 @@ pub fn free_vram_mb(server: Option<&Path>) -> Option<u64> {
     free_vram_mb_conservative(server)
 }
 
-#[allow(dead_code)]
-fn free_vram_mb_engine_first(server: Option<&Path>) -> Option<u64> {
-    // 首选：让引擎自己报。它是唯一能准确反映「我能用多少」的来源。
-    if let Some(mb) = server.and_then(query_list_devices) {
-        return Some(mb);
-    }
-    // 兜底：老引擎可能没有 --list-devices（b11714 之前没有），
-    // 或者用户手动指定了别家的 llama-server 包装。
-    query_nvidia_smi()
-}
-
 /// 两路都能拿到时取**较小值**。
 ///
 /// 实测发现两者会差几百 MB（RTX 4060 上：

@@ -40,8 +40,22 @@ vi.mock("../lib/ipc", async (importOriginal) => {
       loaded: [],
       modelsDir: "D:/models",
     })),
-    listRouterModels: vi.fn(async () => [
-      { id: "demo.gguf", state: "loaded" },
+    // 页面启动改用本地扫描（不拉引擎），不再用 listRouterModels
+    listLocalModels: vi.fn(async () => [
+      {
+        id: "demo.gguf",
+        path: "D:/models/demo.gguf",
+        sizeMb: 1024,
+        ctxSize: 4096,
+        trainedCtx: 4096,
+        supportsThinking: false,
+        thinking: "off",
+        chatCapable: true,
+        family: "通用",
+        unsupportedReason: null,
+        chatAuto: true,
+        chatOverridden: false,
+      },
     ]),
     filterBatchPaths: actual.filterBatchPaths,
     baseName: actual.baseName,
@@ -105,8 +119,21 @@ describe("Batch · 断点续传的界面反馈", () => {
       serverPath: "D:/llama/llama-server.exe",
       modelsDir: "D:/models",
     });
-    vi.mocked(ipc.listRouterModels).mockResolvedValue([
-      { id: "demo.gguf", state: "loaded" },
+    vi.mocked(ipc.listLocalModels).mockResolvedValue([
+      {
+        id: "demo.gguf",
+        path: "D:/models/demo.gguf",
+        sizeMb: 1024,
+        ctxSize: 4096,
+        trainedCtx: 4096,
+        supportsThinking: false,
+        thinking: "off",
+        chatCapable: true,
+        family: "通用",
+        unsupportedReason: null,
+        chatAuto: true,
+        chatOverridden: false,
+      },
     ]);
   });
 

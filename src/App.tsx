@@ -12,12 +12,14 @@ import {
   getRuntimeStatus,
   getServiceStatus,
   getSettings,
-  listRouterModels,
+  countLocalModels,
   type AppInfo,
   type RuntimeStatus,
   type ServiceStatus,
   type Settings,
 } from "./lib/ipc";
+import { computeReadiness } from "./lib/readiness";
+import { shallowEqual } from "./lib/shallowEqual";
 
 type Tab = "translate" | "batch" | "chat";
 
@@ -73,16 +75,27 @@ function App() {
     let alive = true;
     (async () => {
       try {
-        // 引擎没装直接判定需要引导
+        // 判定走 lib/readiness，与引导层、翻译页同一套口径。
         const rt = await getRuntimeStatus();
         if (!alive) return;
         if (!rt.installed) {
           setShowGuide(true);
           return;
         }
-        // 引擎装了但一个模型都没有，同样算没配好
-        const list = await listRouterModels();
-        if (alive) setShowGuide(list.length === 0);
+        // **用 countLocalModels 而不是 listRouterModels。**
+        //
+        // 后者内部是 `ensure()`——引擎没跑就会立刻 spawn 一个，把
+        // 「双击图标」变成「拉起 llama-server」。实测窗口在 02:09:38
+        // 就可见了，而引擎到 02:09:44 才起来，这 6 秒界面是空的，
+        // 用户看到的就是"白屏一会儿"。
+        //
+        // 这里只需要知道"有没有模型"，扫目录就够了。引擎等用户真要
+        // 翻译时再由 translate/chat/batch 各自 ensure，符合本项目
+        // 「按需加载、不常驻占硬件」的定位。
+        const n = await countLocalModels();
+        if (!alive) return;
+        const r = computeReadiness({ installed: rt.installed, modelCount: n });
+        setShowGuide(!r.ready);
       } catch {
         // 拉不到状态就不打扰，免得误弹
       } finally {
@@ -102,11 +115,17 @@ function App() {
         const rt = await getRuntimeStatus();
         const sv = await getServiceStatus();
         const cfg = await getSettings();
-        if (alive) {
-          setRuntime(rt);
-          setService(sv);
-          setSettings(cfg);
-        }
+        if (!alive) return;
+        // 值没变就不 setState。
+        //
+        // 这三个 getter 每次返回的都是**新对象**，而 React 用引用比较 —
+        // 直接 set 的话，哪怕数据一模一样，每 2.5 秒也会重渲染整棵树
+        // （三个页面是常驻挂载的，不省着点会让空闲时的翻译页也跟着重画）。
+        //
+        // 这几个对象都很小且扁平，浅比较就够；比引入深比较库划算得多。
+        setRuntime((prev) => (shallowEqual(prev, rt) ? prev : rt));
+        setService((prev) => (shallowEqual(prev, sv) ? prev : sv));
+        setSettings((prev) => (shallowEqual(prev, cfg) ? prev : cfg));
       } catch {
         // 引擎未启动时静默
       }

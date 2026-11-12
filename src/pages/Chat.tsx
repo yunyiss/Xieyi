@@ -11,7 +11,6 @@ import {
   deleteAllSessions,
   deleteSession,
   listLocalModels,
-  listRouterModels,
   listSessions,
   newRequestId,
   onModelState,
@@ -42,6 +41,7 @@ import {
   versionCount,
 } from "../lib/chat";
 import { useTauriEvent } from "../lib/useTauriEvent";
+import { mergeModelStates } from "../lib/modelState";
 
 /** 会话 id 与消息 id 用同一套生成方式，但两者互不相干。 */
 function newSessionId(): string {
@@ -196,16 +196,30 @@ export function Chat({
 
   const refresh = useCallback(async () => {
     try {
-      const list = await listRouterModels();
-
-      // 模型画像只用于过滤与提示，读失败不该把整页拖垮：
-      // 拿不到就当作"都能对话"，让用户至少能继续用现有模型。
+      // **只扫目录，不碰引擎。**
+      //
+      // 早先这里先调 `listRouterModels()` 取模型和状态，再调
+      // `listLocalModels()` 取画像——前者内部是 `ensure()`，会把引擎
+      // 拉起来。而三个页面都是常驻挂载的，于是启动瞬间就启动了引擎，
+      // 那 6 秒里界面是空的。
+      //
+      // 现在只用本地扫描：`id` 够填下拉，画像本来也在这一份里。
+      // 状态一律先给 `unloaded`（引擎没起，不可能有模型驻留），
+      // 之后由 `model://state-changed` 事件更新。
       let local: LocalModel[] = [];
       try {
         local = await listLocalModels();
       } catch (e) {
+        // 画像只用于过滤与提示，读失败不该把整页拖垮：
+        // 拿不到就当作"都能对话"，让用户至少能继续用现有模型。
         console.error("读取模型画像失败，本次不过滤", e);
       }
+
+      // 保留已有状态，别一律重置成 unloaded（见 lib/modelState.ts）
+      const list: RouterModel[] = mergeModelStates(
+        models,
+        local.map((m) => m.id),
+      );
 
       // 翻译专用模型不进对话页：实测它们会把用户的问题本身翻译掉。
       // 判定依据是后端读 GGUF 元数据得到的 chatCapable，不是靠名字猜。

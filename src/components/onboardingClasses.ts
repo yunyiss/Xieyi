@@ -12,5 +12,6 @@ export const ONBOARDING_CLASSES = [
   "onboarding-head",
   "onboarding-logo",
   "onboarding-title",
+  "onboarding-subtitle",
   "onboarding-card",
 ] as const;

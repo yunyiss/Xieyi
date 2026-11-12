@@ -7,10 +7,13 @@ import { QualityHint } from "../components/QualityHint";
 import { RunButton } from "../components/RunButton";
 import { Select } from "../components/Select";
 import { SOURCE_LANGUAGES, TARGET_LANGUAGES } from "../lib/languages";
+import { computeReadiness } from "../lib/readiness";
+import { mergeModelStates } from "../lib/modelState";
 import {
   abort,
   getRuntimeStatus,
-  listRouterModels,
+  getServiceStatus,
+  listLocalModels,
   newRequestId,
   onModelState,
   onQualityReport,
@@ -18,7 +21,6 @@ import {
   onTranslateProgress,
   restartService,
   setModelsDir,
-  startService,
   translate,
   type QualityReport,
   type RouterModel,
@@ -127,7 +129,21 @@ export function Translate({
 
   const unlistenRef = useRef<UnlistenFn | null>(null);
 
-  /** 走完整链路：确认运行时 → 拉起引擎 → 拉模型列表 */
+  /**
+   * 准备模型列表：**只扫目录，不启动引擎**。
+   *
+   * 早先这里是「getRuntimeStatus → startService → listRouterModels」，
+   * 也就是页面一挂载就把 llama-server 拉起来。三个页面都是常驻挂载的，
+   * 于是"双击图标"等于"立即启动推理进程"——实测日志里窗口在
+   * 02:09:38 就可见了，引擎到 02:09:44 才起来，那 6 秒界面是空的。
+   *
+   * 现在改用 `listLocalModels`（纯扫目录 + 读 GGUF 元数据）。
+   * 引擎等用户真的点了「翻译」再由 `handleRun` 里的 translate 调用
+   * 触发 ensure()，符合「按需加载、不常驻占硬件」的定位。
+   *
+   * 模型状态（已加载/未加载）此时一律给 `unloaded`：引擎还没起，
+   * 本来就没有任何模型驻留。之后由 `model://state-changed` 事件维持。
+   */
   const bootstrap = useCallback(async () => {
     setEngineError("");
     try {
@@ -135,13 +151,23 @@ export function Translate({
       setRuntime(rt);
       if (!rt.installed) return;
 
-      await startService().then(setService);
-      const list = await listRouterModels();
+      // 顺带读一下引擎状态用于底部显示端口。`service_status` 只读、
+      // 不启动引擎（用的是 `current()` 而不是 `ensure()`），安全。
+      getServiceStatus().then(setService).catch(() => setService(null));
+
+      const local = await listLocalModels();
+      // 保留已有状态，别一律重置成 unloaded（见 lib/modelState.ts）
+      const list: RouterModel[] = mergeModelStates(
+        models,
+        local.map((m) => m.id),
+      );
       setModels(list);
       setModel((prev) => prev || list[0]?.id || "");
     } catch (e) {
       setEngineError(String(e));
     }
+    // models 只用于保留旧状态，不作为重建依赖（否则每次 setModels 都会重跑）
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -301,9 +327,19 @@ export function Translate({
     }
   };
 
-  /** 模型列表非空即算这一步完成（引擎没装时不算，因为拉不到列表）。 */
-  const hasModels = models.length > 0;
-  const ready = runtime?.installed && hasModels;
+  /**
+   * 能不能翻译 —— 交给 `lib/readiness` 判定，**这里不再自己算**。
+   *
+   * 早先这里是 `runtime?.installed && hasModels`，而引导层用的是
+   * `installed && (选过目录 || 有模型)`。两套判定在「选了一个空目录」
+   * 这种情况下直接分叉：引导层放行、这里报未配置。同类 bug 修过两次
+   * 都没修干净，根因就是各算各的。
+   */
+  const readiness = computeReadiness({
+    installed: Boolean(runtime?.installed),
+    modelCount: models.length,
+  });
+  const ready = readiness.ready;
 
 
   const currentModelState =

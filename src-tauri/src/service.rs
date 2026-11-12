@@ -1391,19 +1391,7 @@ pub async fn load_model(
 }
 
 #[tauri::command]
-pub async fn unload_model(
-    app: AppHandle,
-    state: tauri::State<'_, AppState>,
-    model: String,
-) -> Result<(), String> {
-    let Some(s) = current(&state).await else {
-        return Ok(());
-    };
-    s.unload(&app, &model).await
-}
-
 /// 用户主动中止：停止正在生成的请求，并把正在加载的模型卸掉。
-#[tauri::command]
 pub async fn abort(
     app: AppHandle,
     state: tauri::State<'_, AppState>,
@@ -2664,12 +2652,45 @@ pub struct LocalModelInfo {
     pub chat_overridden: bool,
 }
 
+/// 只数一下模型目录里有几个可用的 .gguf，**不启动引擎**。
+///
+/// ## 为什么单独做这个命令
+///
+/// 启动时 `App.tsx` 需要知道「有没有模型」来决定弹不弹引导层。它原来调
+/// `list_router_models`，而那个命令内部是 `ensure()`——**引擎没跑就会
+/// 立刻 spawn 一个**。于是"双击图标"等于"立即拉起 llama-server"：
+///
+/// ```text
+/// 02:09:38  主窗口已创建（可见性 true）
+/// 02:09:44  引擎启动            ← 这 6 秒里界面是空的
+/// ```
+///
+/// 而这 6 秒全花在与"数模型"无关的事情上：`models::scan` +
+/// `write_preset`（读每个 GGUF 的文件头）+ `--list-devices`（起子进程）。
+///
+/// 用户可能只是想看一眼界面，甚至只是打开确认自己装过没有。这种情况下
+/// 拉起一个占显存的推理进程没有道理，也不符合本项目「模型按需加载、
+/// 不常驻占硬件」的定位。
+///
+/// 所以把"数模型"和"引擎列模型"分开：前者纯扫目录（`models::scan`
+/// 只做 `read_dir` + `stat`），后者才需要引擎。
+///
+/// 真正要翻译时，`translate` / `chat` / `batch` 各自会 `ensure()`，
+/// 引擎该起的时候自然会起。
+#[tauri::command]
+pub fn count_local_models(app: AppHandle) -> usize {
+    models::scan(&app).len()
+}
+
 #[tauri::command]
 pub fn list_local_models(app: AppHandle) -> Vec<LocalModelInfo> {
+    // 先取一次全部参数：params::get 每次都会重读 config.json，
+    // 放在 map 里就是「一个模型读一次盘」。模型多的用户能明显感到差别。
+    let all_params = params::all(&app);
     models::scan(&app)
         .into_iter()
         .map(|m| {
-            let p = params::get(&app, &m.id);
+            let p = params::from_map(&all_params, &m.id);
             let path = std::path::Path::new(&m.path);
             let caps = models::model_caps(path);
 

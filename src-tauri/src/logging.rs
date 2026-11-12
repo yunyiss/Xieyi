@@ -101,10 +101,12 @@ pub fn info(target: &str, msg: impl AsRef<str>) {
     log(Level::Info, target, msg)
 }
 
-/// Debug 级别目前没有调用点，但级别常量与过滤逻辑都已就位。
-/// 保留成公开接口，是为了新增排查点时不必每次都改这个模块——
-/// 用 `allow` 而不是删掉，删了以后加回来还得重新写一遍门面。
-#[allow(dead_code)]
+/// Debug 级别。目前由 `titlebar.rs` 在主题相关的非致命失败时使用
+/// （标题栏配色是锦上添花，失败不该刷屏，但排查时又需要看到）。
+///
+/// 不设 `#[allow(dead_code)]`：这个函数有真实调用点，加了反而会掩盖
+/// 未来的失效。上面那句注释曾经写着「目前没有调用点」，是错的——
+/// 当时没查调用点就下了判断。
 pub fn debug(target: &str, msg: impl AsRef<str>) {
     log(Level::Debug, target, msg)
 }

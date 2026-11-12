@@ -26,6 +26,13 @@ struct AppInfo {
     version: String,
     data_dir: String,
     models_dir: String,
+    /// 用户是否**显式设过**模型目录。
+    ///
+    /// `models_dir` 永远有值（配置或程序目录下的默认 `models`），
+    /// 不能用它判断「用户是否做过选择」。
+    /// 引导层需要这个区分：否则引擎一装好就被当成「配置完成」，
+    /// 而模型列表还是空的。
+    models_dir_configured: bool,
     runtime_version: Option<String>,
     /// 是否运行在便携模式。
     ///
@@ -48,6 +55,9 @@ fn app_info(app: tauri::AppHandle) -> Result<AppInfo, String> {
         version: env!("CARGO_PKG_VERSION").to_string(),
         data_dir: data_dir.to_string_lossy().to_string(),
         models_dir: models_dir.to_string_lossy().to_string(),
+        models_dir_configured: paths::config_value(&app, "modelsDir")
+            .and_then(|v| v.as_str().map(|s| !s.is_empty()))
+            .unwrap_or(false),
         runtime_version: status.version,
     })
 }
@@ -265,6 +275,16 @@ fn create_main_window(app: &tauri::App) -> Result<(), String> {
             //
             // 保留为 info 级：正常启动也就 4 行，不影响日志可读性。
             crate::logging::info("window", "主窗口已创建");
+            // **建窗后立刻上底色**，不要等前端 syncWindowTheme。
+            //
+            // WebView2 从开始加载到 React 挂载完成这段时间，页面里什么都
+            // 没有（`index.html` 的 `#root` 是空的，CSS 由 JS 引入），
+            // 显示的是 WebView2 默认的**白底**。窗口又早已可见（实测
+            // 「可见性 true」就在建窗那一秒），于是用户看到一块白板。
+            //
+            // 先铺上和 `--canvas` 一致的底色，白板就变成了"和最终界面
+            // 同色的一闪"。不改变总时长，但视觉上不再是刺眼的白。
+            crate::titlebar::set_window_background(&window, "system");
             if let Ok(pos) = window.outer_position() {
                 crate::logging::info("window", format!("窗口位置 {pos:?}"));
             }
@@ -410,14 +430,12 @@ pub fn run() {
             runtime::runtime_status,
             runtime::install_runtime,
             runtime::set_manual_runtime,
-            runtime::probe_runtime,
             runtime::discover_runtimes,
             service::service_status,
             service::start_service,
             service::stop_service,
             service::list_router_models,
             service::load_model,
-            service::unload_model,
             service::translate,
             service::get_glossary,
             service::set_glossary,
@@ -430,6 +448,7 @@ pub fn run() {
             service::set_gpu_layers,
             service::set_pinned,
             service::get_settings,
+            service::count_local_models,
             service::list_local_models,
             service::set_model_params,
             service::set_model_chat_capable,

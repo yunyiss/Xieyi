@@ -100,6 +100,9 @@ pub fn write_preset(
     };
 
     let mut ini = String::new();
+    // 先一次性取回所有模型参数：params::ctx_of 会每次重读 config.json，
+    // 放在循环里就是「一个模型读一次盘」。
+    let all_params = params::all(app);
     for m in models {
         let layers = if gpu_layers == AUTO_LAYERS {
             let layer_count = read_layer_count(Path::new(&m.path));
@@ -110,7 +113,7 @@ pub fn write_preset(
             gpu_layers
         };
 
-        let ctx = params::ctx_of(app, &m.id);
+        let ctx = params::from_map(&all_params, &m.id).ctx;
 
         ini.push_str(&format!(
             "[{}]\nmodel = {}\njinja = 1\nctx-size = {}\nn-gpu-layers = {}\ncache-type-k = q8_0\ncache-type-v = q8_0\n\n",
@@ -143,8 +146,86 @@ fn estimate_layers(size_mb: u64, layers: Option<u32>, free_mb: u64) -> u64 {
 }
 
 /// 从 GGUF 头部读取 `*.block_count`，用于按比例分配 GPU 层数。
+///
+/// ## 为什么要缓存
+///
+/// 这个函数只在 `write_preset` 里被调用，而 `write_preset` 每次启动引擎
+/// 都会跑一遍（改模型目录、换引擎、重启服务都会触发）。它按模型逐个
+/// 打开文件、**线性遍历整个 KV 段**直到找到 `block_count`——模型越多、
+/// 元数据越多，耗时越长。
+///
+/// 而同一个文件头在 `model_caps` 里已经被扫过一次并缓存了。这里再加
+/// 一层同样策略的缓存（键 = 路径 + 体积 + 修改时间），重启引擎时就不必
+/// 重新扫盘。缓存失效条件是文件被替换，与 `model_caps` 完全一致。
 pub fn read_layer_count(path: &Path) -> Option<u32> {
-    read_numeric_meta(path, "block_count").map(|v| v as u32)
+    // 缓存键只按**路径**，值的有效期用 (体积, mtime) 校验。
+    //
+    // 早先直接把体积和 mtime 拼进键里，结果文件一旦不可读（改名、
+    // 临时锁、被移动）metadata 拿不到，键就退化成一个新的形状，
+    // 与之前那条缓存对不上 —— 于是"文件不可读"反而触发了一次扫盘。
+    // 键按路径走、值里带指纹，才既能命中又能及时发现文件被替换。
+    let key = path.display().to_string();
+
+    let now = layer_cache_fingerprint(path);
+    if let Some(hit) = layer_cache_lookup(&key, now) {
+        return hit;
+    }
+
+    let value = read_numeric_meta(path, "block_count").map(|v| v as u32);
+    layer_cache_store(key, now, value);
+    value
+}
+
+/// layer_count 缓存的指纹：(体积, mtime 秒)。
+///
+/// 拿不到元数据时用 `(0, 0)` 哨兵——不与任何真实文件相同，
+/// 因此文件不可读时缓存必定失效，会老实去解析一次。
+fn layer_cache_fingerprint(path: &Path) -> (u64, u64) {
+    match std::fs::metadata(path) {
+        Ok(m) => (
+            m.len(),
+            m.modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        ),
+        Err(_) => (0, 0),
+    }
+}
+
+/// 文件指纹：(体积, mtime 秒)。
+type LayerFingerprint = (u64, u64);
+
+/// layer_count 缓存：路径 → (指纹, 层数)。
+///
+/// 值里带指纹而不是把指纹拼进键，理由见 `read_layer_count` 的注释。
+type LayerCache = HashMap<String, (LayerFingerprint, Option<u32>)>;
+
+fn layer_cache() -> &'static Mutex<LayerCache> {
+    static CACHE: OnceLock<Mutex<LayerCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 命中则返回值。指纹不一致视为未命中（同时把陈旧条目留在原地，
+/// 由下一次 `store` 覆盖——反正键一样）。
+fn layer_cache_lookup(key: &str, fingerprint: LayerFingerprint) -> Option<Option<u32>> {
+    let guard = layer_cache().lock().ok()?;
+    let (fp, value) = guard.get(key)?;
+    if *fp == fingerprint {
+        Some(*value)
+    } else {
+        None
+    }
+}
+
+fn layer_cache_store(key: String, fingerprint: LayerFingerprint, value: Option<u32>) {
+    if let Ok(mut guard) = layer_cache().lock() {
+        if guard.len() > 128 {
+            guard.clear();
+        }
+        guard.insert(key, (fingerprint, value));
+    }
 }
 
 /// 模型原生上下文长度（`*.context_length`），用于给用户提示"还能开多大"。
@@ -750,6 +831,79 @@ mod tests {
         );
     }
 
+    /// 缓存必须真的命中：第二次调用**不再扫文件头**。
+    ///
+    /// `write_preset` 每次启动引擎都会对每个模型调一次 `read_layer_count`，
+    /// 而它要线性遍历整个 KV 段。没有缓存时，"启动引擎"的开销随模型
+    /// 数量线性增长。
+    ///
+    /// 这里直接用缓存探针判断，不靠耗时——耗时在快盘上噪声太大，
+    /// 变异验证时根本抓不住"缓存被绕过"（试过，确实抓不住）。
+    #[test]
+    fn layer_count_is_cached_after_first_read() {
+        let Ok(sample) = std::env::var("LT_GGUF_SAMPLE") else {
+            return;
+        };
+        let tmp = std::env::temp_dir().join("xieyi-cache-test.gguf");
+        if std::fs::copy(&sample, &tmp).is_err() {
+            return; // 临时目录不可写就跳过，不把环境问题当失败
+        }
+
+        let value = read_layer_count(&tmp);
+        assert!(value.is_some(), "首次读取应当成功");
+
+        // 缓存里必须留下这条记录，且指纹与当前文件一致
+        let key = tmp.display().to_string();
+        let fp = layer_cache_fingerprint(&tmp);
+        let cached = layer_cache_lookup(&key, fp);
+        assert_eq!(
+            cached,
+            Some(value),
+            "首次读取后必须写入缓存，否则每次启动引擎都会重扫全部模型"
+        );
+
+        // 指纹变化（文件被替换）时不能命中
+        assert_eq!(
+            layer_cache_lookup(&key, (fp.0 + 1, fp.1)),
+            None,
+            "文件指纹变了还命中缓存 = 换掉 .gguf 后仍沿用旧层数"
+        );
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// 文件被替换后，缓存必须失效并重新解析。
+    ///
+    /// 这是上一条的对偶：缓存不能只看路径，否则用户换掉 .gguf 后
+    /// 层数会一直沿用旧值，显存估算就错了。
+    #[test]
+    fn layer_count_cache_invalidates_when_file_changes() {
+        let Ok(sample) = std::env::var("LT_GGUF_SAMPLE") else {
+            return;
+        };
+        let tmp = std::env::temp_dir().join("xieyi-cache-invalidate.gguf");
+        if std::fs::copy(&sample, &tmp).is_err() {
+            return;
+        }
+
+        let first = read_layer_count(&tmp);
+        assert!(first.is_some(), "首次读取应当成功");
+
+        // 破坏文件内容（保留文件名），指纹随之改变
+        if std::fs::write(&tmp, b"NOTAGGUF").is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return;
+        }
+
+        let after = read_layer_count(&tmp);
+        assert!(
+            after.is_none(),
+            "文件内容已变，缓存必须失效并重新解析（旧值 {first:?} 不该被沿用）"
+        );
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
     #[test]
     fn template_references_requires_jinja_tag() {
         assert!(template_references(
@@ -942,5 +1096,92 @@ mod tests {
         assert_eq!(PromptStyle::TemplateKwargs.as_str(), "template-kwargs");
         assert_eq!(PromptStyle::Delimiter.as_str(), "delimiter");
         assert_eq!(PromptStyle::LanguagePair.as_str(), "language-pair");
+    }
+
+    /// 真实模型的识别结果必须稳定：这是"适配层对不对"的总闸门。
+    ///
+    /// 用本机实测过的模型名 + 几个刻意构造的陷阱名，断言家族、调用机制、
+    /// 能否对话三项都符合预期。
+    ///
+    /// **这条测试的价值在于它不依赖外部文件**：`profile_of` 只看文件名与
+    /// chat_template 特征词，所以能在任何机器上跑，不需要真实 .gguf。
+    /// 新增家族时往这里加一行即可（这也是"要不要为每个模型单独维护"
+    /// 的答案：只在**新增一个家族**时改一处，不是每个模型都要写配置）。
+    #[test]
+    fn real_world_models_are_recognized_correctly() {
+        // (文件名, 期望家族, 期望机制, 能否对话)
+        let cases: &[(&str, &str, PromptStyle, bool)] = &[
+            // 本机实测过的翻译模型
+            (
+                "Hy-MT2-1.8B-Q8_0.gguf",
+                "Hy-MT2",
+                PromptStyle::ChineseOfficial,
+                true,
+            ),
+            (
+                "Hy-MT2-7B-Q4_K_M.gguf",
+                "Hy-MT2",
+                PromptStyle::ChineseOfficial,
+                true,
+            ),
+            (
+                "Index-Translate-9B.Q4_K_M.gguf",
+                "Index-Translate",
+                PromptStyle::ChineseText,
+                true,
+            ),
+            (
+                "translategemma-12b-it-Q4_K_S.gguf",
+                "TranslateGemma",
+                PromptStyle::TemplateKwargs,
+                false,
+            ),
+            (
+                "translategemma-4b-it.Q8_0.gguf",
+                "TranslateGemma",
+                PromptStyle::TemplateKwargs,
+                false,
+            ),
+            // 通用对话模型：一个都不能被误判
+            (
+                "Qwen3-8B-Q4_K_M.gguf",
+                "通用",
+                PromptStyle::EnglishSystem,
+                true,
+            ),
+            (
+                "gemma-3-4b-it.gguf",
+                "通用",
+                PromptStyle::EnglishSystem,
+                true,
+            ),
+            (
+                "Llama-3.1-8B-Instruct.gguf",
+                "通用",
+                PromptStyle::EnglishSystem,
+                true,
+            ),
+            // 陷阱名：看着像某家族，实际不是
+            (
+                "Seoul-Translate-Bot.gguf",
+                "通用",
+                PromptStyle::EnglishSystem,
+                true,
+            ),
+            (
+                "hymn-generator-7b.gguf",
+                "通用",
+                PromptStyle::EnglishSystem,
+                true,
+            ),
+        ];
+
+        for (name, family, style, chat) in cases {
+            let p = profile_of(name, None);
+            assert_eq!(&p.family, family, "{name} 家族判错");
+            assert_eq!(&p.style, style, "{name} 调用机制判错");
+            assert_eq!(p.chat_capable, *chat, "{name} 能否对话判错");
+            assert!(p.unsupported.is_none(), "{name} 不该被标成不可用");
+        }
     }
 }

@@ -22,6 +22,7 @@ vi.mock("../lib/ipc", async (importOriginal) => {
       version: "0.1.0",
       dataDir: "C:/data/com.xieyi.translate",
       modelsDir: "D:/models",
+      modelsDirConfigured: true,
       runtimeVersion: "b11714",
       portable: false,
     })),
@@ -129,6 +130,7 @@ describe("StorageInfo · 翻译缓存", () => {
       version: "0.1.0",
       dataDir: "D:/Xieyi-0.1.0-win64/data",
       modelsDir: "D:/Xieyi-0.1.0-win64/models",
+      modelsDirConfigured: true,
       runtimeVersion: "b11714",
       portable: true,
     });

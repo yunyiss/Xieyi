@@ -480,12 +480,6 @@ pub fn set_manual_runtime(app: AppHandle, server_path: String) -> Result<Runtime
     Ok(st)
 }
 
-/// 只做自检、不改配置。用于界面上"先试试这个文件行不行"。
-#[tauri::command]
-pub fn probe_runtime(server_path: String) -> RuntimeProbe {
-    probe_exe(Path::new(&server_path))
-}
-
 /// 磁盘上已有、可直接切换过去的引擎。
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
