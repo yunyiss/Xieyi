@@ -1,0 +1,226 @@
+name: release
+
+# 只在打 tag 时触发。日常提交由 build.yml 跑测试，不产包。
+on:
+  push:
+    tags:
+      - 'v*'
+  # 也允许手动跑一遍（不打 tag 时验证流水线）
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # 减少 macOS/Windows runner 上的 LTO 内存峰值
+  CARGO_PROFILE_RELEASE_LTO: thin
+
+jobs:
+  # ── Windows ────────────────────────────────────────────────────────
+  #
+  # 产出两个东西：
+  #   1. NSIS 安装包（Tauri 原生）
+  #   2. 便携 zip（exe + data/ + models/）
+  #
+  # 便携 zip 必须手工拼：Tauri 没有「便携版」这个打包目标，
+  # 它只认安装包格式。所以这里先 --no-bundle 出裸 exe，再自己压缩。
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: npm ci
+
+      # 安装包（NSIS）
+      - name: Build installer
+        run: npx tauri build --bundles nsis
+
+      # 裸 exe，用于便携包
+      - name: Build bare exe
+        run: npx tauri build --no-bundle
+
+      - name: Assemble portable zip
+        shell: pwsh
+        run: |
+          $ver = (Get-Content src-tauri/tauri.conf.json | ConvertFrom-Json).version
+          $dir = "Xieyi-$ver-win64"
+          New-Item -ItemType Directory -Path $dir -Force | Out-Null
+          Copy-Item src-tauri/target/release/xieyi.exe "$dir/Xieyi.exe"
+          # data/ 与 models/ 必须存在：data 是便携模式的判定依据，
+          # 里面放 .keep 是因为部分解压工具会丢弃空目录。
+          New-Item -ItemType Directory -Path "$dir/data" -Force | Out-Null
+          New-Item -ItemType Directory -Path "$dir/models" -Force | Out-Null
+          New-Item -ItemType File -Path "$dir/data/.keep" -Force | Out-Null
+          New-Item -ItemType File -Path "$dir/models/.keep" -Force | Out-Null
+          Compress-Archive -Path $dir -DestinationPath "Xieyi-$ver-portable-win64.zip"
+          Write-Output "PORTABLE_ZIP=Xieyi-$ver-portable-win64.zip" >> $env:GITHUB_ENV
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-portable
+          path: Xieyi-*-portable-win64.zip
+          if-no-files-found: error
+
+  # ── Linux ──────────────────────────────────────────────────────────
+  #
+  # 产出：
+  #   1. .deb 安装包（3.5 MB，依赖系统 webkit2gtk）
+  #   2. 便携 zip（内含 AppImage + data/ + models/）
+  #
+  # AppImage 自带 webkit2gtk，约 107 MB —— 这是它的设计目标
+  # （换台机器也能跑），不是我们塞了多余东西。
+  linux:
+    name: Linux x64
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libxdo-dev \
+            libssl-dev
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: npm ci
+
+      - name: Build deb + AppImage
+        run: npx tauri build --bundles deb,appimage
+
+      - name: Assemble portable zip
+        run: |
+          VER=$(jq -r .version src-tauri/tauri.conf.json)
+          DIR="Xieyi-$VER-linux-x64"
+          mkdir -p "$DIR/data" "$DIR/models"
+          # AppImage 的「程序目录」是只读挂载点，真实位置由 $APPIMAGE 提供；
+          # data/ 放在 AppImage 同级目录即可（代码里会读 $APPIMAGE 找它）。
+          cp src-tauri/target/release/bundle/appimage/*.AppImage "$DIR/Xieyi.AppImage"
+          touch "$DIR/data/.keep" "$DIR/models/.keep"
+          chmod +x "$DIR/Xieyi.AppImage"
+          zip -r "Xieyi-$VER-portable-linux-x64.zip" "$DIR"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-deb
+          path: src-tauri/target/release/bundle/deb/*.deb
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-portable
+          path: Xieyi-*-portable-linux-x64.zip
+          if-no-files-found: error
+
+  # ── macOS ──────────────────────────────────────────────────────────
+  #
+  # 只编译验证，**不产包**。
+  #
+  # 原因：没有在真机上跑过界面。CI 编译通过 ≠ 能用，
+  # 在没有人工验证之前不出安装包，避免误导用户。
+  # 等到有人实际验证过界面，再把这里换成 tauri-action。
+  macos-check:
+    name: macOS compile check
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: npm ci
+
+      - name: Build (no bundle)
+        run: npx tauri build --target aarch64-apple-darwin --no-bundle
+
+      - name: Verify frontend is embedded
+        run: |
+          APP=$(find src-tauri/target/aarch64-apple-darwin/release -maxdepth 1 -name 'xieyi' -type f)
+          COUNT=$(strings "$APP" | grep -cE 'index-[A-Za-z0-9_-]+\.js' || true)
+          echo "embedded asset refs: $COUNT"
+          if [ "$COUNT" -lt 1 ]; then
+            echo "::error::前端资源没有嵌进二进制"
+            exit 1
+          fi
+
+  # ── 汇总发布 ───────────────────────────────────────────────────────
+  #
+  # 所有产物收集齐后创建 Release。分成两个 job 是因为
+  # tauri-action 只认它自己构建的产物，我们的便携 zip 是手工拼的。
+  publish:
+    name: Publish release
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh artifacts
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: |
+            artifacts/*.exe
+            artifacts/*.deb
+            artifacts/*.zip
+          body: |
+            ## 下载哪个
+
+            | 平台 | 文件 | 说明 |
+            |---|---|---|
+            | Windows | `Xieyi_*_x64-setup.exe` | 安装版，数据存 `%LOCALAPPDATA%` |
+            | Windows | `Xieyi-*-portable-win64.zip` | 便携版，解压即用，数据在 `data\` |
+            | Linux | `Xieyi_*_amd64.deb` | 安装版（3.5 MB，需系统已装 webkit2gtk） |
+            | Linux | `Xieyi-*-portable-linux-x64.zip` | 便携版（内含 AppImage，自带 webkit） |
+
+            **macOS 暂不提供安装包**：编译与单元测试通过，但界面未在真机验证。
+
+            ## 首次启动
+
+            需要自己准备 `.gguf` 模型文件，放到 `models` 目录。
+            推理引擎首次启动时按需下载（约 30 MB）。
