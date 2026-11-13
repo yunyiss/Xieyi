@@ -1,5 +1,7 @@
 mod batch;
 mod cache;
+mod download_gate;
+mod downloader;
 mod hardware;
 mod job_object;
 mod logging;
@@ -7,12 +9,14 @@ mod models;
 mod params;
 mod partial;
 mod paths;
+mod presets;
 mod prompts;
 mod quality;
 mod runtime;
 mod service;
 mod sessions;
 mod single_instance;
+mod sources;
 mod titlebar;
 mod translate;
 
@@ -431,6 +435,7 @@ pub fn run() {
             runtime::install_runtime,
             runtime::set_manual_runtime,
             runtime::discover_runtimes,
+            runtime::delete_runtime_partial,
             service::service_status,
             service::start_service,
             service::stop_service,
@@ -448,6 +453,12 @@ pub fn run() {
             service::set_gpu_layers,
             service::set_pinned,
             service::get_settings,
+            sources::get_download_source_config,
+            sources::set_download_source_config,
+            presets::list_presets,
+            presets::download_preset,
+            download_gate::cancel_download,
+            presets::delete_preset_partial,
             service::count_local_models,
             service::list_local_models,
             service::set_model_params,

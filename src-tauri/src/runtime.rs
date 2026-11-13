@@ -1,11 +1,10 @@
-use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter};
-use tokio::io::AsyncWriteExt;
 
+use crate::downloader;
 use crate::paths;
+use crate::sources;
 
 /// 固定的 llama.cpp 构建号。路由模式属于较新特性，必须 pin 版本而不是用 latest。
 pub const PINNED_VERSION: &str = "b11714";
@@ -94,6 +93,23 @@ pub struct RuntimeStatus {
     /// 界面上能直接看到"这个引擎到底是什么"。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub probe: Option<RuntimeProbe>,
+    /// 有没有**未完成**的引擎包下载残留在磁盘上（字节数）。
+    ///
+    /// ## 为什么必须有这个字段
+    ///
+    /// 引擎包下载到 `runtime/downloads/*.zip.part`。取消之后那份数据
+    /// 是**故意保留**的（下次续传要用），但它此前完全不可见：
+    ///
+    /// - 不在任何列表里
+    /// - 启动时不扫描
+    /// - 界面上没有入口
+    ///
+    /// 而 31 MB 在 90 KB/s 的国内网络下要下 5 分钟，用户很可能取消过
+    /// 好几次，磁盘上就堆了好几份半截包，而他一无所知。
+    ///
+    /// 这与模型的 `.part` 是**同一个缺陷**。模型那边上一轮已经修了
+    /// （`PresetStatus.partialBytes` + 「删除」按钮），引擎这边当时漏了。
+    pub partial_bytes: u64,
 }
 
 /// 对某个 llama-server 可执行文件做一次自检。
@@ -147,7 +163,107 @@ pub fn status(app: &AppHandle) -> RuntimeStatus {
         // 状态查询要保持轻量：每次 2.5 秒轮询都跑一次 --version 太重，
         // 自检只在"切换引擎"这种显式操作时做。
         probe: None,
+        partial_bytes: partial_bytes(app),
     }
+}
+
+/// 这个后端的引擎是否已经装在 `runtime/` 下。
+///
+/// 返回安装目录（含可执行文件），没装返回 `None`。
+///
+/// ## 为什么按目录判断，而不看配置里的 `backend`
+///
+/// 用户手动指定引擎时，配置里 `backend` 记作 `manual`，但
+/// `runtime/` 下并没有我们下载的那一份。此时仍应允许下载——
+/// 他可能想换成我们提供的 Vulkan 版。
+///
+/// 反过来，配置说装了 vulkan 但用户把目录删了，这里也应当返回
+/// `None`（允许重装），因为判断依据是**磁盘上的实际文件**。
+fn already_installed(root: &Path, backend: &str) -> Option<String> {
+    let dir = root.join(format!("llama-{PINNED_VERSION}-{backend}"));
+    find_executable(&dir).map(|_| dir.to_string_lossy().to_string())
+}
+
+/// 扫一遍 `runtime/downloads/`，累加所有未完成下载的字节数。
+///
+/// 引擎包只有一个文件名（`llama-<版本>-<后端>.zip`），所以正常情况下
+/// 最多一份残留。用累加而不是取单个，是为了容错：用户改过后端
+/// （vulkan → cuda）就会留下另一份，两份都该被算进去并清理。
+///
+/// 只累加 `.part` 后缀的文件。解压用的完整 zip 在成功后会删掉，
+/// 不该出现在这里。
+fn partial_bytes(app: &AppHandle) -> u64 {
+    let Ok(root) = paths::runtime_root(app) else {
+        return 0;
+    };
+    sum_partials_in(&root.join("downloads"))
+}
+
+/// `partial_bytes` 的纯逻辑部分：扫目录、认后缀、累加。
+///
+/// 抽出来是为了能单测——`AppHandle` 在单测里造不出来，
+/// 而"后缀判断"恰恰是这里最容易写错的地方。
+fn sum_partials_in(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|e| {
+            e.path()
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.ends_with(".part"))
+                .unwrap_or(false)
+        })
+        .filter_map(|e| e.metadata().ok())
+        .map(|m| m.len())
+        .sum()
+}
+
+/// 删掉所有未完成的引擎包下载，返回释放的字节数。
+///
+/// 与模型的「删除」入口对称：取消是"先停一下"（保留以便续传），
+/// 删除是"不要了"。没有这个入口，用户取消几次之后那些半截包
+/// 就永远躺在磁盘上，而且没有任何线索能查。
+#[tauri::command]
+pub fn delete_runtime_partial(app: AppHandle) -> Result<u64, String> {
+    // 正在下载时不许删：文件句柄还在写，删了会立刻重新长出来
+    if crate::download_gate::is_busy() {
+        return Err("请先取消正在进行的下载，再删除已下载的部分".into());
+    }
+
+    let root = paths::runtime_root(&app)?;
+    let downloads = root.join("downloads");
+    let freed = clean_partials_in(&downloads);
+
+    // downloads 空了就收掉，别留一个空目录
+    let _ = std::fs::remove_dir(&downloads);
+    Ok(freed)
+}
+
+/// `delete_runtime_partial` 的纯逻辑部分。
+///
+/// 先算字节数再删（删完就没法 `metadata` 了），删的时候 `.part` 与
+/// `.part.meta` 一起删。
+fn clean_partials_in(dir: &Path) -> u64 {
+    let freed = sum_partials_in(dir);
+
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            let is_partial = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.ends_with(".part") || n.ends_with(".part.meta"))
+                .unwrap_or(false);
+            if is_partial {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
+
+    freed
 }
 
 /// 对指定路径的 llama-server 跑一次 `--version` 自检。
@@ -271,7 +387,17 @@ fn extract_archive(path: &std::path::Path, dest: &std::path::Path) -> Result<(),
     }
 }
 
-fn asset_url(backend: &str) -> Result<String, String> {
+#[cfg(test)]
+fn asset_url_for(source: sources::Source, backend: &str) -> Result<String, String> {
+    asset_url_full(source, backend, None)
+}
+
+/// 同 [`asset_url_for`]，但允许给 `Source::Custom` 指定镜像基地址。
+fn asset_url_full(
+    source: sources::Source,
+    backend: &str,
+    custom_base: Option<&str>,
+) -> Result<String, String> {
     let v = PINNED_VERSION;
     let ext = archive_ext();
     let name = if cfg!(target_os = "windows") {
@@ -288,9 +414,16 @@ fn asset_url(backend: &str) -> Result<String, String> {
         }
     };
 
-    Ok(format!(
-        "https://github.com/ggml-org/llama.cpp/releases/download/{v}/{name}"
-    ))
+    // URL 走 sources 模块拼，这样"换源"只有一个实现点。
+    // 引擎目前只有 GitHub 一个真实来源（上游不在别处发 release），
+    // 但把拼接集中到 sources 之后，将来加镜像不用改这里。
+    sources::resolve_with(
+        source,
+        "ggml-org/llama.cpp",
+        &format!("{v}/{name}"),
+        custom_base,
+    )
+    .ok_or_else(|| "无法构造引擎下载地址".to_string())
 }
 
 fn emit(app: &AppHandle, stage: &str, downloaded: u64, total: u64) {
@@ -339,9 +472,39 @@ pub fn runtime_status(app: AppHandle) -> RuntimeStatus {
 
 #[tauri::command]
 pub async fn install_runtime(app: AppHandle, backend: String) -> Result<RuntimeStatus, String> {
-    let url = asset_url(&backend)?;
+    // 引擎目前只有 GitHub 一个真实来源（上游不在别处发 release），
+    // 但走 candidates + download_from_sources 之后，将来加镜像
+    // 只需要在 sources.rs 里补一个源，这里零改动。
+    let custom = sources::custom_mirror(&app);
+    let urls: Vec<String> = sources::candidates_for(&app, sources::Kind::Engine)
+        .into_iter()
+        .filter_map(|src| asset_url_full(src, &backend, custom.as_deref()).ok())
+        .collect();
+    if urls.is_empty() {
+        return Err("没有可用的引擎下载源".into());
+    }
     let root = paths::runtime_root(&app)?;
     let downloads = root.join("downloads");
+
+    /*
+     * **已经装过同一个后端就不要重下。**
+     *
+     * 用户实测：装好引擎之后引导层里那个「下载推理引擎…」按钮还在，
+     * 再点一次会重新下 31 MB —— 国内 90 KB/s 要等 5 分钟，白等。
+     *
+     * 判据是「安装目录里有可执行文件」而不是配置里的 `backend` 字段：
+     * 用户手动指定引擎时 `backend` 记作 `manual`，此时 runtime 目录
+     * 里并没有我们装的那一份，仍然应该允许下载。所以直接查目录。
+     *
+     * 换后端（vulkan → cuda）时这一层自然放行：路径按 backend 拼接。
+     */
+    if let Some(existing) = already_installed(&root, &backend) {
+        return Err(format!(
+            "这个后端（{backend}）已经装好了：{existing}\n\
+             如需重新安装，先删除该目录再试。"
+        ));
+    }
+
     paths::ensure(&downloads)?;
 
     let archive_path = downloads.join(format!(
@@ -349,55 +512,58 @@ pub async fn install_runtime(app: AppHandle, backend: String) -> Result<RuntimeS
         archive_ext()
     ));
 
-    // 下载
+    // 下载 + 校验：走通用下载器（断点续传、流式哈希）
+    //
+    // 早先这里是内联的下载循环，哈希用 `fs::read` 整包读进内存。
+    // 31 MB 的运行时包还能接受，但模型动辄几个 GB，那套写法不能复用。
+    // 统一走 downloader 之后：续传、限流进度、流式校验都只有一份实现。
+    //
+    // ## 为什么现在要能取消
+    //
+    // 早先这里传 `cancel: None`，理由是「31 MB 几秒就完，不值得做取消」。
+    // 那个前提是错的：2026-11-14 实测国内加速代理只有 **约 90 KB/s**，
+    // 30.8 MB 要下 **5 分钟**。而引导层里用户没有别的出路——要么干等，
+    // 要么关掉窗口。关窗口后 `.part` 会留在磁盘上，界面上又看不见。
+    //
+    // 现在与预设下载共用同一个通道和取消标志（`download_gate`）。
+    let gate = crate::download_gate::Gate::acquire()
+        .ok_or_else(|| "已有下载在进行，请等它完成或先取消".to_string())?;
+
     emit(&app, "downloading", 0, 0);
-    let resp = reqwest::get(&url)
-        .await
-        .map_err(|e| format!("请求下载地址失败: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!(
-            "下载失败，HTTP {}。可尝试更换网络或手动放置运行时。",
-            resp.status()
-        ));
-    }
-    let total = resp.content_length().unwrap_or(0);
+    let app_for_progress = app.clone();
+    let result = downloader::download_from_sources(
+        &urls,
+        &archive_path,
+        expected_sha256(&backend),
+        Some(gate.flag()),
+        |p| {
+            emit(&app_for_progress, "downloading", p.downloaded, p.total);
+        },
+    )
+    .await;
 
-    let mut file = tokio::fs::File::create(&archive_path)
-        .await
-        .map_err(|e| format!("创建下载文件失败: {e}"))?;
-    let mut stream = resp.bytes_stream();
-    let mut downloaded: u64 = 0;
-    let mut last_emit = std::time::Instant::now();
-
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("下载中断: {e}"))?;
-        file.write_all(&chunk)
-            .await
-            .map_err(|e| format!("写入文件失败: {e}"))?;
-        downloaded += chunk.len() as u64;
-
-        if last_emit.elapsed().as_millis() > 250 {
-            emit(&app, "downloading", downloaded, total);
-            last_emit = std::time::Instant::now();
+    let result = match result {
+        Ok(done) => done,
+        // 取消不是失败：不发 failed 阶段（界面会弹红字），
+        // `install_runtime` 的命令返回值仍是 Err，但文案是中性的。
+        Err(downloader::DownloadError::Cancelled) => {
+            emit(&app, "cancelled", 0, 0);
+            return Err("已取消下载。已下载的部分保留，下次会继续".into());
         }
-    }
-    file.flush().await.map_err(|e| e.to_string())?;
-    emit(&app, "downloading", downloaded, total);
+        Err(e) => return Err(e.to_string()),
+    };
 
-    // 校验
     emit(&app, "verifying", 0, 0);
-    let bytes = std::fs::read(&archive_path).map_err(|e| e.to_string())?;
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    let actual = format!("{:x}", hasher.finalize());
-    if let Some(expected) = expected_sha256(&backend)
-        && actual != expected
-    {
-        let _ = std::fs::remove_file(&archive_path);
-        return Err(format!(
-            "下载包校验失败：期望 {expected}，实际 {actual}。文件已删除。"
-        ));
-    }
+    // 下载器已算过哈希并校验过；这里只留一行日志便于事后核对
+    crate::logging::info(
+        "runtime",
+        format!(
+            "引擎包下载完成 {} 字节{}，sha256={}",
+            result.bytes,
+            if result.resumed { "（续传）" } else { "" },
+            result.sha256
+        ),
+    );
 
     // 解压
     emit(&app, "extracting", 0, 0);
@@ -406,7 +572,7 @@ pub async fn install_runtime(app: AppHandle, backend: String) -> Result<RuntimeS
         let _ = std::fs::remove_dir_all(&dest);
     }
     paths::ensure(&dest)?;
-    extract_archive(&archive_path, &dest)?;
+    extract_archive(&result.path, &dest)?;
 
     let exe = find_executable(&dest).ok_or("压缩包内未找到 llama-server")?;
 
@@ -437,7 +603,7 @@ pub async fn install_runtime(app: AppHandle, backend: String) -> Result<RuntimeS
         backend: backend.clone(),
         server_path: exe.to_string_lossy().to_string(),
         source: "downloaded".into(),
-        sha256: actual,
+        sha256: result.sha256.clone(),
     };
     write_info(&app, &info)?;
 
@@ -615,7 +781,8 @@ mod tests {
     /// URL 里的扩展名必须与 `archive_ext()` 一致，不能写死。
     #[test]
     fn asset_url_uses_the_right_extension() {
-        let url = asset_url("vulkan").expect("vulkan 后端应当有下载地址");
+        let url =
+            asset_url_for(sources::Source::GitHub, "vulkan").expect("vulkan 后端应当有下载地址");
         let ext = archive_ext();
 
         assert!(
@@ -638,8 +805,8 @@ mod tests {
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     #[test]
     fn different_backends_give_different_urls() {
-        let a = asset_url("vulkan").unwrap();
-        let b = asset_url("cpu").unwrap();
+        let a = asset_url_for(sources::Source::GitHub, "vulkan").unwrap();
+        let b = asset_url_for(sources::Source::GitHub, "cpu").unwrap();
         assert_ne!(a, b, "不同后端必须对应不同的下载地址");
     }
 
@@ -675,7 +842,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_ignores_backend_choice() {
-        assert_eq!(asset_url("cpu").unwrap(), asset_url("vulkan").unwrap());
+        assert_eq!(
+            asset_url_for(sources::Source::GitHub, "cpu").unwrap(),
+            asset_url_for(sources::Source::GitHub, "vulkan").unwrap()
+        );
     }
 
     #[test]
@@ -737,5 +907,135 @@ mod tests {
             "应带回版本行：{}",
             probe.detail
         );
+    }
+
+    // ───────────── 重复安装的闸门 ─────────────
+
+    /// 装过的后端必须被认出来，避免用户重复下载 31 MB。
+    ///
+    /// 用户实测：引擎装好后引导层的按钮还在，再点一次会重新下一遍。
+    /// 国内 90 KB/s 要等 5 分钟，白等。
+    ///
+    /// 变异验证：把 `already_installed` 改成恒返回 `None`，本测试失败。
+    #[test]
+    fn installed_backend_is_detected() {
+        let root = std::env::temp_dir().join("xieyi-already-installed-test");
+        let _ = std::fs::remove_dir_all(&root);
+
+        let dir = root.join(format!("llama-{PINNED_VERSION}-vulkan"));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 目录建好了但还没有可执行文件 → 不算装好（可能上次解压断了）
+        assert!(
+            already_installed(&root, "vulkan").is_none(),
+            "只有空目录不该算已安装"
+        );
+
+        // 放一个同名可执行文件
+        let exe_name = if cfg!(windows) {
+            "llama-server.exe"
+        } else {
+            "llama-server"
+        };
+        std::fs::write(dir.join(exe_name), b"fake").unwrap();
+
+        let found = already_installed(&root, "vulkan").expect("有可执行文件就该算已安装");
+        assert!(
+            found.contains("vulkan"),
+            "返回的路径要能看出是哪个后端：{found}"
+        );
+
+        // 换个后端不该误报
+        assert!(
+            already_installed(&root, "cuda").is_none(),
+            "cuda 没装过，不能被 vulkan 的存在误判"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ───────────── 未完成下载的统计与清理 ─────────────
+    //
+    // `partial_bytes` / `delete_runtime_partial` 都要 `AppHandle`，
+    // 单测里造不出来。所以把"扫目录、认后缀、累加、删除"这段逻辑
+    // 抽成纯函数单独测——它才是容易写错的地方（后缀判断、`remove_dir`
+    // 失败时的行为、`.meta` 漏删）。
+    //
+    // 真实的 AppHandle 那层只是"找到目录 → 调纯函数"，没什么可错的。
+
+    use super::{clean_partials_in, sum_partials_in};
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(tag);
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// 只算 `.part`，不算 `.part.meta`，也不算完整 zip。
+    ///
+    /// 变异验证：把后缀判断从 `ends_with(".part")` 改成
+    /// `contains(".part")`，本测试失败（`.part.meta` 也会被算进去，
+    /// 导致统计出来的字节数比实际占用多）。
+    #[test]
+    fn sum_partials_counts_only_part_files() {
+        let dir = tmp_dir("xieyi-runtime-sum-test");
+        std::fs::write(dir.join("a.zip.part"), vec![0u8; 1000]).unwrap();
+        std::fs::write(dir.join("a.zip.part.meta"), b"{\"total\":1000}").unwrap();
+        // 完整的 zip 不该被算进来
+        std::fs::write(dir.join("b.zip"), vec![0u8; 5000]).unwrap();
+        // 别的文件也不该被算
+        std::fs::write(dir.join("readme.txt"), vec![0u8; 77]).unwrap();
+
+        assert_eq!(
+            sum_partials_in(&dir),
+            1000,
+            "只该累加 .part 的字节。把 .meta 或完整 zip 算进来会虚报占用"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 目录不存在时返回 0，不 panic。
+    #[test]
+    fn sum_partials_on_missing_dir_is_zero() {
+        let dir = std::env::temp_dir().join("xieyi-runtime-nonexistent-xyz");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(sum_partials_in(&dir), 0);
+    }
+
+    /// 清理必须同时删 `.part` 与 `.part.meta`，并报告释放的字节数。
+    ///
+    /// 变异验证：只删 `.part` 不删 `.meta`，本测试失败——留着 meta 会让
+    /// 下次下载按已失效的身份尝试续传，等于白试一次。
+    #[test]
+    fn clean_partials_removes_both_and_reports_freed() {
+        let dir = tmp_dir("xieyi-runtime-clean-test");
+        std::fs::write(dir.join("a.zip.part"), vec![0u8; 2048]).unwrap();
+        std::fs::write(dir.join("a.zip.part.meta"), b"{}").unwrap();
+        // 用户手放的完整包不该被删
+        std::fs::write(dir.join("keep.zip"), vec![0u8; 10]).unwrap();
+
+        let freed = clean_partials_in(&dir);
+        assert_eq!(freed, 2048, "要报告释放了多少字节，界面才能提示用户");
+        assert!(!dir.join("a.zip.part").exists(), ".part 必须删掉");
+        assert!(
+            !dir.join("a.zip.part.meta").exists(),
+            ".part.meta 必须一起删，否则下次续传会按已失效的身份尝试"
+        );
+        assert!(
+            dir.join("keep.zip").exists(),
+            "完整的 zip 不该被当成残留删掉（可能是用户手动放的）"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 没有残留时清理是安全的：返回 0，不 panic。
+    #[test]
+    fn clean_partials_on_empty_dir_is_harmless() {
+        let dir = tmp_dir("xieyi-runtime-clean-empty-test");
+        assert_eq!(clean_partials_in(&dir), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
