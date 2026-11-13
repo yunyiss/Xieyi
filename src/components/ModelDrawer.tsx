@@ -8,7 +8,10 @@ import {
   getGlossary,
   getRuntimeStatus,
   getSettings,
+  installRuntime,
   listLocalModels,
+  onRuntimeProgress,
+  type RuntimeProgress,
   listRouterModels,
   openModelsDir,
   probeVram,
@@ -28,6 +31,9 @@ import {
   type RuntimeStatus,
   type Settings,
 } from "../lib/ipc";
+import { useTauriEvent } from "../lib/useTauriEvent";
+import { DownloadSourceSettings } from "./DownloadSourceSettings";
+import { PresetModels } from "./PresetModels";
 import { Select } from "./Select";
 import { StorageInfo } from "./StorageInfo";
 
@@ -53,10 +59,20 @@ function ctxOptions(model: LocalModel): number[] {
   return list.sort((a, b) => a - b);
 }
 
+/** 设置抽屉的三个页签。 */
+export type DrawerTab = "general" | "models" | "network";
+
 interface Props {
   open: boolean;
   onClose: () => void;
   onChanged: () => void;
+  /**
+   * 打开时默认停在哪个页签。
+   *
+   * 用于「只缺模型」的场景：翻译页的提示按钮把用户送到模型页，
+   * 而不是让他打开抽屉后再自己找一遍。
+   */
+  initialTab?: DrawerTab;
 }
 
 const btnClass =
@@ -75,18 +91,49 @@ function stateLabel(state: string): { text: string; hot: boolean } {
   return { text: "未加载", hot: false };
 }
 
+/** 引擎下载各阶段的中文说明。 */
+function stageText(stage: string): string {
+  switch (stage) {
+    case "downloading":
+      return "下载中";
+    case "verifying":
+      return "校验中";
+    case "extracting":
+      return "解压中";
+    case "checking":
+      return "自检中";
+    case "done":
+      return "完成";
+    default:
+      return "处理中";
+  }
+}
+
 /** 右侧抽屉：模型列表与目录管理。 */
-export function ModelDrawer({ open, onClose, onChanged }: Props) {
+export function ModelDrawer({
+  open,
+  onClose,
+  onChanged,
+  initialTab = "general",
+}: Props) {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [local, setLocal] = useState<LocalModel[]>([]);
   /** 当前页签：engines 类参数与模型分开，避免一页塞太多。 */
-  const [tab, setTab] = useState<"general" | "models">("general");
+  const [tab, setTab] = useState<DrawerTab>(initialTab);
   /** 当前推理引擎状态，用于「推理引擎」那一块。 */
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
   /** 引擎切换后的自检结果（成功显示版本，失败显示原因）。 */
   const [probeMsg, setProbeMsg] = useState<RuntimeProbe | null>(null);
   /** 扫描到的可切换引擎。 */
   const [discovered, setDiscovered] = useState<DiscoveredRuntime[]>([]);
+  /**
+   * 引擎下载进度。
+   *
+   * 之前设置里**没有下载入口**——「下载推理引擎」只在首启引导层有。
+   * 用户删了引擎、或引导时点了「稍后配置」，就再也找不到下载按钮，
+   * 只能手动去 GitHub 找文件。这里补上。
+   */
+  const [dlProgress, setDlProgress] = useState<RuntimeProgress | null>(null);
   const [states, setStates] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
@@ -97,8 +144,14 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
   const [engineToken, setEngineToken] = useState(0);
   /** 改过上下文后需要重启引擎才生效 */
   const [needsRestart, setNeedsRestart] = useState(false);
+  /** 「推荐模型」是否展开。**默认收起**——已下完的用户不需要它 */
+  const [presetOpen, setPresetOpen] = useState(false);
+  /** 还差几个预设没下。收起时用它透出这儿还有东西 */
+  const [presetPending, setPresetPending] = useState(0);
   /** 退场动画期间仍然渲染，动画结束后再卸载 */
   const [closing, setClosing] = useState(false);
+
+  useTauriEvent(onRuntimeProgress, setDlProgress);
 
   const refresh = useCallback(async () => {
     try {
@@ -132,6 +185,22 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
     const timer = window.setInterval(refresh, 2500);
     return () => window.clearInterval(timer);
   }, [open, refresh]);
+
+  /**
+   * 每次「打开」时应用外部指定的页签。
+   *
+   * 抽屉是常驻挂载的（只切显隐），`useState(initialTab)` 的初值只在
+   * 首次渲染生效。若不在这里同步，第二次从外部带着不同页签打开时
+   * 会停在用户上次手动切到的位置。
+   *
+   * 只在 `open` 变 true 时同步，不跟 `tab` 变化联动——否则用户手动
+   * 切页签会被立刻弹回去。
+   */
+  useEffect(() => {
+    if (open) setTab(initialTab);
+    // 故意不依赖 tab：见上面注释
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, initialTab]);
 
   // 关闭时先播 170ms 退场动画再卸载，避免"啪一下消失"。
   // 用 wasOpen 记住"真的打开过"，否则首次挂载会误播一次退场。
@@ -287,7 +356,65 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
     }
   };
 
+  /**
+   * 下载推理引擎。
+   *
+   * 设置里原本没有这个入口——「下载推理引擎」只在首启引导层有。
+   * 用户删了引擎、或引导时选了「稍后配置」，就再也找不到地方下载，
+   * 只能自己去 GitHub 翻文件。补上这个缺口。
+   *
+   * 后端会按源顺序自动尝试（加速代理 → 官方 → 用户自填镜像），
+   * 并在失败时自动回退，这里不用管源。
+   */
+  const downloadEngine = async () => {
+    setError("");
+    setBusy("download-engine");
+    setDlProgress(null);
+    try {
+      setRuntime(await installRuntime("vulkan"));
+      setDlProgress(null);
+      await restartService();
+      await refresh();
+      setEngineToken((n) => n + 1);
+      onChanged();
+    } catch (e) {
+      setDlProgress(null);
+      setError(String(e));
+    } finally {
+      setBusy("");
+    }
+  };
+
   const restart = async () => {
+    setError("");
+    setBusy("restart");
+    try {
+      await restartService();
+      await refresh();
+      setNeedsRestart(false);
+      onChanged();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  /**
+   * 预设模型下载完成后的收尾。
+   *
+   * **必须重启引擎**：`presets.ini` 是 `spawn()` 时按当时的目录扫描结果
+   * 写出来的，新下的 `.gguf` 不重启永远不会被路由看见——用户在设置里
+   * 也切不过去，因为那个列表本身就来自引擎。
+   *
+   * 与引导层里的同名逻辑相比，这里**可能打断正在使用的模型**：
+   * 抽屉随时能被打开，而某个模型可能正 warm 着。所以额外做两件事：
+   *
+   * 1. `setNeedsRestart(false)` —— 引擎刚重启过，那个「改了参数待重启」
+   *    的提示该灭掉
+   * 2. 保持 `busy` 状态，"正在重启…" 的文字让用户知道卡顿不是死机
+   */
+  const onPresetDownloaded = async () => {
     setError("");
     setBusy("restart");
     try {
@@ -436,6 +563,7 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
             [
               { key: "general", label: "通用" },
               { key: "models", label: "模型与术语" },
+              { key: "network", label: "下载源" },
             ] as const
           ).map((t) => {
             const active = tab === t.key;
@@ -536,7 +664,7 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
             <div className="flex items-baseline gap-2">
               <span className="section-title">推理引擎</span>
               <span className="text-[10px]" style={{ color: "var(--text-muted)" }}>
-                换成自己的 llama-server，不必重新下载
+                可下载官方运行时，或指定本机已有的 llama-server
               </span>
             </div>
 
@@ -559,7 +687,7 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
               <p className="m-0 mt-0.5 text-[11px]" style={{ color: "var(--text-muted)" }}>
                 {runtime?.installed
                   ? `${runtime.backend ?? "未知"} · ${runtime.version ?? "未知版本"}`
-                  : "还没配置过，可以走一遍引导"}
+                  : "尚未配置。可直接下载官方运行时，或指定本机已有的 llama-server"}
               </p>
 
               {probeMsg && (
@@ -575,13 +703,38 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
               )}
 
               <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                {/*
+                  下载入口放在最前：未配置时它是最该点的那个。
+                  已装好时降级为次要操作（用户可能想换个后端重装）。
+                */}
+                <button
+                  className={btnClass}
+                  style={
+                    runtime?.installed
+                      ? btnStyle
+                      : {
+                          background: "var(--accent-btn)",
+                          color: "var(--accent-btn-text)",
+                          border: "none",
+                        }
+                  }
+                  onClick={downloadEngine}
+                  disabled={busy !== ""}
+                  title="从官方或加速镜像下载 llama.cpp 运行时（Vulkan 版，约 31 MB）"
+                >
+                  {busy === "download-engine"
+                    ? "下载中…"
+                    : runtime?.installed
+                      ? "重新下载"
+                      : "下载引擎"}
+                </button>
                 <button
                   className={btnClass}
                   style={btnStyle}
                   onClick={pickEngineFile}
                   disabled={busy === "engine"}
                 >
-                  选择文件…
+                  指定已有文件…
                 </button>
                 <button
                   className={btnClass}
@@ -589,9 +742,42 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
                   onClick={scanEngines}
                   disabled={busy === "engine"}
                 >
-                  {busy === "engine" ? "扫描中…" : "扫描已安装"}
+                  {busy === "engine" ? "扫描中…" : "扫描本机"}
                 </button>
               </div>
+
+              {/* 下载进度：不显示的话用户只能看着按钮变灰干等 */}
+              {dlProgress && (
+                <div className="mt-2">
+                  <div
+                    className="mb-1 flex justify-between text-[10px]"
+                    style={{ color: "var(--text-muted)" }}
+                  >
+                    <span>{stageText(dlProgress.stage)}</span>
+                    <span className="tabular-nums">
+                      {dlProgress.stage === "downloading"
+                        ? `${dlProgress.percent.toFixed(1)}% · ${(
+                            dlProgress.downloaded / 1048576
+                          ).toFixed(1)} / ${(
+                            dlProgress.total / 1048576
+                          ).toFixed(1)} MB`
+                        : ""}
+                    </span>
+                  </div>
+                  <div
+                    className="h-1.5 overflow-hidden rounded-full"
+                    style={{ background: "var(--surface)" }}
+                  >
+                    <div
+                      className="h-full rounded-full transition-[width] duration-200"
+                      style={{
+                        width: `${dlProgress.percent}%`,
+                        background: "var(--brand)",
+                      }}
+                    />
+                  </div>
+                </div>
+              )}
 
               {/* 扫出来的候选：点一下就能换，省得去文件对话框翻路径 */}
               {discovered.length > 0 && (
@@ -642,10 +828,25 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
                 </ul>
               )}
             </div>
+
           </section>
           )}
 
           {tab === "general" && <StorageInfo refreshToken={engineToken} />}
+
+          {/*
+            下载源单独一页。
+
+            它是**横切关注点**：同时管引擎（GitHub）与模型（魔搭 / HF）
+            两类下载。放在「通用」或「模型」页里都不贴切，而且两页各放
+            一份会重复——自定义镜像、优先源这些设置以后还会增加。
+          */}
+          {tab === "network" && (
+            <>
+              <DownloadSourceSettings kind="engine" />
+              <DownloadSourceSettings kind="model" />
+            </>
+          )}
 
           {tab === "models" && (
           <>
@@ -703,8 +904,83 @@ export function ModelDrawer({ open, onClose, onChanged }: Props) {
             </div>
           </div>
 
+          {/* 推荐模型下载。**默认收起**。
+
+              与引导层的区别：引导层是用户第一次面对"我没有模型"，那里
+              必须直接摊开（`mode="featured"`）；设置抽屉是回过头的用户，
+              多半只是想改个参数，推荐区一直摊着反而占地方。
+
+              收起的另一半理由：三档都下完之后，这块内容对他永久无用，
+              却会一直把下面的本地模型列表往下推。
+
+              标题行做成整行可点，不是只有一个小三角——点击区域小是
+              "看起来像标题、其实是按钮"这类问题的常见来源。 */}
+          <div
+            className="mt-4 border-t pt-3"
+            style={{ borderColor: "var(--border)" }}
+          >
+            <button
+              className="btn flex w-full items-center gap-2 rounded-md px-1 py-0.5"
+              style={{ background: "transparent", color: "var(--text)" }}
+              onClick={() => setPresetOpen((v) => !v)}
+              aria-expanded={presetOpen}
+              title={presetOpen ? "收起推荐模型" : "展开推荐模型"}
+            >
+              <span
+                aria-hidden
+                style={{
+                  display: "inline-block",
+                  width: 0,
+                  height: 0,
+                  borderLeft: "3.5px solid transparent",
+                  borderRight: "3.5px solid transparent",
+                  borderTop: presetOpen ? "none" : "4px solid currentColor",
+                  borderBottom: presetOpen ? "4px solid currentColor" : "none",
+                  opacity: 0.5,
+                }}
+              />
+              <span className="section-title">推荐模型</span>
+              <span
+                className="text-[10px]"
+                style={{ color: "var(--text-muted)" }}
+              >
+                已实测可用
+              </span>
+              {/* 收起时把"还有几个没下"透出来，别让人忘了这儿有东西 */}
+              {!presetOpen && (
+                <span
+                  className="ml-auto text-[10px]"
+                  style={{ color: "var(--text-muted)" }}
+                >
+                  {presetPending > 0 ? `${presetPending} 个未下载` : "全部已下载"}
+                </span>
+              )}
+            </button>
+
+            {/*
+              **始终挂载**，只用 CSS 隐藏。
+
+              早先写成条件渲染（`presetOpen && <PresetModels …/>`），
+              结果收起时组件根本没挂载——它就没机会把「还有几个没下」
+              报上来，标题行右侧那个「N 个未下载」永远是空的。
+
+              挂载着不展开的代价很小：它只查一次 list_presets 并订阅
+              进度事件，都是已有的开销。
+            */}
+            <div
+              className="mt-2"
+              style={{ display: presetOpen ? undefined : "none" }}
+            >
+              <PresetModels
+                mode="full"
+                onDownloaded={() => void onPresetDownloaded()}
+                onPendingChange={setPresetPending}
+              />
+            </div>
+          </div>
+
           {/* 模型列表（单列） */}
-          <div className="mb-1 flex items-center gap-2">
+          <div className="mb-1 mt-4 flex items-center gap-2">
             <span className="text-[11px]" style={{ color: "var(--text-muted)" }}>
               共 {local.length} 个模型
             </span>

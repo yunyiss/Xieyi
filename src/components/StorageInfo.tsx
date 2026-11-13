@@ -258,12 +258,19 @@ function TranslateCache({ refreshToken = 0 }: { refreshToken?: number }) {
 
   return (
     <div className="mt-3">
-      <div className="mb-1 flex items-baseline gap-2">
-        <span className="section-title">批量翻译缓存</span>
-        <span className="text-[10px]" style={{ color: "var(--text-muted)" }}>
-          批量翻过的段落重跑时直接复用；翻译页的临时译文不入此
-        </span>
-      </div>
+      {/*
+        标题与说明分两行。
+        早先两者放在一个 `flex items-baseline` 里，说明文字太长被挤，
+        末尾的单字（"存"）掉到第二行，看起来像排版事故。
+        标题是分组标识、说明是补充信息，本来就该分行。
+      */}
+      <div className="section-title mb-0.5">批量翻译缓存</div>
+      <p
+        className="m-0 mb-1.5 text-[10px] leading-relaxed"
+        style={{ color: "var(--text-muted)" }}
+      >
+        批量翻过的段落重跑时直接复用；翻译页的临时译文不写入此处。
+      </p>
 
       <div
         className="rounded-[10px] border p-2.5 text-[11px]"
