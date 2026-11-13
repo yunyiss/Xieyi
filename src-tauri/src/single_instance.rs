@@ -260,10 +260,10 @@ mod unix_impl {
             }
             // comm 是完整路径；解析成规范形式再比，避免 /private/var
             // 与 /var 这类符号链接差异导致漏判
-            if let Ok(target) = std::fs::canonicalize(comm.trim()) {
-                if target == own {
-                    return Some(pid);
-                }
+            if let Ok(target) = std::fs::canonicalize(comm.trim())
+                && target == own
+            {
+                return Some(pid);
             }
         }
         None
@@ -294,7 +294,7 @@ mod unix_impl {
     /// 手写 FFI 更划算——和本文件其它地方同一个思路。
     #[cfg(target_os = "macos")]
     mod macos {
-        use std::ffi::c_void;
+        use std::ffi::{c_char, c_void};
 
         /// `NSApplicationActivationOptions`：同时激活所有窗口
         const ACTIVATE_ALL_WINDOWS: usize = 1 << 0;
@@ -304,8 +304,11 @@ mod unix_impl {
 
         #[link(name = "objc")]
         unsafe extern "C" {
-            fn objc_getClass(name: *const u8) -> *mut c_void;
-            fn sel_registerName(name: *const u8) -> *mut c_void;
+            // 参数是 C 字符串。写成 `*const c_char` 而不是 `*const u8`：
+            // `c"..."` 的 `as_ptr()` 返回的正是 `*const c_char`
+            // （macOS 上 `c_char` 是 `i8`），用 `u8` 会类型不匹配。
+            fn objc_getClass(name: *const c_char) -> *mut c_void;
+            fn sel_registerName(name: *const c_char) -> *mut c_void;
             fn objc_msgSend();
         }
 
@@ -324,20 +327,20 @@ mod unix_impl {
             // Objective-C 声明一致。对象生命周期由 autorelease pool 之外的
             // 全局缓存管理（NSRunningApplication 是单例表），我们只读不持有。
             unsafe {
-                let cls = objc_getClass(b"NSRunningApplication ".as_ptr());
+                let cls = objc_getClass(c"NSRunningApplication".as_ptr());
                 if cls.is_null() {
                     return Err("找不到 NSRunningApplication 类".into());
                 }
 
                 let sel_app =
-                    sel_registerName(b"runningApplicationWithProcessIdentifier: ".as_ptr());
+                    sel_registerName(c"runningApplicationWithProcessIdentifier:".as_ptr());
                 let msg_class: MsgSendClassId = std::mem::transmute(objc_msgSend as *const ());
                 let app = msg_class(cls, sel_app, pid as i32);
                 if app.is_null() {
                     return Err(format!("PID {pid} 没有对应的 NSRunningApplication"));
                 }
 
-                let sel_activate = sel_registerName(b"activateWithOptions: ".as_ptr());
+                let sel_activate = sel_registerName(c"activateWithOptions:".as_ptr());
                 let msg_activate: MsgSendActivate = std::mem::transmute(objc_msgSend as *const ());
                 let ok = msg_activate(app, sel_activate, ACTIVATE_ALL_WINDOWS);
                 if ok == 0 {
@@ -451,8 +454,9 @@ mod unix_impl {
             fn open() -> Result<Self, String> {
                 // 先试 RTLD_NOLOAD：如果 GTK/WebKit 已经把 X11 加载进进程，
                 // 直接复用，避免重复初始化
-                for name in ["libX11.so.6 ", "libX11.so "] {
-                    let cname = name.as_ptr() as *const c_char;
+                for name in [c"libX11.so.6", c"libX11.so"] {
+                    // c"..." 的 as_ptr() 已经是 *const c_char
+                    let cname = name.as_ptr();
                     let h = unsafe { dlopen(cname, RTLD_LAZY | RTLD_NOLOAD) };
                     if !h.is_null() {
                         return Ok(Self { handle: h });

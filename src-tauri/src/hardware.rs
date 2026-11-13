@@ -30,7 +30,16 @@
 //! 3. `None` → 上层退化成全 GPU 层
 
 use std::path::Path;
-#[cfg(any(target_os = "windows", target_os = "linux"))]
+// `Command` 在三个平台都用得到：
+//
+// - `query_list_devices`（`--list-devices`）**无条件**使用它——
+//   Metal / ROCm / Vulkan 都靠这条路径拿显存
+// - `query_nvidia_smi` 只在 Windows / Linux 有
+//
+// 早期这里挂过 `#[cfg(any(windows, linux))]`，那时只有 `nvidia-smi`
+// 会用 `Command`，挂 cfg 是对的。后来加了 `--list-devices` 却没同步
+// 放宽 cfg，于是 **macOS 上编译直接失败**（`cannot find type Command`）。
+// 因为本地只在 Windows 开发、CI 也没跑过 macOS，这个错误潜伏了很久。
 use std::process::Command;
 
 /// 查询当前空闲显存（MB）。拿不到时返回 `None`，上层会退化成「全 GPU 层」。
