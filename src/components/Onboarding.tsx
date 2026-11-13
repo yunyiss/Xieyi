@@ -4,6 +4,8 @@ import {
   discoverRuntimes,
   getAppInfo,
   getRuntimeStatus,
+  cancelDownload,
+  deleteRuntimePartial,
   installRuntime,
   listRouterModels,
   onRuntimeProgress,
@@ -17,6 +19,7 @@ import {
 } from "../lib/ipc";
 import { useTauriEvent } from "../lib/useTauriEvent";
 import { computeReadiness } from "../lib/readiness";
+import { formatBytes, PresetModels } from "./PresetModels";
 
 /**
  * 首次启动引导。
@@ -145,7 +148,59 @@ export function Onboarding({ onDone, onChanged }: Props) {
   const [scanning, setScanning] = useState(false);
   const [progress, setProgress] = useState<RuntimeProgress | null>(null);
   const [busy, setBusy] = useState("");
-  const [error, setError] = useState("");
+  /**
+   * 底部浮条。
+   *
+   * ## 为什么要分 kind 和自动消失
+   *
+   * 早先这里只有一个 `error: string`，问题有三：
+   *
+   * 1. **不会消失**。只有下一次操作开始时才被 `setError("")` 清掉，
+   *    所以用户取消下载后那句「已取消下载…」会一直挂在屏幕上。
+   * 2. **取消被渲染成红色**。取消不是错误，是用户主动做的正常操作；
+   *    后端专门为它加了 `cancelled` 阶段不报红字，前端却又把它染红了。
+   * 3. 没有替换语义：两条提示同时来，后一条覆盖前一条，用户只看到一半。
+   *
+   * 现在用 kind 区分中性/错误，并统一自动消失。
+   */
+  const [notice, setNotice] = useState<{ kind: "info" | "error"; text: string } | null>(null);
+  /** 自动消失的定时器。新提示到来时清掉旧的，避免前一条把后一条提前关掉。 */
+  const noticeTimer = useRef<number | null>(null);
+
+  /**
+   * 显示一条浮条，几秒后自动消失。
+   *
+   * 错误停留久一点（用户需要读），中性提示短一些。
+   */
+  const showNotice = useCallback((kind: "info" | "error", text: string) => {
+    if (noticeTimer.current !== null) {
+      window.clearTimeout(noticeTimer.current);
+    }
+    setNotice({ kind, text });
+    noticeTimer.current = window.setTimeout(
+      () => setNotice(null),
+      kind === "error" ? 8000 : 4000,
+    );
+  }, []);
+
+  /** 立刻收起浮条（用户点 × 时）。 */
+  const dismissNotice = useCallback(() => {
+    if (noticeTimer.current !== null) {
+      window.clearTimeout(noticeTimer.current);
+      noticeTimer.current = null;
+    }
+    setNotice(null);
+  }, []);
+
+  // 组件卸载时清掉定时器，避免在已卸载的组件上 setState
+  useEffect(
+    () => () => {
+      if (noticeTimer.current !== null) {
+        window.clearTimeout(noticeTimer.current);
+      }
+    },
+    [],
+  );
   /** 已经扫过一次就不再重复扫盘。 */
   const scannedRef = useRef(false);
   /**
@@ -213,7 +268,7 @@ export function Onboarding({ onDone, onChanged }: Props) {
         if (aliveRef.current) setScanning(false);
       }
     } catch (e) {
-      if (aliveRef.current) setError(String(e));
+      if (aliveRef.current) showNotice("error", String(e));
     }
   }, []);
 
@@ -239,7 +294,6 @@ export function Onboarding({ onDone, onChanged }: Props) {
   }, [scan]);
 
   const adoptEngine = async (path: string) => {
-    setError("");
     setBusy("engine");
     try {
       setRuntime(await setManualRuntime(path));
@@ -247,14 +301,13 @@ export function Onboarding({ onDone, onChanged }: Props) {
       await refresh();
       onChanged();
     } catch (e) {
-      setError(String(e));
+      showNotice("error", String(e));
     } finally {
       setBusy("");
     }
   };
 
   const pickEngine = async () => {
-    setError("");
     try {
       const picked = await openDialog({
         multiple: false,
@@ -265,12 +318,11 @@ export function Onboarding({ onDone, onChanged }: Props) {
       if (typeof picked !== "string") return;
       await adoptEngine(picked);
     } catch (e) {
-      setError(String(e));
+      showNotice("error", String(e));
     }
   };
 
   const download = async () => {
-    setError("");
     setBusy("download");
     try {
       setRuntime(await installRuntime("vulkan"));
@@ -279,14 +331,68 @@ export function Onboarding({ onDone, onChanged }: Props) {
       onChanged();
     } catch (e) {
       setProgress(null);
-      setError(String(e));
+      // **取消不是错误。**
+      //
+      // 后端专门为取消加了独立的 `cancelled` 阶段，就是为了不让它走
+      // 红字路径；前端这边若还染红，等于把后端的区分又抹平了。
+      // 用户主动点「取消下载」，凭什么看到一条红色警告？
+      //
+      // 判据用文案包含「已取消」——后端的取消错误串固定在
+      // `runtime.rs` 与 `presets.rs` 两处，都以「已取消下载」开头。
+      // 这不是"用字符串当控制流"的理想解，但 `installRuntime` 返回的是
+      // `String` 而非枚举，前端拿不到类型信息；真要根治得改命令签名，
+      // 那是更大的改动，记在这里而不是现在做。
+      const msg = String(e);
+      showNotice(msg.includes("已取消") ? "info" : "error", msg);
+      // **失败/取消后必须重新拉一次状态。**
+      //
+      // 否则 `runtime.partialBytes` 停在进入下载前的旧值（通常是 0），
+      // 于是「上次下载留下 xx MB」那行永远不显示——用户取消后看不到
+      // 残留，也拿不到清理入口，正是这条提示要解决的场景。
+      //
+      // 这个遗漏是在用户实测后发现的：取消了 10 多 MB，界面上什么都没
+      // 出现，再点下载又直接续上了。数据其实都在，只是状态没刷新。
+      await refresh();
+    } finally {
+      setBusy("");
+    }
+  };
+
+  /**
+   * 取消正在进行的引擎下载。
+   *
+   * 不做本地状态清理：`installRuntime` 的 Promise 会在取消后自己
+   * reject，走上面 `download()` 的 catch。这里只负责把请求发出去，
+   * 两层都改状态会打架。
+   */
+  const abortEngineDownload = async () => {
+    try {
+      await cancelDownload();
+    } catch (e) {
+      showNotice("error", String(e));
+    }
+  };
+
+  /**
+   * 清掉引擎包的下载残留。
+   *
+   * 与「取消」的区别：取消是"先停一下"（保留 `.part` 以便续传），
+   * 这个按钮是"不要了"。没有它，用户取消几次之后那些半截包会永远
+   * 占着磁盘，而且没有任何入口能查到。
+   */
+  const clearRuntimePartial = async () => {
+    setBusy("clear-partial");
+    try {
+      await deleteRuntimePartial();
+      await refresh();
+    } catch (e) {
+      showNotice("error", String(e));
     } finally {
       setBusy("");
     }
   };
 
   const pickDir = async () => {
-    setError("");
     try {
       const picked = await openDialog({
         multiple: false,
@@ -320,11 +426,34 @@ export function Onboarding({ onDone, onChanged }: Props) {
       await refresh();
       onChanged();
     } catch (e) {
-      setError(String(e));
+      showNotice("error", String(e));
     } finally {
       setBusy("");
     }
   };
+
+  /**
+   * 预设模型下载完成后的收尾。
+   *
+   * **必须重启引擎**：`presets.ini` 是在 `spawn()` 里按当时的目录扫描
+   * 结果写出来的。新下的 `.gguf` 不重启引擎永远不会被路由看见——
+   * 用户下完了，翻译页还是说「没有模型」。
+   *
+   * 与 `pickDir` 的区别是这里不动模型目录、不改配置，只让引擎重扫一遍。
+   * 引导层里这么做没有副作用：用户本来就在配置阶段，没有正在进行的翻译。
+   */
+  const onPresetDownloaded = useCallback(async () => {
+    setBusy("model");
+    try {
+      await restartService();
+      await refresh();
+      onChanged();
+    } catch (e) {
+      showNotice("error", String(e));
+    } finally {
+      setBusy("");
+    }
+  }, [refresh, onChanged]);
 
   /**
    * 判定走 `lib/readiness`，不在这里自己算。
@@ -349,6 +478,28 @@ export function Onboarding({ onDone, onChanged }: Props) {
   // 避免这里和判定又对不上。
   const engineReady = readiness.engineReady;
   const modelReady = readiness.modelReady;
+  /**
+   * 引擎是否正在下载/校验/解压。
+   *
+   * 有 `progress` 就说明流程在跑。用来决定「清理残留」要不要显示——
+   * 正在下载时显示"清理上次的残留"会让人以为点它能停掉当前这次。
+   */
+  const engineDownloading = progress !== null;
+
+  /**
+   * 我们**自己下载的那份**引擎是否已经就位。
+   *
+   * 用来决定「下载推理引擎…」按钮要不要显示。
+   *
+   * 为什么不能只看 `engineReady`：用户手动指定 `D:\llama\llama-server.exe`
+   * 时引擎也是就绪的，但 `runtime/` 目录下并没有我们下载的那一份，
+   * 此时下载按钮应当保留——他可能想换成我们提供的 Vulkan 版。
+   *
+   * `backend === "manual"` 正是"手动指定"的判据（见 `runtime.rs` 的
+   * `write_manual_info`）。
+   */
+  const hasDownloadedEngine =
+    engineReady && runtime?.backend !== "manual" && Boolean(runtime?.backend);
   /** 可以进主界面（引擎就绪即可，模型可以稍后再配） */
   const allReady = readiness.canEnter;
 
@@ -363,7 +514,7 @@ export function Onboarding({ onDone, onChanged }: Props) {
         会把整块推偏。auto 外边距 + 自身限宽在任何窗口尺寸下都居中。
       */}
       <div
-        className="onboarding-pad mx-auto flex min-h-full w-full max-w-[560px] flex-col justify-center px-6 py-6"
+        className="onboarding-pad mx-auto flex min-h-full w-full flex-col justify-center px-6 py-6"
       >
         {/* 标题 */}
         <div className="onboarding-head mb-5 text-center">
@@ -398,6 +549,21 @@ export function Onboarding({ onDone, onChanged }: Props) {
           小窗口下那个按钮可能在视口外。
         */}
         <div className="min-h-0 flex-1 overflow-y-auto">
+        {/*
+          单列 + 分步。
+
+          ## 为什么不做两列（试过一次，撤了）
+
+          引擎和模型是**依赖关系**：②需要①，没装引擎时模型卡片里什么都
+          显示不出来。把依赖画成并排，右列必然大面积空白，看起来像没做完。
+
+          UI/UX 规范里管这叫 Funnel 模式：**一次只讲一件事，用编号表达
+          顺序**。编号 ①② 本来就是线性的，布局也该是线性的。
+
+          早先也试过固定窄宽 + 居中，全屏时两侧留白太多；现在保持单列，
+          但宽度放宽（见 index.css 的 .onboarding-pad），内容更舒展。
+        */}
+        <div className="onboarding-steps">
         {/* ① 推理引擎 */}
         <section className="onboarding-card card mb-3 p-4">
           <div className="mb-3 flex items-center gap-2">
@@ -455,6 +621,30 @@ export function Onboarding({ onDone, onChanged }: Props) {
                   }}
                 />
               </div>
+              {/*
+                取消按钮。**只在真正在下载时出现**。
+
+                为什么要它：实测国内加速代理约 90 KB/s，30.8 MB 要下 5 分钟。
+                没有取消时用户只有两条路——干等，或者关掉窗口。而关窗口后
+                `.part` 会留在磁盘上（其实下次能续传），但界面上看不见，
+                用户会以为这次白下了。
+
+                校验/解压/自检阶段不给取消：那些步骤不可中断，
+                给了按钮反而让人以为点了能停。
+              */}
+              {progress.stage === "downloading" && (
+                <button
+                  className="btn mt-2 h-7 rounded-md border px-2 text-[11px]"
+                  style={{
+                    background: "transparent",
+                    borderColor: "var(--border)",
+                    color: "var(--text-muted)",
+                  }}
+                  onClick={() => void abortEngineDownload()}
+                >
+                  取消下载
+                </button>
+              )}
             </div>
           ) : (
             <>
@@ -515,15 +705,30 @@ export function Onboarding({ onDone, onChanged }: Props) {
                 >
                   指定其他引擎…
                 </button>
-                <button
-                  className="btn h-8 rounded-lg border px-3 text-[12px]"
-                  style={btnStyle}
-                  onClick={download}
-                  disabled={busy !== ""}
-                  title="从 GitHub 下载 llama.cpp 推理引擎（Vulkan 版，约 31 MB）"
-                >
-                  下载推理引擎…
-                </button>
+                {/*
+                  装好之后就不再显示「下载推理引擎…」。
+
+                  用户实测：装好引擎后这个按钮还在，再点一次会重新下
+                  31 MB —— 国内 90 KB/s 要等 5 分钟，纯属白等。
+
+                  但**手动指定**引擎时仍要保留它：那种情况下
+                  `runtime/` 里并没有我们装的那一份，用户可能想换成
+                  我们提供的 Vulkan 版（手动指定的未必是最优后端）。
+
+                  后端 `install_runtime` 里也加了同样的闸门（查安装目录），
+                  两层都拦：前端不给台阶，后端不给绕过。
+                */}
+                {!hasDownloadedEngine && (
+                  <button
+                    className="btn h-8 rounded-lg border px-3 text-[12px]"
+                    style={btnStyle}
+                    onClick={download}
+                    disabled={busy !== ""}
+                    title="从 GitHub 下载 llama.cpp 推理引擎（Vulkan 版，约 31 MB）"
+                  >
+                    下载推理引擎…
+                  </button>
+                )}
               </div>
 
               {/* 说清「下载」到底下的是什么，第一次用的人不会一头雾水 */}
@@ -544,6 +749,46 @@ export function Onboarding({ onDone, onChanged }: Props) {
                 >
                   当前：{runtime?.serverPath}
                 </p>
+              )}
+
+              {/*
+                未完成下载的残留。
+
+                引擎包下到 `runtime/downloads/*.zip.part`。取消之后那份数据
+                是**故意保留**的（下次续传要用），但它此前完全不可见：
+                不在任何列表里、启动时不扫描、界面上没有入口。
+                31 MB 在 90 KB/s 下要 5 分钟，用户可能取消过好几次，
+                磁盘上就躺着好几份半截包而他一无所知。
+
+                这与模型的 `.part` 是**同一个缺陷**。模型那边上一轮已经
+                修了（暂停态 + 删除按钮），引擎这边当时漏了。
+
+                单列一行灰字 + 一个「清理」链接，不做成红字警告：
+                残留不是错误，是"还没下完"的正常中间状态。
+              */}
+              {!engineDownloading && (runtime?.partialBytes ?? 0) > 0 && (
+                <div
+                  className="mt-2 flex items-center gap-2 border-t pt-2 text-[11px]"
+                  style={{ borderColor: "var(--border)" }}
+                >
+                  <span style={{ color: "var(--text-muted)" }}>
+                    上次下载留下 {formatBytes(runtime!.partialBytes ?? 0)}
+                    ，下次会续传
+                  </span>
+                  <button
+                    className="btn ml-auto h-6 rounded px-1.5 text-[11px]"
+                    style={{
+                      background: "transparent",
+                      border: "1px solid var(--border)",
+                      color: "var(--text-muted)",
+                    }}
+                    onClick={clearRuntimePartial}
+                    disabled={busy !== ""}
+                    title="删掉这份半截包，释放磁盘空间"
+                  >
+                    清理
+                  </button>
+                </div>
               )}
             </>
           )}
@@ -593,11 +838,24 @@ export function Onboarding({ onDone, onChanged }: Props) {
           </div>
 
           {!engineReady ? (
+            /*
+              空状态给**说明**就够了，不给按钮。
+
+              曾经按 UI/UX 规范的 Empty State 条目（"Show helpful message
+              and action"）在这里加过一个「回到第 ① 步」按钮，用户反馈
+              「这是干什么用的，我没看懂」——因为：
+
+              引导层总共两张卡，引擎卡**就在上面**，往上滑一眼就看到。
+              一个滚到视线内已有内容的按钮，只会让人怀疑自己漏了什么。
+
+              那条规范针对的是整屏空白、用户不知道从哪开始的场景，
+              这里不适用。**规范要按场景用，不能照抄。**
+            */
             <p
               className="m-0 text-[12px]"
               style={{ color: "var(--text-muted)" }}
             >
-              请先完成推理引擎配置
+              请先完成上面的推理引擎配置
             </p>
           ) : (
             <>
@@ -679,41 +937,93 @@ export function Onboarding({ onDone, onChanged }: Props) {
                   </span>
                 )}
               </div>
-              <p
-                className="m-0 mt-2 text-[11px]"
-                style={{ color: "var(--text-muted)" }}
-              >
-                支持将 .gguf 文件直接拖入窗口
-              </p>
+              {/*
+                这里**不能**写"支持拖入窗口"。
+
+                引导层没有 drop 处理——拖入只发生在主界面（Translate /
+                Batch 页监听 Tauri 的 drag-drop 事件）。早先这句文案是从
+                主界面照搬过来的，用户在引导层试了一次拖入，什么都没发生。
+
+                宣传一个此时不存在的功能，比不宣传更糟：用户会以为
+                "这软件坏了"。真要支持，得在这层加监听，那是另一件事。
+              */}
               {/* 「没找到 .gguf」的提示已合并到标题右侧这一处，
                   不再在这里另起一行把卡片撑高。 */}
+
+              {/*
+                推荐模型：用户第一次面对「我没有模型」，此刻给下载最有用。
+
+                这里 `onDownloaded` 让上层重启引擎——`presets.ini` 是在
+                引擎启动时按当时的目录扫描结果写出来的，不重启的话新下的
+                `.gguf` 永远不会被路由看见，用户下完还是用不了。
+              */}
+              <div
+                className="mt-3 border-t pt-3"
+                style={{ borderColor: "var(--border)" }}
+              >
+                <div className="mb-2 flex items-baseline gap-2">
+                  <span className="section-title">推荐模型</span>
+                  <span
+                    className="text-[10px]"
+                    style={{ color: "var(--text-muted)" }}
+                  >
+                    已实测可用
+                  </span>
+                </div>
+                <PresetModels mode="featured" onDownloaded={() => void onPresetDownloaded()} />
+              </div>
             </>
           )}
         </section>
         </div>
+        </div>
 
         {/*
-          错误提示做成不占布局的浮条。
-          原来它插在按钮上方，一出现就把「开始使用」往下推，
-          整个引导层的视觉重心跟着跳。
+          底部浮条：错误与中性提示共用。
+
+          做成不占布局的浮条（原来插在按钮上方，一出现就把「开始使用」
+          往下推，视觉重心跟着跳）。
+
+          ## 为什么分两种颜色
+          
+          取消下载不是错误。后端已经用独立的 `cancelled` 阶段把两者分开，
+          前端若一律染红，等于把那个区分抹平——用户主动点了取消，
+          却看到一条红色警告，观感是"我做错了什么"。
+
+          ## 为什么能手动关
+          
+          自动消失是 4 秒（提示）/ 8 秒（错误），但用户可能想立刻清掉
+          腾出视线。`pointer-events-auto` 只在浮条本身上开，外层保持
+          none，这样它不会挡住下面的按钮。
         */}
-        {error && (
+        {notice && (
           <div
             className="pointer-events-none fixed inset-x-0 bottom-6 z-50 flex justify-center px-4"
-            role="alert"
+            role={notice.kind === "error" ? "alert" : "status"}
           >
-            <p
-              className="m-0 rounded-lg border px-3 py-2 text-[12px]"
+            <div
+              className="pointer-events-auto flex items-center gap-2 rounded-lg border px-3 py-2 text-[12px]"
               style={{
                 background: "var(--surface)",
-                borderColor: "var(--danger)",
-                color: "var(--danger)",
+                borderColor:
+                  notice.kind === "error" ? "var(--danger)" : "var(--border-strong)",
+                color:
+                  notice.kind === "error" ? "var(--danger)" : "var(--text-muted)",
                 boxShadow: "var(--shadow-2)",
                 maxWidth: 520,
               }}
             >
-              {error}
-            </p>
+              <span>{notice.text}</span>
+              <button
+                className="btn -mr-1 shrink-0 rounded px-1 text-[14px] leading-none"
+                style={{ background: "transparent", color: "inherit", opacity: 0.6 }}
+                onClick={dismissNotice}
+                title="关闭"
+                aria-label="关闭提示"
+              >
+                ×
+              </button>
+            </div>
           </div>
         )}
 

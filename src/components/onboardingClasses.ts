@@ -14,4 +14,6 @@ export const ONBOARDING_CLASSES = [
   "onboarding-title",
   "onboarding-subtitle",
   "onboarding-card",
+  /** 分步容器：恒单列。宽屏只放宽宽度，不改布局。 */
+  "onboarding-steps",
 ] as const;

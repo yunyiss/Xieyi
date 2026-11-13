@@ -33,6 +33,21 @@ export interface RuntimeStatus {
   modelsDir: string;
   /** 自检结果；只有显式「切换引擎」时才返回 */
   probe?: RuntimeProbe | null;
+  /**
+   * 未完成的引擎包下载残留在磁盘上的字节数。0 表示没有残留。
+   *
+   * 引擎包下到 `runtime/downloads/*.zip.part`。取消之后那份数据是
+   * **故意保留**的（下次续传要用），但它此前完全不可见——不在任何列表
+   * 里、启动时不扫描、界面上没有入口。用户取消过几次，磁盘上就静静
+   * 躺着几份半截包。
+   *
+   * 与模型 `.part` 是同一个缺陷；模型那边有 `PresetStatus.partialBytes`
+   * 和「删除」按钮，引擎这边靠这个字段补齐。
+   *
+   * 标为可选：后端始终返回它，但前端也应当能在与旧后端配对时安全工作
+   * （读取处一律 ）。
+   */
+  partialBytes?: number;
 }
 
 /** 对某个 llama-server 的自检结果。 */
@@ -248,6 +263,13 @@ export const installRuntime = (backend: string) =>
 export const setManualRuntime = (serverPath: string) =>
   invoke<RuntimeStatus>("set_manual_runtime", { serverPath });
 
+/**
+ * 删掉未完成的引擎包下载，返回释放的字节数。
+ *
+ * 与「取消」的区别：取消是「先停一下」保留数据以便续传；删除是「不要了」。
+ * 没有这个入口，取消几次之后那些半截包会永远占着磁盘且无从察觉。
+ */
+export const deleteRuntimePartial = () => invoke<number>("delete_runtime_partial");
 /** 扫一遍磁盘，找现成可切换的 llama-server。 */
 export const discoverRuntimes = () =>
   invoke<DiscoveredRuntime[]>("discover_runtimes");

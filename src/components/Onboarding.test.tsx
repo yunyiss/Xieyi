@@ -16,6 +16,43 @@ import { Onboarding } from "./Onboarding";
  * 进度条百分比动画（纯展示）。
  */
 
+/**
+ * 剥掉所有 `@media { ... }` 块，只留媒体查询之外的内容。
+ *
+ * 用于判断"某个类是否有基础定义，而不是只写在媒体查询里"。
+ * 手写配对括号扫描而不是正则：媒体查询里还有嵌套的 `{}`，
+ * 一个 `[^}]*` 贪婪匹配很容易把后面的规则一起吃掉。
+ */
+function stripMediaBlocks(css: string): string {
+  let out = "";
+  let i = 0;
+  while (i < css.length) {
+    const m = css.indexOf("@media", i);
+    if (m === -1) {
+      out += css.slice(i);
+      break;
+    }
+    out += css.slice(i, m);
+    // 从 @media 往后找第一个 `{`，再配对到它的闭括号
+    const open = css.indexOf("{", m);
+    if (open === -1) break;
+    let depth = 0;
+    let j = open;
+    for (; j < css.length; j += 1) {
+      if (css[j] === "{") depth += 1;
+      else if (css[j] === "}") {
+        depth -= 1;
+        if (depth === 0) {
+          j += 1;
+          break;
+        }
+      }
+    }
+    i = j;
+  }
+  return out;
+}
+
 vi.mock("../lib/ipc", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/ipc")>();
   return {
@@ -45,6 +82,7 @@ vi.mock("../lib/ipc", async (importOriginal) => {
       backend: "vulkan",
       serverPath: "D:/runtime/llama-server.exe",
       modelsDir: "D:/models",
+      partialBytes: 0,
     })),
     setManualRuntime: vi.fn(async () => ({
       installed: true,
@@ -52,6 +90,7 @@ vi.mock("../lib/ipc", async (importOriginal) => {
       backend: "manual",
       serverPath: "D:/llama/llama-server.exe",
       modelsDir: "D:/models",
+      partialBytes: 0,
     })),
     setModelsDir: vi.fn(async () => "D:/models"),
     restartService: vi.fn(async () => ({
@@ -59,8 +98,16 @@ vi.mock("../lib/ipc", async (importOriginal) => {
       port: 8080,
       loaded: [],
       modelsDir: "D:/models",
+      partialBytes: 0,
     })),
     onRuntimeProgress: vi.fn(async () => () => {}),
+    cancelDownload: vi.fn(async () => {}),
+    deleteRuntimePartial: vi.fn(async () => 0),
+    // 推荐模型下载（`PresetModels` 子组件会调）
+    listPresets: vi.fn(async () => []),
+    downloadPreset: vi.fn(async () => "D:/models/x.gguf"),
+    deletePresetPartial: vi.fn(async () => 0),
+    onPresetProgress: vi.fn(async () => () => {}),
   };
 });
 
@@ -125,6 +172,79 @@ describe("Onboarding · 自适应类名一致性", () => {
     ).toEqual([]);
   });
 
+  /**
+   * 容器类必须有**媒体查询之外的基础定义**。
+   *
+   * ## 为什么只查容器类（上一版是假测试）
+   *
+   * 上一版对 `ONBOARDING_CLASSES` 全体套用这条判据，结果五个类报错——
+   * 但那是**误报**：`onboarding-head` / `-logo` / `-title` / `-subtitle`
+   * / `-card` 的基础样式本来就在 JSX 的 Tailwind 类里，`onboarding-*`
+   * 只负责在窄窗下**覆盖**几个值（缩小字号、收紧间距）。那套设计是对的。
+   *
+   * 真正需要基础定义的只有**布局容器**：它们的默认值不能靠 JSX 里的
+   * Tailwind 类表达，否则宽屏媒体查询一覆盖，窄屏就没有可回退的原始值。
+   *
+   * ## 这条测试抓到的真实问题
+   *
+   * `onboarding-grid` 最初只写了宽屏的 `display: grid`，没有基础
+   * `display: block`。窄窗下它没有任何样式——靠浏览器的 `div` 默认
+   * 行为侥幸正确，但那不是设计，是巧合。
+   *
+   * 变异验证：删掉 `.onboarding-grid { display: block; }` 整块，
+   * 本测试失败（而"类名存在"那条仍然通过）。
+   */
+  it("布局容器类有媒体查询之外的基础定义", async () => {
+    const css = readFileSync("src/index.css", "utf-8");
+    const withoutMedia = stripMediaBlocks(css);
+
+    // 只列**布局容器**：基础样式必须写在 CSS 里，不能依赖 JSX 的
+    // Tailwind 类——媒体查询覆盖后需要原始值可回退。
+    const LAYOUT_CLASSES = ["onboarding-pad", "onboarding-steps"] as const;
+
+    const missingBase = LAYOUT_CLASSES.filter(
+      (c) => !new RegExp("\\." + c + "\\s*[,{]").test(withoutMedia),
+    );
+
+    expect(
+      missingBase,
+      `这些布局类只有媒体查询里的定义、缺基础样式：${missingBase.join(", ")}`,
+    ).toEqual([]);
+  });
+
+  /**
+   * 引导层必须**始终单列**，不许再出现两列布局。
+   *
+   * ## 为什么写成测试而不只是注释
+   *
+   * 「全屏留白多」这个反馈很容易被再次理解成"应该占满宽度"，于是又去
+   * 开两列。而两列在这里是**结构性错误**：模型依赖引擎，没装引擎时
+   * 右列只有一句「请先完成推理引擎配置」，整片空白。
+   *
+   * 换句话说，这个改法看起来解决了留白，实际制造了更大的视觉空洞。
+   * 光靠注释拦不住下次的"顺手优化"，写成测试才行。
+   *
+   * 判据：`.onboarding-pad` 的宽度媒体查询里，不许出现
+   * `grid-template-columns` 或 `columns`。
+   *
+   * 变异验证：在 `@media (min-width: 720px)` 里给 `.onboarding-steps`
+   * 加一条 `grid-template-columns: 1fr 1fr`，本测试失败。
+   */
+  it("引导层保持单列，宽屏只放宽宽度", () => {
+    const css = readFileSync("src/index.css", "utf-8");
+
+    // 引导层相关规则里不该有任何分列声明
+    const onboardingBlocks = css.match(/\.onboarding-[a-z]+\s*\{[^}]*\}/g) ?? [];
+    const offenders = onboardingBlocks.filter((block) =>
+      /grid-template-columns|column-count|flex-direction:\s*row/.test(block),
+    );
+
+    expect(
+      offenders,
+      `引导层不该分列。模型依赖引擎，并排会让右列整片空白：\n${offenders.join("\n")}`,
+    ).toEqual([]);
+  });
+
   it("CSS 里定义的每个 onboarding-* 类都真的被 JSX 用到了", async () => {
     // 反方向对账。上面那条只保证「清单里的类在 CSS 中存在」，
     // 抓不出「CSS 里写了样式、但 JSX 压根没用这个类名」。
@@ -162,6 +282,7 @@ describe("Onboarding", () => {
       backend: null,
       serverPath: null,
       modelsDir: "D:/models",
+      partialBytes: 0,
     });
     vi.mocked(ipc.discoverRuntimes).mockResolvedValue([]);
     vi.mocked(ipc.listRouterModels).mockResolvedValue([]);
@@ -245,6 +366,353 @@ describe("Onboarding", () => {
     });
   });
 
+  /**
+   * **装好之后就不要再显示「下载推理引擎…」。**
+   *
+   * 用户实测：引擎装好之后那个按钮还在，再点一次会重新下 31 MB ——
+   * 国内 90 KB/s 要等 5 分钟，纯属白等。
+   *
+   * 变异验证：把 JSX 里的 `{!hasDownloadedEngine && (...)}` 改回无条件
+   * 渲染，本测试失败。
+   */
+  it("引擎装好后不再显示下载按钮", async () => {
+    vi.mocked(ipc.getRuntimeStatus).mockResolvedValue({
+      installed: true,
+      version: "b11714",
+      backend: "vulkan",
+      serverPath: "D:/runtime/llama-server.exe",
+      modelsDir: "D:/models",
+      partialBytes: 0,
+    } as never);
+
+    renderOnboarding();
+
+    // 等引擎卡片渲染出来
+    await screen.findByText(/b11714/);
+    expect(screen.queryByText(/下载推理引擎/)).toBeNull();
+    // 但「指定其他引擎…」要保留——用户可能想换成自己的那份
+    expect(screen.getByText(/指定其他引擎/)).toBeInTheDocument();
+  });
+
+  /**
+   * **手动指定**引擎时，下载按钮要保留。
+   *
+   * 因为那种情况下 `runtime/` 目录里并没有我们下载的那一份，
+   * 用户可能想换成我们提供的 Vulkan 版（手动指定的未必是最优后端）。
+   *
+   * 这条与上一条是一对：只看 `engineReady` 会把两种情况混为一谈，
+   * 必须按 `backend === "manual"` 区分。
+   *
+   * 变异验证：把 `hasDownloadedEngine` 里的
+   * `runtime?.backend !== "manual"` 去掉，本测试失败。
+   */
+  it("手动指定引擎时仍保留下载按钮", async () => {
+    vi.mocked(ipc.getRuntimeStatus).mockResolvedValue({
+      installed: true,
+      version: "manual",
+      backend: "manual",
+      serverPath: "D:/llama/llama-server.exe",
+      modelsDir: "D:/models",
+      partialBytes: 0,
+    } as never);
+
+    renderOnboarding();
+
+    // 等状态渲染完（会显示「手动指定」）
+    await screen.findByText(/手动指定/);
+    expect(screen.getByText(/下载推理引擎/)).toBeInTheDocument();
+  });
+
+  /**
+   * 引擎下载中必须能取消。
+   *
+   * 这条锁住一个实测过的痛点：国内加速代理约 90 KB/s，30.8 MB 要下
+   * 5 分钟。早先没有取消按钮，用户只能干等或者关掉窗口——关窗口后
+   * `.part` 留在磁盘上而界面看不见，用户会以为白下了。
+   *
+   * 变异验证：把 JSX 里那段 `progress.stage === "downloading" && <button>`
+   * 删掉，本测试失败。
+   */
+  it("引擎下载中显示取消按钮，点了会调 cancelDownload", async () => {
+    const user = userEvent.setup();
+
+    // 让 installRuntime 挂住，制造「正在下载」的现场
+    let push: ((p: unknown) => void) | null = null;
+    vi.mocked(ipc.onRuntimeProgress).mockImplementation(async (cb) => {
+      push = cb as (p: unknown) => void;
+      return () => {};
+    });
+    vi.mocked(ipc.installRuntime).mockImplementation(
+      () => new Promise(() => {}), // 永不 resolve
+    );
+
+    renderOnboarding();
+    await user.click(await screen.findByText(/下载推理引擎/));
+
+    // 推一条下载中进度
+    await waitFor(() => expect(push).not.toBeNull());
+    push!({
+      stage: "downloading",
+      downloaded: 5_000_000,
+      total: 30_800_000,
+      percent: 16.2,
+    });
+
+    const cancel = await screen.findByRole("button", { name: "取消下载" });
+    await user.click(cancel);
+
+    await waitFor(() => {
+      expect(ipc.cancelDownload).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  /**
+   * 校验阶段不该有取消按钮——那些步骤不可中断，给了按钮会让人
+   * 以为点了能停。
+   */
+  it("校验阶段不显示取消按钮", async () => {
+    const user = userEvent.setup();
+    let push: ((p: unknown) => void) | null = null;
+    vi.mocked(ipc.onRuntimeProgress).mockImplementation(async (cb) => {
+      push = cb as (p: unknown) => void;
+      return () => {};
+    });
+    vi.mocked(ipc.installRuntime).mockImplementation(() => new Promise(() => {}));
+
+    renderOnboarding();
+    await user.click(await screen.findByText(/下载推理引擎/));
+
+    await waitFor(() => expect(push).not.toBeNull());
+    push!({ stage: "verifying", downloaded: 30_800_000, total: 30_800_000, percent: 100 });
+
+    // 等进度区渲染出来（有「校验中」字样），此时不该有取消按钮
+    await screen.findByText(/校验中/);
+    expect(screen.queryByRole("button", { name: "取消下载" })).toBeNull();
+  });
+
+  /**
+   * 引擎包有未完成下载残留时，界面上必须显示出来并能清理。
+   *
+   * 这条锁住一个和模型那边**完全对称**的缺陷：`.part` 是故意保留的
+   * （下次续传要用），但它不在任何列表里、启动时不扫描、界面上没有
+   * 入口。用户取消过几次，磁盘上就躺着好几份半截包而一无所知。
+   *
+   * 模型那边上一轮已经修了（`PresetStatus.partialBytes` + 「删除」），
+   * 引擎这边当时漏了。
+   *
+   * 变异验证：把 JSX 里 `(runtime?.partialBytes ?? 0) > 0` 那段删掉，
+   * 本测试失败。
+   */
+  it("引擎包有残留时显示大小并给出清理入口", async () => {
+    const user = userEvent.setup();
+    vi.mocked(ipc.getRuntimeStatus).mockResolvedValue({
+      installed: true,
+      version: "b11714",
+      backend: "vulkan",
+      serverPath: "D:/runtime/llama-server.exe",
+      modelsDir: "D:/models",
+      partialBytes: 12_000_000,
+    } as never);
+    vi.mocked(ipc.deleteRuntimePartial).mockResolvedValue(12_000_000);
+
+    renderOnboarding();
+
+    // 显示出残留大小（12 MB）
+    expect(await screen.findByText(/上次下载留下/)).toBeInTheDocument();
+    expect(screen.getByText(/11\.4 MB/)).toBeInTheDocument();
+
+    const clear = screen.getByRole("button", { name: "清理" });
+    await user.click(clear);
+
+    await waitFor(() => {
+      expect(ipc.deleteRuntimePartial).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  /** 没有残留时不该出现那一行——不能凭空多一条"上次下载留下 0 B"。 */
+  it("没有残留时不显示清理入口", async () => {
+    vi.mocked(ipc.getRuntimeStatus).mockResolvedValue({
+      installed: true,
+      version: "b11714",
+      backend: "vulkan",
+      serverPath: "D:/runtime/llama-server.exe",
+      modelsDir: "D:/models",
+      partialBytes: 0,
+    } as never);
+
+    renderOnboarding();
+
+    // 等引擎卡片渲染完（用引擎路径作为稳定锚点，
+    // 标题「推理引擎」四个字在小窗口下可能与其他文本合并）
+    await screen.findByText(/llama-server/);
+    expect(screen.queryByText(/上次下载留下/)).toBeNull();
+    expect(screen.queryByRole("button", { name: "清理" })).toBeNull();
+  });
+
+  /**
+   * **取消下载之后必须重新拉状态**，否则残留提示永远不出现。
+   *
+   * 这条锁住一个用户实测出来的真实缺陷：
+   *
+   * 1. 用户下载了 10 多 MB，点取消
+   * 2. 界面上什么都没出现——既没有"已取消"的残留提示，也没有清理入口
+   * 3. 再点下载，**直接续上了**（说明数据确实都在磁盘上）
+   *
+   * 根因：`download()` 的 catch 分支只 `setError`，**没调 `refresh()`**。
+   * 于是 `runtime.partialBytes` 停在进入下载前的旧值 0，那行提示的
+   * 显示条件 `(runtime?.partialBytes ?? 0) > 0` 永远不成立。
+   *
+   * 数据全在，只是界面不知道。这正是"残留不可见"那个缺陷的**第二次**
+   * 出现——第一次是后端没有这个字段，这一次是前端没刷新。
+   *
+   * 变异验证：删掉 catch 里的 `await refresh()`，本测试失败。
+   */
+  it("取消下载后会刷新状态，残留提示随即出现", async () => {
+    const user = userEvent.setup();
+
+    // 下载场景 = 还没装我们的引擎，所以 backend 必须**不是** vulkan，
+    // 否则「下载推理引擎…」按钮会按"已装"隐藏，点不到。
+    // 这里用 manual（手动指定），是真实存在的一种中间状态。
+    vi.mocked(ipc.getRuntimeStatus).mockResolvedValue({
+      installed: false,
+      version: null,
+      backend: null,
+      serverPath: null,
+      modelsDir: "D:/models",
+      partialBytes: 0,
+    } as never);
+
+    // 点下载 → 用户取消 → installRuntime reject
+    vi.mocked(ipc.installRuntime).mockRejectedValue("已取消下载");
+    vi.mocked(ipc.cancelDownload).mockResolvedValue(undefined);
+
+    renderOnboarding();
+    await screen.findByText(/下载推理引擎/);
+
+    // 在点击**之前**就排好后续返回值：取消后 refresh 会立刻拉一次，
+    // 若等到点击之后再改 mock，那次 refresh 可能已经拿到旧值。
+    vi.mocked(ipc.getRuntimeStatus).mockResolvedValue({
+      installed: true,
+      version: "b11714",
+      backend: "vulkan",
+      serverPath: "D:/runtime/llama-server.exe",
+      modelsDir: "D:/models",
+      partialBytes: 10_485_760,
+    } as never);
+
+    await user.click(screen.getByText(/下载推理引擎/));
+
+    // 关键断言：提示出现了（说明 catch 里真的重新拉了状态）
+    expect(
+      await screen.findByText(/上次下载留下/),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "清理" })).toBeInTheDocument();
+  });
+
+  /**
+   * 取消要显示成**中性提示**，不能是红色错误。
+   *
+   * 用户主动点了「取消下载」，凭什么看到红色警告？后端专门为取消加了
+   * 独立的 `cancelled` 阶段（不发 `failed`），就是为了不让它走错误路径；
+   * 前端若一律染红，等于把那个区分又抹平了。
+   *
+   * 判据：用 `role="status"`（中性）而不是 `role="alert"`（错误）。
+   *
+   * 变异验证：把 download() 里的
+   * `msg.includes("已取消") ? "info" : "error"` 改成恒为 `"error"`，
+   * 本测试失败。
+   */
+  it("取消下载显示中性提示，不报红色错误", async () => {
+    const user = userEvent.setup();
+    vi.mocked(ipc.installRuntime).mockRejectedValue(
+      "已取消下载。已下载的部分保留，下次会继续",
+    );
+
+    renderOnboarding();
+    await user.click(await screen.findByText(/下载推理引擎/));
+
+    // role=status 才是中性；role=alert 是错误
+    const status = await screen.findByRole("status");
+    expect(status).toHaveTextContent(/已取消/);
+    // 且不能同时冒出一个 alert
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  /**
+   * 浮条必须能**手动关闭**，并且会**自动消失**。
+   *
+   * 用户反馈：「取消后那句提示一直挂着呐，不消失的」。
+   * 早先只有下一次操作开始时才被清掉，所以它会一直挡在屏幕下方。
+   *
+   * 这条测手动关闭（自动消失靠定时器，测试里用假时钟会拖慢整个套件，
+   * 且 4 秒/8 秒的时长本身不是逻辑）。定时器那条在实现里保证：
+   * 新提示到来时先清旧定时器，不会出现"前一条把后一条提前关掉"。
+   */
+  it("浮条可以手动关闭", async () => {
+    const user = userEvent.setup();
+    vi.mocked(ipc.installRuntime).mockRejectedValue("磁盘空间不足");
+
+    renderOnboarding();
+    await user.click(await screen.findByText(/下载推理引擎/));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/磁盘空间不足/);
+
+    await user.click(screen.getByRole("button", { name: "关闭提示" }));
+
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  /**
+   * 「模型」卡片的空状态**不该再有**「回到第 ① 步」按钮。
+   *
+   * 曾经按 UI/UX 规范的 Empty State 条目（"Show helpful message and
+   * action"）加过它，用户反馈「这是干什么用的，我没看懂」。
+   *
+   * 原因：引导层总共两张卡，引擎卡就在上面，往上滑一眼就看到。
+   * 一个"滚到视线内已有内容"的按钮，只会让人怀疑自己漏了什么。
+   * 规范要按场景用，不能照抄。
+   *
+   * 变异验证：把那句 `请先完成上面的推理引擎配置` 旁边加回一个
+   * 「回到第 ① 步」按钮，本测试失败。
+   */
+  it("模型卡片空状态不再有「回到第 ① 步」按钮", async () => {
+    renderOnboarding();
+
+    // 引擎未配置 → 模型卡片显示空状态
+    expect(
+      await screen.findByText(/请先完成上面的推理引擎配置/),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /回到第/ })).toBeNull();
+  });
+
+  /**
+   * 引导层**不能**宣传「支持拖入 .gguf」。
+   *
+   * 拖入只发生在主界面（Translate / Batch 监听 Tauri 的 drag-drop 事件），
+   * 引导层根本没有 drop 处理。早先这句文案是从主界面照搬的，用户在引导层
+   * 试了一次拖入，什么都没发生。
+   *
+   * 宣传一个此时不存在的功能，比不宣传更糟——用户会以为软件坏了。
+   *
+   * 变异验证：把那句「支持将 .gguf 文件直接拖入窗口」加回去，
+   * 本测试失败。
+   */
+  it("引导层不宣传拖入（此时并不支持）", async () => {
+    vi.mocked(ipc.getRuntimeStatus).mockResolvedValue({
+      installed: true,
+      version: "b11714",
+      backend: "vulkan",
+      serverPath: "D:/runtime/llama-server.exe",
+      modelsDir: "D:/models",
+      partialBytes: 0,
+    } as never);
+
+    renderOnboarding();
+    await screen.findByText(/llama-server/);
+
+    expect(screen.queryByText(/拖入/)).toBeNull();
+  });
+
   it("引擎就绪但目录里没有模型时，仍然可以进主界面（按钮写「开始使用」）", async () => {
     // 这条锁住一个反复走过弯路的判定：
     //
@@ -267,6 +735,7 @@ describe("Onboarding", () => {
       backend: "vulkan",
       serverPath: "D:/runtime/llama-server.exe",
       modelsDir: "D:/Model/translate",
+      partialBytes: 0,
     });
     // 用户确实设过目录（但目录是空的）
     vi.mocked(ipc.getAppInfo).mockResolvedValue({
@@ -300,6 +769,7 @@ describe("Onboarding", () => {
       backend: null,
       serverPath: null,
       modelsDir: "D:/models",
+      partialBytes: 0,
     });
     vi.mocked(ipc.listRouterModels).mockResolvedValue([]);
 
@@ -320,6 +790,7 @@ describe("Onboarding", () => {
       backend: "vulkan",
       serverPath: "D:/runtime/llama-server.exe",
       modelsDir: "D:/Model/translate",
+      partialBytes: 0,
     });
     vi.mocked(ipc.getAppInfo).mockResolvedValue({
       os: "windows",
@@ -360,6 +831,7 @@ describe("Onboarding", () => {
       backend: "vulkan",
       serverPath: "D:/runtime/llama-server.exe",
       modelsDir: "D:/Model/translate",
+      partialBytes: 0,
     });
     let release: (v: never[]) => void = () => {};
     vi.mocked(ipc.listRouterModels).mockImplementation(
@@ -390,6 +862,7 @@ describe("Onboarding", () => {
       backend: "vulkan",
       serverPath: "D:/runtime/llama-server.exe",
       modelsDir: "D:/models",
+      partialBytes: 0,
     });
     // 让重启挂住，好在"进行中"这一刻做断言
     let finish: () => void = () => {};
@@ -468,6 +941,7 @@ describe("Onboarding", () => {
       backend: "vulkan",
       serverPath: "D:/runtime/llama-server.exe",
       modelsDir: "D:/Model/empty",
+      partialBytes: 0,
     });
     vi.mocked(ipc.getAppInfo).mockResolvedValue({
       os: "windows",
@@ -502,6 +976,7 @@ describe("Onboarding", () => {
       backend: "vulkan",
       serverPath: "D:/runtime/llama-server.exe",
       modelsDir: "D:/Model/translate",
+      partialBytes: 0,
     });
     vi.mocked(ipc.listRouterModels).mockResolvedValue([
       { id: "Hy-MT2-1.8B-Q8_0", state: "unloaded" },
@@ -526,6 +1001,7 @@ describe("Onboarding", () => {
       backend: "vulkan",
       serverPath: "D:/runtime/llama-server.exe",
       modelsDir: "D:/models",
+      partialBytes: 0,
     });
     renderOnboarding();
 
@@ -557,6 +1033,7 @@ describe("Onboarding", () => {
       backend: "vulkan",
       serverPath: "D:/runtime/llama-server.exe",
       modelsDir: "D:/models",
+      partialBytes: 0,
     });
     renderOnboarding();
 
@@ -591,6 +1068,7 @@ describe("Onboarding", () => {
       backend: "vulkan",
       serverPath: "D:/runtime/llama-server.exe",
       modelsDir: "D:/models",
+      partialBytes: 0,
     });
     renderOnboarding();
 
@@ -609,6 +1087,7 @@ describe("Onboarding", () => {
       backend: "vulkan",
       serverPath: "D:/runtime/llama-server.exe",
       modelsDir: "D:/NewModelDir",
+      partialBytes: 0,
     });
 
     await userEvent.click(btn);
@@ -640,6 +1119,7 @@ describe("Onboarding", () => {
       backend: "vulkan",
       serverPath: "D:/runtime/llama-server.exe",
       modelsDir: "D:/StrictModels",
+      partialBytes: 0,
     });
     renderOnboardingStrict();
 
