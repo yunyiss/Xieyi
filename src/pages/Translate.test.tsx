@@ -14,31 +14,34 @@ import { Translate } from "./Translate";
  */
 let modelStateCb: ((p: { model: string; state: string }) => void) | null = null;
 
+/**
+ * 一个最小可用的模型画像。
+ *
+ * 页面启动走 `listLocalModels`（纯扫目录，不拉引擎），桩要给完整对象——
+ * 只有 `id` 真正会被用到，其余字段给安全默认值。
+ *
+ * 放在 `vi.mock` **外面**：工厂会被提升到文件顶部，那里引用不到
+ * 模块级 `const`。默认值统一由 `beforeEach` 注入。
+ */
+const LOCAL_MODEL = {
+  id: "demo.gguf",
+  path: "C:/models/demo.gguf",
+  sizeMb: 1024,
+  ctxSize: 4096,
+  trainedCtx: 4096,
+  supportsThinking: false,
+  thinking: "off" as const,
+  chatCapable: true,
+  family: "通用",
+  unsupportedReason: null,
+  chatAuto: true,
+  chatOverridden: false,
+};
+
 vi.mock("../lib/ipc", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/ipc")>();
 
   const noop = async () => () => {};
-
-  /**
-   * 一个最小可用的模型画像。
-   *
-   * 页面启动改用 `listLocalModels`（纯扫目录，不拉引擎），
-   * 所以桩要给完整对象——只需要 `id` 能填进下拉，其余字段给默认值。
-   */
-  const LOCAL_MODEL = {
-    id: "demo.gguf",
-    path: "C:/models/demo.gguf",
-    sizeMb: 1024,
-    ctxSize: 4096,
-    trainedCtx: 4096,
-    supportsThinking: false,
-    thinking: "off" as const,
-    chatCapable: true,
-    family: "通用",
-    unsupportedReason: null,
-    chatAuto: true,
-    chatOverridden: false,
-  };
 
   return {
     ...actual,
@@ -48,21 +51,27 @@ vi.mock("../lib/ipc", async (importOriginal) => {
       backend: "vulkan",
       serverPath: "C:/llama/llama-server.exe",
       modelsDir: "C:/models",
+      partialBytes: 0,
     })),
     startService: vi.fn(async () => ({
       running: true,
       port: 8080,
       loaded: [],
       modelsDir: "C:/models",
+      partialBytes: 0,
     })),
     getServiceStatus: vi.fn(async () => ({
       running: true,
       port: 8080,
       loaded: [],
       modelsDir: "C:/models",
+      partialBytes: 0,
     })),
     stopService: vi.fn(async () => {}),
-    listLocalModels: vi.fn(async () => [LOCAL_MODEL]),
+    // 默认给空数组：真实默认值由 `beforeEach` 统一恢复。
+    // 工厂被 `vi.mock` 提升到文件顶部，此处不能引用外部的 `LOCAL_MODEL`
+    // （那时它还没初始化）。
+    listLocalModels: vi.fn(async () => []),
     newRequestId: vi.fn(() => "req-1"),
     translate: vi.fn(),
     abort: vi.fn(async () => {}),
@@ -86,6 +95,96 @@ const translateMock = vi.mocked(ipc.translate);
 
 beforeEach(() => {
   vi.clearAllMocks();
+
+  // **恢复默认实现**，不能只 clearAllMocks。
+  //
+  // `clearAllMocks()` 只清调用记录，不清 `mockResolvedValue` 设过的实现。
+  // 某个用例把 `listLocalModels` 改成返回 `[]` 之后，后面的用例会一直拿到
+  // 空列表，于是"能翻译"的用例全部因为没模型而失败。
+  vi.mocked(ipc.getRuntimeStatus).mockResolvedValue({
+    installed: true,
+    version: "b11714",
+    backend: "vulkan",
+    serverPath: "C:/llama/llama-server.exe",
+    modelsDir: "C:/models",
+    partialBytes: 0,
+  });
+  vi.mocked(ipc.listLocalModels).mockResolvedValue([LOCAL_MODEL]);
+});
+
+describe("Translate · 未配置提示", () => {
+  /**
+   * 这组测试覆盖一个曾经写死文案的 bug：
+   *
+   * 引擎已配好、只是缺模型时，顶部仍显示「还没配置好引擎或模型」——
+   * 引擎明明配好了，用户会以为连引擎都丢了。
+   *
+   * 现在文案取自 `readiness.hint`，会区分缺什么。
+   */
+
+  it("引擎已配好、缺模型时，提示说的是「没有 .gguf」而不是「引擎或模型」", async () => {
+    vi.mocked(ipc.getRuntimeStatus).mockResolvedValue({
+      installed: true,
+      version: "b11714",
+      backend: "vulkan",
+      serverPath: "D:/runtime/llama-server.exe",
+      modelsDir: "D:/models",
+      partialBytes: 0,
+    });
+    vi.mocked(ipc.listLocalModels).mockResolvedValue([]);
+
+    render(<Translate />);
+
+    // 准确指出缺的是模型。翻译页不知道目录设没设过（它只扫模型、
+    // 不读 AppInfo），所以 hint 用中性措辞「还没有可用的模型」，
+    // 而不是断言目录为空。
+    expect(
+      await screen.findByText(/还没有可用的模型/),
+    ).toBeInTheDocument();
+    // 不能说"引擎或模型"——引擎是好的
+    expect(screen.queryByText(/引擎或模型/)).toBeNull();
+  });
+
+  it("缺模型时按钮叫「去添加模型」，并把 need=models 交给父级", async () => {
+    // 父级据此打开设置抽屉的模型页，而不是全屏首启引导。
+    // 后者看起来像"重新来一遍"，实际配置并没丢。
+    const onOpenSetup = vi.fn();
+    vi.mocked(ipc.getRuntimeStatus).mockResolvedValue({
+      installed: true,
+      version: "b11714",
+      backend: "vulkan",
+      serverPath: "D:/runtime/llama-server.exe",
+      modelsDir: "D:/models",
+      partialBytes: 0,
+    });
+    vi.mocked(ipc.listLocalModels).mockResolvedValue([]);
+
+    render(<Translate onOpenSetup={onOpenSetup} />);
+
+    const btn = await screen.findByRole("button", { name: /去添加模型/ });
+    await userEvent.click(btn);
+
+    expect(onOpenSetup).toHaveBeenCalledWith("models");
+  });
+
+  it("缺引擎时按钮叫「去配置」，并传 need=engine（走首启引导）", async () => {
+    const onOpenSetup = vi.fn();
+    vi.mocked(ipc.getRuntimeStatus).mockResolvedValue({
+      installed: false,
+      version: null,
+      backend: null,
+      serverPath: null,
+      modelsDir: "D:/models",
+      partialBytes: 0,
+    });
+
+    render(<Translate onOpenSetup={onOpenSetup} />);
+
+    const btn = await screen.findByRole("button", { name: /去配置/ });
+    await userEvent.click(btn);
+
+    expect(onOpenSetup).toHaveBeenCalledWith("engine");
+  });
 });
 
 describe("Translate", () => {

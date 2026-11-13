@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { useTheme } from "./lib/useTheme";
-import { ModelDrawer } from "./components/ModelDrawer";
+import { ModelDrawer, type DrawerTab } from "./components/ModelDrawer";
 import { ThemeMenu } from "./components/ThemeMenu";
 import { Onboarding } from "./components/Onboarding";
 import { StatusBar } from "./components/StatusBar";
@@ -30,6 +30,13 @@ function App() {
   const [service, setService] = useState<ServiceStatus | null>(null);
   const [settings, setSettings] = useState<Settings | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
+  /**
+   * 抽屉打开时停在哪个页签。
+   *
+   * 用于「只缺模型」的场景：翻译页的提示按钮把用户直接送到模型页，
+   * 不用他打开抽屉后再自己找。缺引擎才走首启引导。
+   */
+  const [drawerTab, setDrawerTab] = useState<DrawerTab>("general");
   /** 主题偏好：跟随系统 / 浅色 / 深色 */
   const { mode: themeMode, setMode: setThemeMode } = useTheme();
   /** 设置抽屉里改动后 +1，通知当前页面重新拉取模型与状态。 */
@@ -95,7 +102,21 @@ function App() {
         const n = await countLocalModels();
         if (!alive) return;
         const r = computeReadiness({ installed: rt.installed, modelCount: n });
-        setShowGuide(!r.ready);
+
+        // **判据是 `canEnter`（只看引擎），不是 `ready`（还要有模型）。**
+        //
+        // 曾经写成 `!r.ready`，后果是：用户配好引擎、模型目录留空进去了，
+        // 关掉应用重新打开，又被打回全屏引导层——因为"没有模型"又成立
+        // 了一次。用户会以为配置丢了。
+        //
+        // 这与 `lib/readiness.ts` 里写明的设计是矛盾的：那里明确说
+        // 「模型目录本来就允许空的……把这些用户挡在门外没有任何好处，
+        // 而且会形成死循环」。启动判定没遵守它，等于同一个 bug 换了个
+        // 位置又犯一次。
+        //
+        // 缺模型的提示交给翻译页（它本来就按缺失类型分流文案），
+        // 不该在启动时把人拦在门外。
+        setShowGuide(!r.canEnter);
       } catch {
         // 拉不到状态就不打扰，免得误弹
       } finally {
@@ -212,7 +233,10 @@ function App() {
         <ThemeMenu mode={themeMode} onChange={setThemeMode} />
 
         <button
-          onClick={() => setDrawerOpen(true)}
+          onClick={() => {
+            setDrawerTab("general");
+            setDrawerOpen(true);
+          }}
           className="btn flex h-8 shrink-0 items-center gap-1.5 rounded-lg border px-3 text-[12px]"
           style={{
             background: "var(--surface)",
@@ -246,7 +270,17 @@ function App() {
             refreshSignal={refreshSignal}
             onSendToChat={handleSendToChat}
             onRuntimeChanged={handleRuntimeChanged}
-            onOpenSetup={() => setShowGuide(true)}
+            onOpenSetup={(need) => {
+              if (need === "models") {
+                // 只缺模型：就地打开设置抽屉的模型页，
+                // 不把用户丢回全屏引导（那看起来像"重新来一遍"）
+                setDrawerTab("models");
+                setDrawerOpen(true);
+              } else {
+                // 缺引擎（或两样都缺）：走首启引导，那才是真正的从零配置
+                setShowGuide(true);
+              }
+            }}
           />
         </div>
         <div className={tab === "batch" ? "h-full" : "hidden"}>
@@ -285,6 +319,7 @@ function App() {
 
       <ModelDrawer
         open={drawerOpen}
+        initialTab={drawerTab}
         onClose={() => setDrawerOpen(false)}
         onChanged={() => setRefreshSignal((n) => n + 1)}
       />

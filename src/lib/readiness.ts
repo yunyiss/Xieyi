@@ -109,11 +109,17 @@ export function computeReadiness(input: ReadinessInput): Readiness {
     } else if (input.scanning) {
       // 扫描中不能说「没有模型」——那可能是错的，会误导用户去重复操作
       hint = "正在扫描模型…";
-    } else if (input.dirConfigured) {
-      // 目录设过但还是没有模型：问题在目录内容，不在设置
+    } else if (input.dirConfigured === true) {
+      // 确定设过目录但没模型：问题在目录内容，不在设置
       hint = "模型目录里还没有 .gguf 文件";
-    } else {
+    } else if (input.dirConfigured === false) {
+      // 确定没设过目录
       hint = "还没配置模型目录";
+    } else {
+      // 调用方不知道目录状态（如翻译页：它只扫模型，不读 AppInfo）。
+      // 这时既不能说"目录里没有文件"（可能设过且非空但扫不到），
+      // 也不能说"还没配置目录"（可能已经配了）——用中性措辞，不猜。
+      hint = "还没有可用的模型";
     }
   }
 

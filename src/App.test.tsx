@@ -34,6 +34,7 @@ vi.mock("./lib/ipc", async (importOriginal) => {
       version: "0.1.0",
       dataDir: "C:/data",
       modelsDir: "D:/models",
+      partialBytes: 0,
       modelsDirConfigured: true,
       runtimeVersion: "b11714",
       portable: false,
@@ -44,18 +45,21 @@ vi.mock("./lib/ipc", async (importOriginal) => {
       backend: "vulkan",
       serverPath: "D:/runtime/llama-server.exe",
       modelsDir: "D:/Model/translate",
+      partialBytes: 0,
     })),
     getServiceStatus: vi.fn(async () => ({
       running: false,
       port: null,
       loaded: [],
       modelsDir: "D:/Model/translate",
+      partialBytes: 0,
     })),
     getSettings: vi.fn(async () => ({
       ttlSecs: 120,
       gpuLayers: 1001,
       pinned: [],
       modelsDir: "D:/Model/translate",
+      partialBytes: 0,
       running: false,
       port: null,
     })),
@@ -68,6 +72,7 @@ vi.mock("./lib/ipc", async (importOriginal) => {
       port: 8080,
       loaded: [],
       modelsDir: "D:/Model/translate",
+      partialBytes: 0,
     })),
     listRouterModels: vi.fn(async () => []),
     listSessions: vi.fn(async () => []),
@@ -101,6 +106,7 @@ describe("App · 启动路径", () => {
       backend: "vulkan",
       serverPath: "D:/runtime/llama-server.exe",
       modelsDir: "D:/Model/translate",
+      partialBytes: 0,
     });
     vi.mocked(ipc.countLocalModels).mockResolvedValue(5);
   });
@@ -127,6 +133,7 @@ describe("App · 启动路径", () => {
       backend: null,
       serverPath: null,
       modelsDir: "D:/models",
+      partialBytes: 0,
     });
 
     render(<App />);
@@ -145,6 +152,39 @@ describe("App · 启动路径", () => {
       expect(ipc.countLocalModels).toHaveBeenCalled();
     });
     // 引导层未出现：页面上不该有「稍后配置」
+    expect(screen.queryByText(/稍后配置/)).toBeNull();
+  });
+
+  /**
+   * **引擎已装、模型目录为空时，不该弹引导层。**
+   *
+   * 这条锁住一个真实反馈的 bug：用户配好引擎、留空模型目录进了主界面，
+   * 关掉应用重新打开又被打回全屏引导层——因为「没有模型」又成立了一次，
+   * 用户以为配置丢了。
+   *
+   * 根因是启动判定用了 `ready`（引擎 && 有模型），而
+   * `lib/readiness.ts` 里明确写着进主界面只看引擎（`canEnter`）：
+   *
+   * > 模型目录本来就允许空的……把这些用户挡在门外没有任何好处，
+   * > 而且会形成死循环：不放模型就进不去，进不去就看不到模型目录在哪。
+   *
+   * 变异验证：把 `App.tsx` 里的 `!r.canEnter` 改回 `!r.ready`，
+   * 本测试失败。
+   *
+   * 注意这条与前一条的区别：前一条「有模型」两种情况都通过，
+   * **只有这一条**能区分 canEnter 与 ready。
+   */
+  it("引擎已装但模型目录为空时，也不弹引导层", async () => {
+    vi.mocked(ipc.countLocalModels).mockResolvedValue(0);
+
+    render(<App />);
+
+    // 等启动判定跑完
+    await waitFor(() => {
+      expect(ipc.countLocalModels).toHaveBeenCalled();
+    });
+
+    // 关键断言：没模型也不能把人拦在门外
     expect(screen.queryByText(/稍后配置/)).toBeNull();
   });
 });

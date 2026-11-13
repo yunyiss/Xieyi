@@ -33,12 +33,14 @@ vi.mock("../lib/ipc", async (importOriginal) => {
       backend: "manual",
       serverPath: "D:/llama/llama-server.exe",
       modelsDir: "D:/models",
+      partialBytes: 0,
     })),
     startService: vi.fn(async () => ({
       running: true,
       port: 8080,
       loaded: [],
       modelsDir: "D:/models",
+      partialBytes: 0,
     })),
     // 页面启动改用本地扫描（不拉引擎），不再用 listRouterModels
     listLocalModels: vi.fn(async () => [
@@ -118,6 +120,7 @@ describe("Batch · 断点续传的界面反馈", () => {
       backend: "manual",
       serverPath: "D:/llama/llama-server.exe",
       modelsDir: "D:/models",
+      partialBytes: 0,
     });
     vi.mocked(ipc.listLocalModels).mockResolvedValue([
       {

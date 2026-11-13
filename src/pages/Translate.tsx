@@ -81,8 +81,14 @@ interface Props {
   onSendToChat?: (text: string) => void;
   /** 运行时安装/切换成功后通知父级，让常驻挂载的其他页面也重新拉取模型。 */
   onRuntimeChanged?: () => void;
-  /** 打开首启引导（引擎或模型还没配好时，页面只留一个入口）。 */
-  onOpenSetup?: () => void;
+  /**
+   * 打开配置入口。
+   *
+   * 参数是**缺什么**，由父级决定去哪：
+   * - 缺引擎 → 走首启引导（真正的从零配置）
+   * - 只缺模型 → 打开设置抽屉的模型页（就地补，不用全屏重来）
+   */
+  onOpenSetup?: (need: "engine" | "models") => void;
 }
 
 export function Translate({
@@ -394,15 +400,26 @@ export function Translate({
           }}
         >
           <span className="min-w-0 flex-1 truncate">
-            {engineError || "还没配置好引擎或模型"}
+            {/*
+              文案来自 `readiness.hint`，**不要写死**。
+              早先这里固定写「还没配置好引擎或模型」——引擎明明配好了、
+              只是缺模型时，这句话是错的，用户会以为连引擎都丢了。
+              hint 会区分「还没配置推理引擎」「模型目录里还没有 .gguf
+              文件」「还没配置模型目录」三种情况。
+            */}
+            {engineError || readiness.hint}
           </span>
           {onOpenSetup && (
             <button
               className="btn shrink-0 rounded px-1.5 text-[11px]"
               style={{ color: "var(--brand-text)" }}
-              onClick={onOpenSetup}
+              onClick={() =>
+                // 缺引擎（或两样都缺）才需要全屏引导；
+                // 只缺模型时走设置抽屉，不用把用户丢回"初始配置页"
+                onOpenSetup(readiness.missing === "models" ? "models" : "engine")
+              }
             >
-              去配置
+              {readiness.missing === "models" ? "去添加模型" : "去配置"}
             </button>
           )}
         </div>
