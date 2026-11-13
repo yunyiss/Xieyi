@@ -247,6 +247,7 @@ export const installRuntime = (backend: string) =>
   invoke<RuntimeStatus>("install_runtime", { backend });
 export const setManualRuntime = (serverPath: string) =>
   invoke<RuntimeStatus>("set_manual_runtime", { serverPath });
+
 /** 扫一遍磁盘，找现成可切换的 llama-server。 */
 export const discoverRuntimes = () =>
   invoke<DiscoveredRuntime[]>("discover_runtimes");
@@ -300,6 +301,119 @@ export const listLocalModels = () => invoke<LocalModel[]>("list_local_models");
  * 可能只是想看一眼界面。见 service.rs 里 `count_local_models` 的注释。
  */
 export const countLocalModels = () => invoke<number>("count_local_models");
+
+/**
+ * 一个预设模型的下载状态。
+ *
+ * `downloaded` 由后端按**磁盘实际文件 + 大小匹配**判断，不是配置记录——
+ * 用户手动删了文件也会正确显示为未下载。
+ */
+export interface PresetStatus {
+  id: string;
+  name: string;
+  summary: string;
+  sizeBytes: number;
+  /** 建议显存（MB）。显卡不够时提前提示，避免"引擎启动失败"的天书报错 */
+  vramHintMb: number;
+  /** 模型家族，与设置里显示的家族徽章一致 */
+  family: string;
+  downloaded: boolean;
+  path: string | null;
+  /**
+   * 未完成下载已占用的字节数（`.part` 的大小）。0 表示没有残留。
+   *
+   * 与 `downloaded` 互斥。大于 0 时界面显示「已暂停」，
+   * 并给出续传与删除两个入口。
+   */
+  partialBytes: number;
+  /** 未完成下载的期望总字节数；0 表示未知（`.part.meta` 没写或读不到） */
+  partialTotal: number;
+}
+
+/** 预设下载进度事件。`stage` 为 `failed` 时 `error` 有值。 */
+export interface PresetProgress {
+  id: string;
+  /**
+   * `cancelled` 是独立的阶段，**不是失败**：界面上不该报红字，
+   * 而应显示成「已暂停 · 可续传」。
+   */
+  stage: "downloading" | "verifying" | "done" | "cancelled" | "failed";
+  downloaded: number;
+  total: number;
+  percent: number;
+  error?: string;
+}
+
+/**
+ * 下载源配置。
+ *
+ * `preferred` 为 `null` 表示按默认顺序（模型：魔搭 → HF；
+ * 引擎：加速代理 → 官方）。
+ * `customMirror` 是用户自填的镜像基地址，为空表示没填。
+ */
+export interface DownloadSourceConfig {
+  /** 类别：`engine` 或 `model` */
+  kind: "engine" | "model";
+  preferred: string | null;
+  customMirror: string | null;
+}
+
+export const getDownloadSourceConfig = (kind: "engine" | "model") =>
+  invoke<DownloadSourceConfig>("get_download_source_config", { kind });
+
+/**
+ * 保存下载源配置。
+ *
+ * `preferred` 传 `null` 恢复默认顺序；`customMirror` 传空串清除。
+ * 后端会校验：镜像必须以 http(s):// 开头；偏好源必须是该类别支持的源
+ * （拿模型源去配引擎会被拒绝，避免"存了却不生效"的静默失败）。
+ */
+export const setDownloadSourceConfig = (
+  kind: "engine" | "model",
+  preferred: string | null,
+  customMirror: string | null,
+) =>
+  invoke<void>("set_download_source_config", { kind, preferred, customMirror });
+
+export const listPresets = () => invoke<PresetStatus[]>("list_presets");
+
+/**
+ * 下载一个预设模型。返回下载后的实际路径。
+ *
+ * 会按源顺序自动尝试并回退；成功后记住那次用的源。
+ * **不自动切换当前模型**——那会打断用户正在做的事，且需要重启引擎。
+ */
+export const downloadPreset = (id: string) =>
+  invoke<string>("download_preset", { id });
+
+/**
+ * 取消当前下载——引擎包与预设模型**共用同一个通道**。
+ *
+ * 全项目只有这一个取消入口。早先另有一个 `cancelPresetDownload`，
+ * 名字暗示它只管模型，而通道其实是共用的——两个名字指向同一件事，
+ * 只会让调用方犹豫该用哪个。合并成一个。
+ *
+ * 取消后已下载的部分**保留**，下次会续传。
+ */
+export const cancelDownload = () => invoke<void>("cancel_download");
+
+/**
+ * 删除某个预设未完成的下载（`.part` + `.part.meta`），返回释放的字节数。
+ *
+ * 与取消的区别：取消是「先停一下」，保留数据以便续传；删除是「不要了」。
+ *
+ * **必须提供这个入口**：`.part` 不进模型列表、启动时不扫描，用户没有
+ * 任何别的办法看到并清理它。没有它，取消一次 8 GB 下载就等于永久占
+ * 8 GB 磁盘且无从察觉。
+ */
+export const deletePresetPartial = (id: string) =>
+  invoke<number>("delete_preset_partial", { id });
+
+/** 预设下载进度。 */
+export const onPresetProgress = (
+  cb: (p: PresetProgress) => void,
+): Promise<UnlistenFn> =>
+  listen<PresetProgress>("preset://progress", (e) => cb(e.payload));
 
 /**
  * 翻译缓存的当前状态。
