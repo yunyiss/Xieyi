@@ -258,8 +258,18 @@ export const syncWindowTheme = (theme: "light" | "dark" | "system") =>
     // 标题栏配色是锦上添花，失败不影响使用，也不该弹错误
   });
 export const getRuntimeStatus = () => invoke<RuntimeStatus>("runtime_status");
-export const installRuntime = (backend: string) =>
-  invoke<RuntimeStatus>("install_runtime", { backend });
+/**
+ * 下载并安装推理引擎。
+ *
+ * `force` 为 true 时**绕过「已装过」的拦截**，重新下载并覆盖安装。
+ *
+ * 这是设置里「重新下载」用的：拦截的初衷是防止"装好了还点下载白等
+ * 31 MB"，但反过来它就是**修复手段**——引擎目录损坏、缺 DLL、启动即崩
+ * 时，重下一遍是最直接的自救方式。引导层的下载按钮在装好后会隐藏，
+ * 走的永远是 `force = false`。
+ */
+export const installRuntime = (backend: string, force = false) =>
+  invoke<RuntimeStatus>("install_runtime", { backend, force });
 export const setManualRuntime = (serverPath: string) =>
   invoke<RuntimeStatus>("set_manual_runtime", { serverPath });
 

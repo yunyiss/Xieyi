@@ -184,6 +184,28 @@ fn already_installed(root: &Path, backend: &str) -> Option<String> {
     find_executable(&dir).map(|_| dir.to_string_lossy().to_string())
 }
 
+/// 该不该拦住这次安装。
+///
+/// 返回 `Some(路径)` 表示拒绝，`None` 表示放行。
+///
+/// ## 为什么需要 `force`
+///
+/// 拦住重复安装是为了防止「已经装好了还点下载，白等 31 MB」。但同一个
+/// 能力反过来就是**修复手段**：引擎目录被损坏、缺了 DLL、`llama-server`
+/// 启动即崩时，重下一遍是最直接的自救方式。
+///
+/// 设置里的「重新下载」正是这条修复路径，所以它必须能绕过闸门。引导层
+/// 那个按钮在装好后会隐藏，走的永远是 `force = false`。
+///
+/// 抽成独立函数是为了能单测——主流程要 `AppHandle`，测不了。
+fn reinstall_blocked(force: bool, root: &Path, backend: &str) -> Option<String> {
+    if force {
+        // 明确要求重装：不做任何检查
+        return None;
+    }
+    already_installed(root, backend)
+}
+
 /// 扫一遍 `runtime/downloads/`，累加所有未完成下载的字节数。
 ///
 /// 引擎包只有一个文件名（`llama-<版本>-<后端>.zip`），所以正常情况下
@@ -471,7 +493,11 @@ pub fn runtime_status(app: AppHandle) -> RuntimeStatus {
 }
 
 #[tauri::command]
-pub async fn install_runtime(app: AppHandle, backend: String) -> Result<RuntimeStatus, String> {
+pub async fn install_runtime(
+    app: AppHandle,
+    backend: String,
+    force: Option<bool>,
+) -> Result<RuntimeStatus, String> {
     // 引擎目前只有 GitHub 一个真实来源（上游不在别处发 release），
     // 但走 candidates + download_from_sources 之后，将来加镜像
     // 只需要在 sources.rs 里补一个源，这里零改动。
@@ -498,10 +524,10 @@ pub async fn install_runtime(app: AppHandle, backend: String) -> Result<RuntimeS
      *
      * 换后端（vulkan → cuda）时这一层自然放行：路径按 backend 拼接。
      */
-    if let Some(existing) = already_installed(&root, &backend) {
+    if let Some(existing) = reinstall_blocked(force.unwrap_or(false), &root, &backend) {
         return Err(format!(
             "这个后端（{backend}）已经装好了：{existing}\n\
-             如需重新安装，先删除该目录再试。"
+             如需重装（例如引擎损坏），请在设置里用「重新下载」。"
         ));
     }
 
@@ -910,6 +936,55 @@ mod tests {
     }
 
     // ───────────── 重复安装的闸门 ─────────────
+
+    /// `force = true` 必须绕过重复安装的闸门。
+    ///
+    /// 这条锁住「重新下载」这条修复路径。加了闸门之后，设置里那个
+    /// 「重新下载」按钮会直接失败——引擎目录损坏、缺 DLL、启动即崩时，
+    /// 用户就没有自救手段了。
+    ///
+    /// 变异验证：把 `reinstall_blocked` 里的 `if force { return None }`
+    /// 删掉，本测试失败。
+    #[test]
+    fn force_bypasses_the_reinstall_guard() {
+        let root = std::env::temp_dir().join("xieyi-force-reinstall-test");
+        let _ = std::fs::remove_dir_all(&root);
+
+        let dir = root.join(format!("llama-{PINNED_VERSION}-vulkan"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe_name = if cfg!(windows) {
+            "llama-server.exe"
+        } else {
+            "llama-server"
+        };
+        std::fs::write(dir.join(exe_name), b"fake").unwrap();
+
+        // 不高抬贵手时：拦住
+        assert!(
+            reinstall_blocked(false, &root, "vulkan").is_some(),
+            "已装且未要求重装时应当拦住"
+        );
+        // 明确要求重装时：放行
+        assert!(
+            reinstall_blocked(true, &root, "vulkan").is_none(),
+            "force=true 必须放行，否则「重新下载」永远失败，引擎坏了没法自救"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `force = true` 在没有已安装引擎时也是无害的（设置里首次下载也走它）。
+    #[test]
+    fn force_is_harmless_when_nothing_is_installed() {
+        let root = std::env::temp_dir().join("xieyi-force-empty-test");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        assert!(reinstall_blocked(false, &root, "vulkan").is_none());
+        assert!(reinstall_blocked(true, &root, "vulkan").is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// 装过的后端必须被认出来，避免用户重复下载 31 MB。
     ///

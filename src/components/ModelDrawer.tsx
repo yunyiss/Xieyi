@@ -371,7 +371,10 @@ export function ModelDrawer({
     setBusy("download-engine");
     setDlProgress(null);
     try {
-      setRuntime(await installRuntime("vulkan"));
+      // `force = true`：这个按钮在装好之后叫「重新下载」，语义就是
+      // 覆盖重装。引擎目录损坏 / 缺 DLL / 启动即崩时，这是应用内唯一的
+      // 自救路径，后端那道「已装过就别再下」的闸门必须为它让路。
+      setRuntime(await installRuntime("vulkan", true));
       setDlProgress(null);
       await restartService();
       await refresh();

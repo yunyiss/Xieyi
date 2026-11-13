@@ -158,6 +158,9 @@ describe("ModelDrawer · 设置读写", () => {
     await waitFor(() => {
       expect(ipc.installRuntime).toHaveBeenCalled();
     });
+    // **必须带 force=true**，否则后端那道「已装过就别再下」的闸门会
+    // 直接拒绝，这个按钮就变成永远失败的摆设。
+    expect(ipc.installRuntime).toHaveBeenCalledWith("vulkan", true);
   });
 
   it("下载源是独立页签，引擎与模型各一份可分别配置", async () => {
