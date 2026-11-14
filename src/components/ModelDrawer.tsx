@@ -122,6 +122,47 @@ export function ModelDrawer({
   const [tab, setTab] = useState<DrawerTab>(initialTab);
   /** 当前推理引擎状态，用于「推理引擎」那一块。 */
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
+  /**
+   * 引擎状态是否**已经读到过一次**。
+   *
+   * 与 `runtime !== null` 不等价：`runtime` 为 null 既可能是"还没读到"，
+   * 也可能只是真的没有状态。而界面必须区分这两者——
+   *
+   * 早先直接用 `runtime?.installed` 决定按钮外观，于是在首次打开抽屉时，
+   * 数据还在路上，`installed` 被当成 false，渲染出一个**深色主按钮**；
+   * 几十毫秒后数据到了才变回次要样式。用户看到的是"一块深色闪一下"。
+   *
+   * 只改颜色是治标：真正的问题是**在知道答案之前就画了答案**。所以这里
+   * 记住"是否已加载"，未加载时不渲染那个按钮，只留等高的占位。
+   */
+  const [runtimeLoaded, setRuntimeLoaded] = useState(false);
+  /**
+   * 「重新下载」是否停在待确认那一步。
+   *
+   * 两步确认：第一次点只是把按钮变成「确认重装？」，再点一次才真下载。
+   * 不用系统模态框——理由见 `downloadEngine` 里那段注释。
+   */
+  const [confirmReinstall, setConfirmReinstall] = useState(false);
+  /** 待确认状态的超时器：5 秒不点就退回普通按钮，避免卡在确认态。 */
+  const confirmTimer = useRef<number | null>(null);
+
+  /** 退出待确认态（并清掉定时器）。 */
+  const clearReinstallConfirm = useCallback(() => {
+    if (confirmTimer.current !== null) {
+      window.clearTimeout(confirmTimer.current);
+      confirmTimer.current = null;
+    }
+    setConfirmReinstall(false);
+  }, []);
+
+  // 卸载时清定时器，避免在已卸载的组件上 setState
+  useEffect(
+    () => () => {
+      if (confirmTimer.current !== null) window.clearTimeout(confirmTimer.current);
+    },
+    [],
+  );
+
   /** 引擎切换后的自检结果（成功显示版本，失败显示原因）。 */
   const [probeMsg, setProbeMsg] = useState<RuntimeProbe | null>(null);
   /** 扫描到的可切换引擎。 */
@@ -137,6 +178,35 @@ export function ModelDrawer({
   const [states, setStates] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
+  /**
+   * 中性提示（成功类）。
+   *
+   * 与 `error` 分开：错误用红色，成功不该染红。重装引擎耗时几十秒，
+   * 完成后必须给一句明确的"成了"——否则用户无法判断这次点击有没有生效
+   * （安装过程只在磁盘上覆盖目录与配置，界面上原本什么都不会变）。
+   */
+  const [notice, setNotice] = useState("");
+
+  /*
+   * 浮条自动消失。
+   *
+   * 错误留 8 秒（要读完，有些报错带两行说明），成功 4 秒。
+   * 用户也可以点 × 立刻关掉。
+   *
+   * 为什么不留在原地等下次操作覆盖：早先就是那样，结果一条上世纪的报错
+   * 会一直挂在面板上，用户以为当前状态出问题了。
+   */
+  useEffect(() => {
+    if (!error) return;
+    const t = window.setTimeout(() => setError(""), 8000);
+    return () => window.clearTimeout(t);
+  }, [error]);
+
+  useEffect(() => {
+    if (!notice) return;
+    const t = window.setTimeout(() => setNotice(""), 4000);
+    return () => window.clearTimeout(t);
+  }, [notice]);
   const [glossaryText, setGlossaryText] = useState("");
   const [glossarySaved, setGlossarySaved] = useState(false);
   const [freeVram, setFreeVram] = useState<number | null>(null);
@@ -160,6 +230,7 @@ export function ModelDrawer({
       setLocal(await listLocalModels());
       setFreeVram(await probeVram());
       setRuntime(await getRuntimeStatus());
+      setRuntimeLoaded(true);
 
       const terms = await getGlossary();
       setGlossaryText(
@@ -368,6 +439,38 @@ export function ModelDrawer({
    */
   const downloadEngine = async () => {
     setError("");
+    setNotice("");
+
+    // **已装过时先确认。**
+    //
+    // 用户实测发现：引擎装好之后点「重新下载」，它会立刻闷头重下 31 MB，
+    // 既不问一句、也没有任何"装成了"的反馈。连点几次就白下上百 MB，
+    // 而且从界面上根本看不出到底装没装成（安装过程会在末尾覆盖
+    // `config.json`，但那是磁盘上的事，界面不体现）。
+    //
+    // 确认框同时承担两个作用：拦住误点，以及**说明它是修复手段**——
+    // 引擎目录损坏、缺 DLL、启动即崩时，覆盖重装是应用内唯一的自救路径。
+    //
+    // **不用系统确认框。** 早先这里调 `@tauri-apps/plugin-dialog` 的
+    // `ask`，两个问题：
+    //
+    // 1. 系统弹窗由 OS 绘制，与整套自绘 UI 不搭——这也是本项目「所有下拉
+    //    都用 `Select.tsx`、不用原生 `<select>`」的同一条理由。
+    // 2. 它是模态的，会打断操作；而这件事远没到需要模态的程度。
+    //
+    // 改成**按钮自身两步确认**：第一次点把按钮变成「确认重装？」，再点一次
+    // 才真正开始，5 秒不点自动退回。没有弹窗、没有模态、不打断。
+    if (runtime?.installed && !confirmReinstall) {
+      setConfirmReinstall(true);
+      if (confirmTimer.current !== null) window.clearTimeout(confirmTimer.current);
+      confirmTimer.current = window.setTimeout(() => {
+        setConfirmReinstall(false);
+        confirmTimer.current = null;
+      }, 5000);
+      return;
+    }
+    clearReinstallConfirm();
+
     setBusy("download-engine");
     setDlProgress(null);
     try {
@@ -380,6 +483,7 @@ export function ModelDrawer({
       await refresh();
       setEngineToken((n) => n + 1);
       onChanged();
+      setNotice("引擎已重新安装");
     } catch (e) {
       setDlProgress(null);
       setError(String(e));
@@ -678,20 +782,66 @@ export function ModelDrawer({
                 borderColor: "var(--border)",
               }}
             >
-              <p
-                className="m-0 truncate text-[12px]"
-                title={runtime?.serverPath ?? ""}
-                style={{ color: "var(--text)" }}
-              >
-                {runtime?.installed
-                  ? (runtime.serverPath ?? "").split(/[\\/]/).slice(-2).join(" / ")
-                  : "尚未安装推理引擎"}
-              </p>
-              <p className="m-0 mt-0.5 text-[11px]" style={{ color: "var(--text-muted)" }}>
-                {runtime?.installed
-                  ? `${runtime.backend ?? "未知"} · ${runtime.version ?? "未知版本"}`
-                  : "尚未配置。可直接下载官方运行时，或指定本机已有的 llama-server"}
-              </p>
+              {/*
+                未加载时**不说是/否**。
+
+                这两行原本也会闪：先画「尚未安装推理引擎」，数据到了再换成
+                真实路径。虽然只是一瞬，但那是**先说错、再改对**——用户如果
+                恰好瞥见，会以为引擎掉了。
+
+                这里用一句如实的「正在读取…」，等知道了再给结论。
+              */}
+              {!runtimeLoaded ? (
+                <p
+                  className="m-0 text-[12px]"
+                  style={{ color: "var(--text-muted)" }}
+                >
+                  正在读取…
+                </p>
+              ) : (
+                <>
+                  <p
+                    className="m-0 truncate text-[12px]"
+                    title={runtime?.serverPath ?? ""}
+                    style={{ color: "var(--text)" }}
+                  >
+                    {runtime?.installed
+                      ? (runtime.serverPath ?? "")
+                          .split(/[\\/]/)
+                          .slice(-2)
+                          .join(" / ")
+                      : "尚未安装推理引擎"}
+                  </p>
+                  {/*
+                    第二行平时显示「后端 · 版本」。
+
+                    但在「待确认重装」时改用它说明这次操作要付出什么——
+                    好处是**高度不变**：31 MB 与后果都写在这一行里，按钮
+                    不用为了塞字变宽，也就不会把「扫描本机」挤到第二行。
+
+                    早先把这个信息塞在按钮文案里（「确认重装？31 MB」），
+                    结果按钮变宽 → 整行换行 → 排版跳了一下。挪到这里，
+                    位置和高度都不动。
+                  */}
+                  {confirmReinstall ? (
+                    <p
+                      className="m-0 mt-0.5 text-[11px]"
+                      style={{ color: "var(--brand-text)" }}
+                    >
+                      将覆盖安装，约 31 MB · 再点一次确认（5 秒后自动取消）
+                    </p>
+                  ) : (
+                    <p
+                      className="m-0 mt-0.5 text-[11px]"
+                      style={{ color: "var(--text-muted)" }}
+                    >
+                      {runtime?.installed
+                        ? `${runtime.backend ?? "未知"} · ${runtime.version ?? "未知版本"}`
+                        : "尚未配置。可直接下载官方运行时，或指定本机已有的 llama-server"}
+                    </p>
+                  )}
+                </>
+              )}
 
               {probeMsg && (
                 <p
@@ -709,28 +859,57 @@ export function ModelDrawer({
                 {/*
                   下载入口放在最前：未配置时它是最该点的那个。
                   已装好时降级为次要操作（用户可能想换个后端重装）。
+
+                  `runtimeLoaded` 之前**不渲染它**。原因是这个按钮的主/次
+                  外观由 `runtime.installed` 决定，而首次打开抽屉时数据还在
+                  路上，`installed` 会被当成 false → 画面先出现一块深色主
+                  按钮，几十毫秒后再变成浅色次要按钮。
+
+                  只改颜色是治标（深浅仍会变），根子是"在知道答案之前就画
+                  了答案"。所以未加载时留一个等高占位：高度与 `h-8` 的按钮
+                  一致，既不会闪，也不会让下面的元素跳一下。
                 */}
-                <button
-                  className={btnClass}
-                  style={
-                    runtime?.installed
-                      ? btnStyle
-                      : {
-                          background: "var(--accent-btn)",
-                          color: "var(--accent-btn-text)",
-                          border: "none",
-                        }
-                  }
-                  onClick={downloadEngine}
-                  disabled={busy !== ""}
-                  title="从官方或加速镜像下载 llama.cpp 运行时（Vulkan 版，约 31 MB）"
-                >
-                  {busy === "download-engine"
-                    ? "下载中…"
-                    : runtime?.installed
-                      ? "重新下载"
-                      : "下载引擎"}
-                </button>
+                {runtimeLoaded ? (
+                  <button
+                    className={btnClass}
+                    style={
+                      confirmReinstall
+                        ? {
+                            // 待确认：给一点强调，但**不用红色**——
+                            // 重装不是危险操作，红字会让人以为要出事
+                            background: "var(--brand-soft)",
+                            color: "var(--brand-text)",
+                            borderColor: "var(--brand)",
+                          }
+                        : runtime?.installed
+                          ? btnStyle
+                          : {
+                              background: "var(--accent-btn)",
+                              color: "var(--accent-btn-text)",
+                              border: "none",
+                            }
+                    }
+                    onClick={downloadEngine}
+                    disabled={busy !== ""}
+                    title={
+                      confirmReinstall
+                        ? "再点一次即开始重新下载并覆盖安装（约 31 MB）"
+                        : runtime?.installed
+                          ? "重新下载并覆盖当前引擎。引擎损坏时可用它修复"
+                          : "从官方或加速镜像下载 llama.cpp 运行时（Vulkan 版，约 31 MB）"
+                    }
+                  >
+                    {busy === "download-engine"
+                      ? "下载中…"
+                      : confirmReinstall
+                        ? "确认重装"
+                        : runtime?.installed
+                          ? "重新下载"
+                          : "下载引擎"}
+                  </button>
+                ) : (
+                  <span aria-hidden style={{ display: "inline-block", height: 28, width: 72 }} />
+                )}
                 <button
                   className={btnClass}
                   style={btnStyle}
@@ -1179,10 +1358,49 @@ export function ModelDrawer({
           </>
           )}
 
-          {error && (
-            <p className="m-0 mt-3 text-[12px]" style={{ color: "var(--danger)" }}>
-              {error}
-            </p>
+          {/*
+            提示做成**浮在面板底部**的浮条，不再插在内容流里。
+
+            原因（用户实测）：错误原本渲染在滚动内容的最末尾，面板一滚，
+            报错就跑到视野外了——「解压失败: i/o error」就是这么被错过的。
+            而且它还会把后面的内容往下推，出现/消失时整块跳。
+
+            浮条不受滚动影响，任何位置的操作报错都能立刻看到。
+
+            自动消失的时长按类型区分：错误留久一点（要读完），成功短一些。
+            */}
+          {(error || notice) && (
+            <div className="pointer-events-none absolute inset-x-3 bottom-3 z-10">
+              <div
+                className="popover pointer-events-auto flex items-start gap-2 px-3 py-2 text-[12px]"
+                style={{
+                  background: "var(--surface)",
+                  borderColor: error ? "var(--danger)" : "var(--border-strong)",
+                  color: error ? "var(--danger)" : "var(--text)",
+                }}
+                role={error ? "alert" : "status"}
+              >
+                <span className="min-w-0 flex-1 whitespace-pre-line break-words">
+                  {error || notice}
+                </span>
+                <button
+                  className="btn -mr-1 shrink-0 rounded px-1 text-[14px] leading-none"
+                  style={{
+                    background: "transparent",
+                    color: "inherit",
+                    opacity: 0.6,
+                  }}
+                  onClick={() => {
+                    setError("");
+                    setNotice("");
+                  }}
+                  aria-label="关闭提示"
+                  title="关闭"
+                >
+                  ×
+                </button>
+              </div>
+            </div>
           )}
         </div>
       </aside>

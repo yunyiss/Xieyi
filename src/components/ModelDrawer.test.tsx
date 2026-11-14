@@ -15,6 +15,13 @@ import { ModelDrawer } from "./ModelDrawer";
  * 比如 TTL 填 0 变成「永不卸载」、上下文设成越界值。
  */
 
+/**
+ * 文件对话框走系统插件，测试里换成可控的桩。
+ */
+vi.mock("@tauri-apps/plugin-dialog", () => ({
+  open: vi.fn(async () => null),
+}));
+
 vi.mock("../lib/ipc", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/ipc")>();
   return {
@@ -128,8 +135,21 @@ function renderDrawer(props: Partial<Parameters<typeof ModelDrawer>[0]> = {}) {
 }
 
 describe("ModelDrawer · 设置读写", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
+    // **`clearAllMocks` 不会重置 `mockImplementation`。**
+    //
+    // 这条踩过一次：某条用例把 `getRuntimeStatus` 改成"永不 resolve"
+    // 来模拟加载中，之后所有用例都拿不到引擎状态，连带三条测试失败。
+    // 所以这里显式恢复本文件依赖的默认实现。
     vi.clearAllMocks();
+    vi.mocked(ipc.getRuntimeStatus).mockResolvedValue({
+      installed: true,
+      version: "b11714",
+      backend: "vulkan",
+      serverPath: "D:/runtime/llama-server.exe",
+      modelsDir: "D:/models",
+      partialBytes: 0,
+    });
   });
 
   it("打开时读取设置并显示 TTL", async () => {
@@ -149,11 +169,17 @@ describe("ModelDrawer · 设置读写", () => {
     // 用户删了引擎、或引导时选了「稍后配置」，就再也找不到下载入口，
     // 只能自己去 GitHub 翻文件——而 GitHub 在国内时通时不通。
     //
+    // 默认 mock 里引擎是已装的，所以这里要走两步（先变确认态）。
+    //
     // 变异验证：把 downloadEngine 那个按钮删掉 → 本条失败。
     renderDrawer();
 
-    const btn = await screen.findByRole("button", { name: /下载引擎|重新下载/ });
-    await userEvent.click(btn);
+    await userEvent.click(
+      await screen.findByRole("button", { name: /重新下载/ }),
+    );
+    await userEvent.click(
+      await screen.findByRole("button", { name: /确认重装/ }),
+    );
 
     await waitFor(() => {
       expect(ipc.installRuntime).toHaveBeenCalled();
@@ -161,6 +187,174 @@ describe("ModelDrawer · 设置读写", () => {
     // **必须带 force=true**，否则后端那道「已装过就别再下」的闸门会
     // 直接拒绝，这个按钮就变成永远失败的摆设。
     expect(ipc.installRuntime).toHaveBeenCalledWith("vulkan", true);
+  });
+
+  /**
+   * 引擎状态还没读到时，**不能先画出结论**。
+   *
+   * 用户实测：首次打开设置，引擎区先是一块深色主按钮（「下载引擎」），
+   * 几十毫秒后才变成浅色的「重新下载」。虽然快到肉眼看不清，但深色块
+   * 闪一下是能感觉到的。
+   *
+   * 根子不是配色，是**在知道答案之前就画了答案**：`runtime` 还是 null，
+   * `installed` 被当成 false。只把深色改成浅色是治标——深浅仍会变。
+   *
+   * 这条测试卡在第一帧：`getRuntimeStatus` 永不 resolve，此时界面上
+   * 既不该出现「下载引擎」（错的结论），也不该出现「重新下载」（对的
+   * 结论但还不知道），只该是一句「正在读取…」。
+   *
+   * 变异验证：把 `runtimeLoaded ? … : 占位` 的守卫去掉，直接按
+   * `runtime?.installed` 渲染，本测试失败。
+   */
+  it("引擎状态未就绪时不渲染下载或重下按钮", async () => {
+    vi.mocked(ipc.getRuntimeStatus).mockImplementation(
+      () => new Promise(() => {}), // 永不返回，模拟"数据还在路上"
+    );
+
+    renderDrawer();
+
+    // 停在「通用」页即可，引擎区块默认就显示在这里
+    expect(await screen.findByText(/正在读取/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /下载引擎/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /重新下载/ })).toBeNull();
+  });
+
+  /**
+   * 已装过引擎时，「重新下载」需要**两步确认**——但不是系统弹窗。
+   *
+   * 用户实测：装好之后点它会一声不响重下 31 MB，连点几次白下上百 MB。
+   * 第一版用系统确认框（`plugin-dialog` 的 `ask`），被否掉了：
+   * 系统弹窗由 OS 绘制，与整套自绘 UI 不搭，而且是模态的、会打断操作。
+   *
+   * 现在改成按钮自身两步：第一次点变成「确认重装？31 MB」，再点才真下。
+   *
+   * 变异验证：把 `if (runtime?.installed && !confirmReinstall)` 那段
+   * 整块删掉，本测试失败（第一下就直接调后端了）。
+   */
+  it("已装引擎时第一下只变文字，不发起下载", async () => {
+    renderDrawer(); // 默认 mock 里 installed = true
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: /重新下载/ }),
+    );
+
+    // 第一下：按钮变成待确认态，且**没有**调后端
+    expect(
+      await screen.findByRole("button", { name: /确认重装/ }),
+    ).toBeInTheDocument();
+    expect(ipc.installRuntime).not.toHaveBeenCalled();
+  });
+
+  /** 第二下才真正开始下载。 */
+  it("再点一次「确认重装」才真正下载", async () => {
+    renderDrawer();
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: /重新下载/ }),
+    );
+    await userEvent.click(
+      await screen.findByRole("button", { name: /确认重装/ }),
+    );
+
+    await waitFor(() => {
+      expect(ipc.installRuntime).toHaveBeenCalledWith("vulkan", true);
+    });
+  });
+
+  /**
+   * 未装引擎时**不用**确认——首下意图明确，多一步只是碍事。
+   *
+   * 变异验证：把确认条件里的 `runtime?.installed` 去掉（无条件确认），
+   * 本测试失败。
+   */
+  it("未装引擎时点一下就直接下载", async () => {
+    vi.mocked(ipc.getRuntimeStatus).mockResolvedValue({
+      installed: false,
+      version: null,
+      backend: null,
+      serverPath: null,
+      modelsDir: "D:/models",
+      partialBytes: 0,
+    });
+
+    renderDrawer();
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: /下载引擎/ }),
+    );
+
+    await waitFor(() => {
+      expect(ipc.installRuntime).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  /**
+   * 待确认态**不能让按钮变宽**。
+   *
+   * 用户反馈的视觉问题："确认重装？31 MB" 比 "重新下载" 长，按钮一变宽
+   * 就把旁边那个「扫描本机」挤到第二行，整块跳了一下。
+   *
+   * 修法不是调宽度，而是让两段文案**字数相同**（都是 4 个汉字），
+   * 体积信息挪到下面那行说明里——位置和高度都不动。
+   *
+   * 这条测试直接量字宽：两段文案的字符数必须相等。
+   *
+   * 变异验证：把文案改回含 "31 MB" 的长版本，本测试失败。
+   */
+  it("待确认的按钮文案与「重新下载」等长，不会撑宽布局", async () => {
+    renderDrawer();
+
+    const before = await screen.findByRole("button", { name: /重新下载/ });
+    const widthBefore = before.textContent?.length ?? 0;
+
+    await userEvent.click(before);
+    const after = await screen.findByRole("button", { name: /确认重装/ });
+
+    expect(after.textContent?.length).toBe(widthBefore);
+  });
+
+  /**
+   * 报错必须做成**浮条**，不能插在滚动内容里。
+   *
+   * 用户实测：解压失败时，错误原本渲染在内容末尾，面板滚到别处就看不见了
+   * （「解压失败: i/o error」就是这么被错过的）。而且它出现/消失时还会把
+   * 下面的元素推来推去。
+   *
+   * 判据：报错节点要 `position: absolute`——脱离文档流，不受滚动影响。
+   *
+   * 变异验证：改回在内容流里渲染 `<p>`，本测试失败。
+   */
+  it("报错以浮条呈现（绝对定位，不随滚动）", async () => {
+    vi.mocked(ipc.installRuntime).mockRejectedValue("解压失败: i/o error");
+
+    renderDrawer();
+    await userEvent.click(
+      await screen.findByRole("button", { name: /重新下载/ }),
+    );
+    await userEvent.click(screen.getByRole("button", { name: /确认重装/ }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(/解压失败/);
+
+    // 承载它的外层必须是绝对定位
+    const floating = alert.parentElement as HTMLElement;
+    expect(floating.className).toMatch(/\babsolute\b/);
+  });
+
+  /** 浮条能手动关掉。 */
+  it("报错浮条可以关闭", async () => {
+    vi.mocked(ipc.installRuntime).mockRejectedValue("磁盘空间不足");
+
+    renderDrawer();
+    await userEvent.click(
+      await screen.findByRole("button", { name: /重新下载/ }),
+    );
+    await userEvent.click(screen.getByRole("button", { name: /确认重装/ }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/磁盘空间不足/);
+
+    await userEvent.click(screen.getByRole("button", { name: "关闭提示" }));
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 
   it("下载源是独立页签，引擎与模型各一份可分别配置", async () => {
