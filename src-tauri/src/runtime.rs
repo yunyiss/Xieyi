@@ -179,6 +179,46 @@ pub fn status(app: &AppHandle) -> RuntimeStatus {
 ///
 /// 反过来，配置说装了 vulkan 但用户把目录删了，这里也应当返回
 /// `None`（允许重装），因为判断依据是**磁盘上的实际文件**。
+/// 清空安装目录，为重装做准备。
+///
+/// ## 为什么要重试
+///
+/// `stop_for_reinstall` 用 `taskkill /F` 结束引擎进程，但 Windows 释放
+/// 文件句柄有延迟：刚杀完进程立刻 `remove_dir_all` 仍可能报「正在使用」。
+/// 所以重试若干次，每次间隔 200ms（总计最多约 2 秒）。
+///
+/// ## 为什么不能静默忽略
+///
+/// 早先这里是 `let _ = std::fs::remove_dir_all(..)`——删不掉就算了。
+/// 结果是**错误在下一层才爆**：解压时写 `llama-server.exe` 失败，报
+/// 「解压失败: i/o error」。用户看到的是"压缩包有问题"，而真正的原因是
+/// "旧文件被占用"。错误指向错误的层，比不报错更浪费时间。
+///
+/// 抽成独立函数是为了能单测；`install_runtime` 本身要 `AppHandle`，测不了。
+fn reset_install_dir(dest: &Path) -> Result<(), String> {
+    if !dest.exists() {
+        return Ok(());
+    }
+
+    let mut last: Option<std::io::Error> = None;
+    for _ in 0..10 {
+        match std::fs::remove_dir_all(dest) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        }
+    }
+
+    let e = last.map(|e| e.to_string()).unwrap_or_default();
+    Err(format!(
+        "无法删除旧的引擎目录，可能仍被其他程序占用：{}\n{e}\n\
+         请关闭正在使用该目录的程序后重试。",
+        dest.display()
+    ))
+}
+
 fn already_installed(root: &Path, backend: &str) -> Option<String> {
     let dir = root.join(format!("llama-{PINNED_VERSION}-{backend}"));
     find_executable(&dir).map(|_| dir.to_string_lossy().to_string())
@@ -594,9 +634,18 @@ pub async fn install_runtime(
     // 解压
     emit(&app, "extracting", 0, 0);
     let dest = root.join(format!("llama-{PINNED_VERSION}-{backend}"));
-    if dest.exists() {
-        let _ = std::fs::remove_dir_all(&dest);
-    }
+
+    /*
+     * **先停掉正在运行的引擎。**
+     *
+     * Windows 锁定运行中的 exe。用户很可能正开着引擎（翻译页在用），
+     * 这时去删目录、解压覆盖同一个 `llama-server.exe` 都会失败：
+     * 删目录报错被静默忽略，解压则报「解压失败: i/o error」——
+     * 而这条信息完全看不出跟"引擎还在跑"有关，用户只会以为包坏了。
+     */
+    crate::service::stop_for_reinstall(&app).await;
+
+    reset_install_dir(&dest)?;
     paths::ensure(&dest)?;
     extract_archive(&result.path, &dest)?;
 
@@ -939,6 +988,38 @@ mod tests {
 
     /// `force = true` 必须绕过重复安装的闸门。
     ///
+    /// 重装前必须能把旧安装目录清掉。
+    ///
+    /// 这条锁住「解压失败: i/o error」那个缺陷的两半：
+    ///
+    /// 1. 旧目录被占用时删不掉 → 解压在下一层失败，且报错指向错误的层
+    /// 2. 早先 `let _ = remove_dir_all(..)` 把删除错误**静默吞掉**，
+    ///    于是用户只看到"压缩包有问题"
+    ///
+    /// 这里验证的是正常路径：目录存在且可删时，必须删干净。
+    /// 「删不掉时报错」那条分支需要真的锁住文件才能触发，见下方说明。
+    ///
+    /// 变异验证：把 `reset_install_dir` 改成直接 `Ok(())` 不做删除，
+    /// 本测试失败（目录还在）。
+    #[test]
+    fn reset_install_dir_removes_existing_dir() {
+        let root = std::env::temp_dir().join("xieyi-reset-install-test");
+        let _ = std::fs::remove_dir_all(&root);
+
+        // 目录不存在时也算成功（首次安装）
+        assert!(reset_install_dir(&root).is_ok(), "目录不存在时不该报错");
+
+        // 造一个带内容的旧安装目录
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("llama-server.exe"), b"old").unwrap();
+        std::fs::write(root.join("sub/ggml.dll"), b"old").unwrap();
+
+        reset_install_dir(&root).expect("正常目录应当能删掉");
+        assert!(!root.exists(), "旧目录必须被清空，否则解压会撞上残留文件");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// 这条锁住「重新下载」这条修复路径。加了闸门之后，设置里那个
     /// 「重新下载」按钮会直接失败——引擎目录损坏、缺 DLL、启动即崩时，
     /// 用户就没有自救手段了。

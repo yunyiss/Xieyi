@@ -1354,6 +1354,31 @@ pub async fn start_service(
     service_status(app, state).await
 }
 
+/// 重装引擎前把正在运行的引擎停掉。
+///
+/// ## 为什么必须停
+///
+/// Windows 会**锁定正在运行的 exe**。重装流程是「删旧目录 → 解压覆盖」，
+/// 引擎还在跑时这两步都会失败：删目录返回错误（早先被静默忽略），
+/// 解压写 `llama-server.exe` 时报 **解压失败: i/o error**。
+///
+/// 实测踩过：用户在翻译页用着引擎，去设置里点「重新下载」，下完 31 MB
+/// 后卡在解压失败——而错误信息完全看不出跟「引擎还在跑」有关。
+///
+/// 与 `stop_service` 的区别：那个是命令入口（需要 `State`），这里只要
+/// `AppHandle`，供 `runtime::install_runtime` 内部调用。
+pub async fn stop_for_reinstall(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let existing = {
+        let mut guard = state.service.lock().await;
+        guard.take()
+    };
+    if let Some(s) = existing {
+        s.kill().await;
+    }
+    let _ = app.emit("service://state-changed", ());
+}
+
 #[tauri::command]
 pub async fn stop_service(app: AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
     state.cancel.store(true, Ordering::Relaxed);
