@@ -461,7 +461,10 @@ impl Default for AppState {
             inflight: Arc::new(AtomicU64::new(0)),
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_used: tokio::sync::Mutex::new(Instant::now()),
-            ttl_secs: AtomicU64::new(120),
+            // 默认 5 分钟。引擎只启动一次（约 0.55s），但模型每次闲置都要
+            // 重载约 4 秒——实测"看一眼文档再回来"很容易超过 2 分钟，
+            // 2 分钟档会让人反复等。10 分钟档在走开时要多占 4-5 GB。
+            ttl_secs: AtomicU64::new(300),
             gpu_layers: AtomicU64::new(models::AUTO_LAYERS),
             pinned: tokio::sync::Mutex::new(HashSet::new()),
             cache: tokio::sync::Mutex::new(HashMap::new()),

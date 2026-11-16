@@ -37,12 +37,42 @@ import { PresetModels } from "./PresetModels";
 import { Select } from "./Select";
 import { StorageInfo } from "./StorageInfo";
 
+/**
+ * 空闲释放档位。
+ *
+ * 分档而不是让用户填数字：这个东西用户说不清具体要多少秒，
+ * 他要的是「省显存 / 平衡 / 少等待」三选一。
+ *
+ * 默认取**中档 5 分钟**：引擎只启动一次（约 0.55 秒），但模型每次闲置
+ * 都要重载约 4 秒。实测「看一眼文档再回来」很容易超过 2 分钟，2 分钟档
+ * 会让人反复等；而 10 分钟档在走开时要多占 4-5 GB 显存。
+ */
 const TTL_OPTIONS = [
-  { value: 60, label: "空闲 60 秒释放" },
-  { value: 120, label: "空闲 120 秒释放" },
-  { value: 300, label: "空闲 5 分钟释放" },
+  { value: 120, label: "空闲 2 分钟释放（省显存）" },
+  { value: 300, label: "空闲 5 分钟释放（推荐）" },
+  { value: 600, label: "空闲 10 分钟释放（少等待）" },
   { value: 0, label: "不自动释放" },
 ];
+
+/** 默认空闲释放：5 分钟。见 `TTL_OPTIONS` 的说明。 */
+const DEFAULT_TTL_SECS = 300;
+
+/**
+ * 把配置里读到的 TTL 补进选项列表。
+ *
+ * 老版本的配置可能存着已下线的档位（比如早先有 60 秒）。此时直接丢给
+ * `Select` 会找不到匹配项、显示成占位符「—」——用户会以为设置坏了。
+ *
+ * 所以遇到不在表里的值就临时加一项。仍保留原值而不是悄悄改成默认：
+ * 用户的配置不该被我们无声改写。
+ */
+function ttlOptionsWith(current: number) {
+  if (TTL_OPTIONS.some((o) => o.value === current)) return TTL_OPTIONS;
+  return [
+    ...TTL_OPTIONS,
+    { value: current, label: `空闲 ${current} 秒释放（旧设置）` },
+  ].sort((a, b) => a.value - b.value);
+}
 
 const LAYER_OPTIONS = [
   { value: 1001, label: "自动（按显存）" },
@@ -713,8 +743,8 @@ export function ModelDrawer({
                 <Select
                   className="min-w-0 flex-1"
                   size="sm"
-                  value={settings?.ttlSecs ?? 120}
-                  options={TTL_OPTIONS}
+                  value={settings?.ttlSecs ?? DEFAULT_TTL_SECS}
+                  options={ttlOptionsWith(settings?.ttlSecs ?? DEFAULT_TTL_SECS)}
                   onChange={(v) => changeTtl(v)}
                   title="模型空闲多久后自动卸载，释放显存"
                 />

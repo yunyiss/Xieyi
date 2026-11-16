@@ -152,15 +152,43 @@ describe("ModelDrawer · 设置读写", () => {
     });
   });
 
-  it("打开时读取设置并显示 TTL", async () => {
+  it("打开时读取设置，并把 TTL 档位显示出来", async () => {
     renderDrawer();
     await waitFor(() => {
       expect(ipc.getSettings).toHaveBeenCalled();
     });
-    // 120 秒的 TTL 应该以某种形式出现在界面上
+    // mock 里 ttlSecs = 120 → 对应「空闲 2 分钟释放」这一档。
+    // 断言文案而不是数字：档位文案改了不该让测试假失败。
     await waitFor(() => {
-      expect(screen.getByText(/120/)).toBeInTheDocument();
+      expect(screen.getByText(/空闲 2 分钟释放/)).toBeInTheDocument();
     });
+  });
+
+  /**
+   * 配置里存着**已下线**的档位时，不能显示成占位符「—」。
+   *
+   * 早先有「60 秒」这一档，后来去掉了。老用户升级后配置里仍是 60，
+   * 若直接丢给选项表就找不到匹配项，界面显示「—」，用户会以为设置坏了。
+   * 也不能悄悄改成默认值——那是无声改写用户配置。
+   *
+   * 变异验证：把  的兜底分支删掉（直接返回 ），
+   * 本测试失败。
+   */
+  it("已下线的 TTL 档位仍按原值显示，不变成占位符", async () => {
+    vi.mocked(ipc.getSettings).mockResolvedValue({
+      ttlSecs: 60, // 已从选项表移除
+      gpuLayers: 1001,
+      pinned: [],
+      modelsDir: "D:/models",
+      running: true,
+      port: 8080,
+    });
+
+    renderDrawer();
+
+    expect(
+      await screen.findByText(/空闲 60 秒释放/),
+    ).toBeInTheDocument();
   });
 
   it("设置里提供「下载引擎」入口，并能触发下载", async () => {

@@ -53,22 +53,6 @@ pub struct Progress {
     pub total: u64,
 }
 
-impl Progress {
-    /// 百分比（0-100）。总量未知时返回 `None`，调用方应显示"未知"而不是 0%。
-    ///
-    /// 目前只有测试在用：进度事件传的是原始字节数（`downloaded`/`total`），
-    /// 前端自己算百分比。保留这个方法是因为**下一步**做模型下载 UI 时，
-    /// 后端要在事件里直接给百分比（前端重复算容易与后端口径不一致）。
-    /// 有单测覆盖边界（总量未知、超过 100% 的夹取）。
-    #[allow(dead_code)]
-    pub fn percent(self) -> Option<u8> {
-        if self.total == 0 {
-            return None;
-        }
-        Some(((self.downloaded as f64 / self.total as f64) * 100.0).clamp(0.0, 100.0) as u8)
-    }
-}
-
 /// 下载失败的原因。
 ///
 /// ## 为什么把「取消」单列成一种，而不是塞进字符串
@@ -950,37 +934,6 @@ mod tests {
         assert!(
             matches!(&err, DownloadError::Failed(m) if m.contains("没有可用的下载源")),
             "{err}"
-        );
-    }
-
-    #[test]
-    fn percent_is_none_when_total_unknown() {
-        // 服务端不给 Content-Length 时不能显示 0%，那会让用户以为卡住了
-        let p = Progress {
-            downloaded: 100,
-            total: 0,
-        };
-        assert_eq!(p.percent(), None);
-    }
-
-    #[test]
-    fn percent_rounds_and_clamps() {
-        assert_eq!(
-            Progress {
-                downloaded: 50,
-                total: 100
-            }
-            .percent(),
-            Some(50)
-        );
-        // 超过总量（服务端报小了）时夹到 100，不显示 120%
-        assert_eq!(
-            Progress {
-                downloaded: 120,
-                total: 100
-            }
-            .percent(),
-            Some(100)
         );
     }
 
