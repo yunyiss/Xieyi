@@ -565,9 +565,39 @@ pub async fn install_runtime(
      * 换后端（vulkan → cuda）时这一层自然放行：路径按 backend 拼接。
      */
     if let Some(existing) = reinstall_blocked(force.unwrap_or(false), &root, &backend) {
+        /*
+         * **磁盘上已经有，就别报错——认回来。**
+         *
+         * 早先这里直接返回「这个后端已经装好了」，于是出现一个死局：
+         * 用户删了 `config.json`（想重置设置）但留着引擎目录，之后点下载
+         * 被这句话挡住，点扫描也走不下去——因为界面的"就绪"判定看配置。
+         * 唯一的出路是手动删引擎目录。**"配置丢了"被伪装成"功能坏了"。**
+         *
+         * 现在改成：探测一下那份引擎，能跑就把它写回配置并返回正常状态。
+         * 对用户来说，点一下下载就自愈了，一个字节都不用下。
+         */
+        let path = PathBuf::from(&existing);
+        if let Some(exe) = find_executable(&path) {
+            let probe = probe_exe(&exe);
+            if probe.ok {
+                let info = RuntimeInfo {
+                    version: PINNED_VERSION.to_string(),
+                    backend: backend.clone(),
+                    server_path: exe.to_string_lossy().to_string(),
+                    source: "adopted".into(),
+                    sha256: String::new(),
+                };
+                write_info(&app, &info)?;
+                crate::logging::info(
+                    "runtime",
+                    format!("磁盘上已有 {backend} 引擎，已认回：{}", exe.display()),
+                );
+                return Ok(status(&app));
+            }
+        }
         return Err(format!(
-            "这个后端（{backend}）已经装好了：{existing}\n\
-             如需重装（例如引擎损坏），请在设置里用「重新下载」。"
+            "这个后端（{backend}）已经装好了，但无法运行：{existing}\n\
+             如需重装，请在设置里用「重新下载」。"
         ));
     }
 
@@ -719,6 +749,110 @@ pub fn set_manual_runtime(app: AppHandle, server_path: String) -> Result<Runtime
     // 把自检结果一起带回去，界面上能直接看到"切换后的引擎到底是哪个版本"
     st.probe = Some(probe);
     Ok(st)
+}
+
+/// 从安装目录名解析出（版本, 后端）。
+///
+/// 目录名由我们自己拼：`llama-{PINNED_VERSION}-{backend}`。
+/// 认回磁盘上的引擎时要把它还原成配置字段，所以单独抽出来测——
+/// `adopt_existing_engine` 需要 `AppHandle`，测不了。
+///
+/// 识别不了就返回 `("unknown", "unknown")`，调用方照写不误：这些字段
+/// 只用于界面显示，不该因为解析不出就拒绝认回。
+fn parse_engine_dir_name(name: &str) -> (&str, &str) {
+    let backend = if name.contains("vulkan") {
+        "vulkan"
+    } else if name.contains("cuda") {
+        "cuda"
+    } else if name.contains("cpu") {
+        "cpu"
+    } else {
+        "unknown"
+    };
+    // 版本段形如 `b11714`：b + 全数字
+    let version = name
+        .split('-')
+        .find(|s| s.starts_with('b') && s.len() > 1 && s[1..].chars().all(|c| c.is_ascii_digit()))
+        .unwrap_or("unknown");
+    (version, backend)
+}
+
+/// 配置里没有引擎，但从磁盘上把它捡回来。
+///
+/// ## 为什么需要这个
+///
+/// 引擎是**装在磁盘上的事实**，`config.json` 只是记着"它在哪里"的备忘。
+/// 备忘丢了不该意味着引擎没了——可实际做成了那样：
+///
+/// 用户实测的路径：装好引擎后删掉 `config.json`（想重置设置），引擎目录
+/// 留着。重开程序：
+///
+/// - 点下载 → 后端发现目录里已有 `llama-server`，报「这个后端已经装好了」
+///   → 下不了
+/// - 点扫描 → 能扫到，但界面上的"就绪"判定仍基于配置 → 走不下去
+///
+/// 于是卡死在引导层，唯一的出路是手动去删引擎目录。**这是"数据丢失"
+/// 伪装成了"功能坏了"**。
+///
+/// 因此：配置缺失时，先看磁盘上有没有我们装过的那一份，有就认回来
+/// （探测一次 `--version`，通过才写配置）。
+///
+/// 只在启动时和"点下载"时调用，不在 2.5 秒轮询里——它会跑一次子进程。
+pub fn adopt_existing_engine(app: &AppHandle) -> Option<RuntimeStatus> {
+    // 已经有配置就以配置为准，不做任何猜测
+    if read_info(app).is_some() {
+        return None;
+    }
+
+    let root = paths::runtime_root(app).ok()?;
+    let entries = std::fs::read_dir(&root).ok()?;
+
+    // 优先挑带版本号与后端的目录名（`llama-b11714-vulkan`），
+    // 这样文档里的版本记录不会丢。排序保证同一台机器上结果稳定。
+    let mut dirs: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    dirs.sort();
+
+    for dir in dirs {
+        let Some(exe) = find_executable(&dir) else {
+            continue;
+        };
+        let probe = probe_exe(&exe);
+        if !probe.ok {
+            // 目录在但跑不起来（缺 DLL、架构不对）——不认，让用户重装
+            continue;
+        }
+
+        let name = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let (version, backend) = parse_engine_dir_name(&name);
+
+        let info = RuntimeInfo {
+            version: version.to_string(),
+            backend: backend.to_string(),
+            server_path: exe.to_string_lossy().to_string(),
+            source: "adopted".into(),
+            sha256: String::new(),
+        };
+        if write_info(app, &info).is_ok() {
+            crate::logging::info(
+                "runtime",
+                format!(
+                    "配置里没有引擎，已从磁盘认回：{}（{backend} · {version}）",
+                    exe.display()
+                ),
+            );
+            return Some(status(app));
+        }
+    }
+
+    None
 }
 
 /// 磁盘上已有、可直接切换过去的引擎。
@@ -990,6 +1124,81 @@ mod tests {
     ///
     /// 重装前必须能把旧安装目录清掉。
     ///
+    /// 解压必须真的把文件放出来，两个平台分支都要覆盖。
+    ///
+    /// ## 为什么补这条
+    ///
+    /// `extract_archive` 在两个平台走完全不同的实现：Windows 用 `zip` crate，
+    /// Linux/macOS 调**系统 `tar -xzf`**。而在 Linux 上这条链路此前**一次都没
+    /// 跑过**——CI 的 `cargo test` 里没有它，真机也没验证过引擎下载。
+    /// 也就是说「点下载 → 解压 → 找到 llama-server」在 Linux 上是纯理论。
+    ///
+    /// 这条测试在两个平台都会跑，各自覆盖自己的分支。
+    ///
+    /// ## 用什么造包
+    ///
+    /// 造包也分平台：Windows 用 `zip` crate 写，Linux 调 `tar -czf`。
+    /// 没有为此引入新依赖——`zip` 已是直接依赖，`tar` 本来就要依赖系统命令。
+    ///
+    /// 变异验证：把 Linux 分支的 `-xzf` 改成 `-cf`（只打包不解压），本测试
+    /// 失败；把 `ZipArchive::extract` 换成不做事，Windows 分支同样失败。
+    #[test]
+    fn extract_archive_actually_writes_files() {
+        let base = std::env::temp_dir().join("xieyi-extract-test");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let exe_name = if cfg!(windows) {
+            "llama-server.exe"
+        } else {
+            "llama-server"
+        };
+        let dest = base.join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        #[cfg(target_os = "windows")]
+        {
+            let archive = base.join("a.zip");
+            let file = std::fs::File::create(&archive).unwrap();
+            let mut w = zip::ZipWriter::new(file);
+            let opts: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+            w.start_file(exe_name, opts).unwrap();
+            std::io::Write::write_all(&mut w, b"fake-engine").unwrap();
+            w.finish().unwrap();
+
+            extract_archive(&archive, &dest).expect("zip 解压应当成功");
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            // 造一个 tar.gz，**带顶层目录**——上游发布包就是这个结构
+            let stage = base.join("stage");
+            let inner = stage.join("llama-bin");
+            std::fs::create_dir_all(&inner).unwrap();
+            std::fs::write(inner.join(exe_name), b"fake-engine").unwrap();
+
+            let archive = base.join("a.tar.gz");
+            let st = std::process::Command::new("tar")
+                .arg("-czf")
+                .arg(&archive)
+                .arg("-C")
+                .arg(&stage)
+                .arg("llama-bin")
+                .status()
+                .expect("系统 tar 应当可用");
+            assert!(st.success(), "造包失败");
+
+            extract_archive(&archive, &dest).expect("tar.gz 解压应当成功");
+        }
+
+        // 关键：解出来的文件**必须能被 find_executable 找到**。
+        // 上游包带顶层目录，能不能找到取决于递归搜索，这条一起锁住。
+        let found = find_executable(&dest).unwrap_or_else(|| panic!("解压后应当能找到 {exe_name}"));
+        assert!(found.exists());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// 这条锁住「解压失败: i/o error」那个缺陷的两半：
     ///
     /// 1. 旧目录被占用时删不掉 → 解压在下一层失败，且报错指向错误的层
@@ -999,6 +1208,35 @@ mod tests {
     /// 这里验证的是正常路径：目录存在且可删时，必须删干净。
     /// 「删不掉时报错」那条分支需要真的锁住文件才能触发，见下方说明。
     ///
+    /// 认回磁盘引擎时，目录名要能还原成（版本, 后端）。
+    ///
+    /// 用户实测：删掉 `config.json`（想重置设置）但留着引擎目录，重开程序
+    /// 后既下载不了、也走不下去，只能手动删引擎。修复的关键一步就是从
+    /// 目录名把配置字段还原出来。
+    ///
+    /// 变异验证：把 `version` 那行的 `s.starts_with('b')` 去掉，本测试失败
+    /// （`llama` 段会被当成版本号）。
+    #[test]
+    fn engine_dir_name_parses_back_to_fields() {
+        // 我们自己的命名
+        assert_eq!(
+            parse_engine_dir_name(&format!("llama-{PINNED_VERSION}-vulkan")),
+            (PINNED_VERSION, "vulkan")
+        );
+        assert_eq!(
+            parse_engine_dir_name("llama-b11714-cuda"),
+            ("b11714", "cuda")
+        );
+        assert_eq!(parse_engine_dir_name("llama-b11714-cpu"), ("b11714", "cpu"));
+
+        // 认不出来时不能崩、也不能瞎猜：返回 unknown，但仍允许认回
+        assert_eq!(
+            parse_engine_dir_name("my-llama-build"),
+            ("unknown", "unknown")
+        );
+        assert_eq!(parse_engine_dir_name(""), ("unknown", "unknown"));
+    }
+
     /// 变异验证：把 `reset_install_dir` 改成直接 `Ok(())` 不做删除，
     /// 本测试失败（目录还在）。
     #[test]

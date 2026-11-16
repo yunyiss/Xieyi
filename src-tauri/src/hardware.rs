@@ -133,6 +133,176 @@ fn parse_free_mb(text: &str) -> Option<u64> {
     None
 }
 
+/// 查询 GPU **总显存**（MB），不依赖已安装的引擎。
+///
+/// ## 与 `free_vram_mb` 的区别
+///
+/// `free_vram_mb` 首选 `llama-server --list-devices`，那是"当前能分到多少"，
+/// 会随桌面/其他程序占用浮动。但它**需要引擎已经在磁盘上**——而引导层
+/// 恰恰是"还没下引擎"的时刻，用来判断"这档模型我这台机器跑不跑得动"
+/// 就赶不上了。
+///
+/// 这个函数只用系统自带信息，**任何时候都能调到**，给出的是硬件的
+/// 总容量。用于预设卡片的「够不够」提示。
+///
+/// ## 各平台走的路
+///
+/// | 平台 | 手段 | 说明 |
+/// |---|---|---|
+/// | Windows | 注册表 `HardwareInformation.qwMemorySize` | WMI 的 `AdapterRAM` 是 u32，>4GB 会截断（实测 8GB 卡读成 4GB），只作兜底 |
+/// | Linux | `/sys/class/drm/cardN/device/mem_info_vram_total` | AMD / Intel 走 sysfs；NVIDIA 闭源驱动不暴露该文件，回退 nvidia-smi |
+/// | macOS | 引擎 `--list-devices` 或 nvidia-smi | 统一内存没有"独立显存"概念，且系统接口需 Metal 框架依赖，不值当 |
+pub fn total_vram_mb() -> Option<u64> {
+    #[cfg(target_os = "windows")]
+    {
+        query_windows_total_vram()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        query_linux_total_vram()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        // macOS：没有 sysfs/注册表；Metal 需要额外依赖。
+        // 返回 None，上层退化成"不显示显存建议"，而不是给错数字。
+        None
+    }
+}
+
+/// Windows：读注册表里驱动写下的显存大小。
+///
+/// 走 PowerShell 而不是引入 `windows` crate：后者为一个数字加进来
+/// 就是几百 KB，而我们**已经在用** PowerShell（查磁盘空间、查进程）。
+///
+/// 只读：`Get-ItemProperty` 不写、不建、不删任何东西。
+#[cfg(target_os = "windows")]
+fn query_windows_total_vram() -> Option<u64> {
+    // 显卡类 GUID；子键里 DriverDesc + HardwareInformation.qwMemorySize
+    const SCRIPT: &str = r#"
+$ErrorActionPreference='SilentlyContinue'
+$vc = @(Get-CimInstance Win32_VideoController)
+$present = @($vc | ForEach-Object { ([string]$_.Name).Trim().ToLower() })
+$best = 0
+Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}' |
+  ForEach-Object {
+    $p = Get-ItemProperty $_.PSPath
+    $desc = if ($p) { ([string]$p.DriverDesc).Trim() } else { '' }
+    if (-not $desc) { return }
+    if ($present.Count -gt 0 -and ($present -notcontains $desc.ToLower())) { return }
+    $mem = $p.'HardwareInformation.qwMemorySize'
+    if (-not $mem) {
+      $m = $p.'HardwareInformation.MemorySize'
+      if ($m -is [byte[]]) { $mem = [BitConverter]::ToUInt32($m, 0) } else { $mem = $m }
+    }
+    if ($mem -and [uint64]$mem -gt $best) { $best = [uint64]$mem }
+  }
+if ($best -gt 0) { [math]::Round($best / 1MB) }
+"#;
+
+    let mut cmd = Command::new("powershell");
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT]);
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+
+    let output = cmd.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|mb| *mb > 0)
+}
+
+/// Linux：总显存来自 sysfs，NVIDIA 回退 nvidia-smi。
+///
+/// ## 只认 `cardN` 和 `renderD*`
+///
+/// `/sys/class/drm/card*` 通配会命中 `card0-Virtual-1` 这类**连接器**目录
+/// （Kali 实测有 card0-Virtual-1..8），它们下面没有 `device/`。
+/// 连接器不是显卡，扫进去只会得到一堆空值。
+///
+/// ## AMD / Intel 与 NVIDIA 的区别
+///
+/// `mem_info_vram_total` 由 amdgpu / i915 驱动提供；NVIDIA 闭源驱动没有
+/// 这个文件，只能用 `nvidia-smi`。两者都有时取较大值（离散卡优先）。
+#[cfg(target_os = "linux")]
+fn query_linux_total_vram() -> Option<u64> {
+    linux_total_vram_from(Path::new("/sys/class/drm")).or_else(query_nvidia_smi_total)
+}
+
+/// [`query_linux_total_vram`] 的核心，sysfs 根目录可替换。
+///
+/// ## 为什么把路径做成参数
+///
+/// 真实路径 `/sys/class/drm` 只在有 AMD / Intel 显卡的机器上才有
+/// `mem_info_vram_total`。开发机是 N 卡（走 nvidia-smi 分支）、
+/// 测试虚拟机是 VMware 虚拟显卡（vendor `0x15ad`，没有这个文件），
+/// **两处都覆盖不到这条分支**。
+///
+/// 改成接受根目录后，可以拿一棵假的 sysfs 树把解析逻辑完整测一遍：
+/// 连接器目录要跳过、`renderD*` 要认、空文件要忽略、多卡取最大。
+/// 这些才是真正会写错的地方，而它们与"这台机器有没有 A 卡"无关。
+///
+/// 不加 ：测试要在任何平台跑得起来，
+/// 否则这条分支永远只能靠一台有 A 卡的 Linux 机器来验。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_total_vram_from(drm_root: &Path) -> Option<u64> {
+    let mut best: u64 = 0;
+
+    let entries = std::fs::read_dir(drm_root).ok()?;
+    for e in entries.flatten() {
+        let Some(name) = e.file_name().to_str().map(|s| s.to_string()) else {
+            continue;
+        };
+        // 只要 cardN（纯数字结尾）与 renderD*。
+        // `card*` 通配会命中 `card0-Virtual-1` 这类**连接器**目录
+        // （Kali 实测有 card0-Virtual-1..8），它们下面没有 `device/`。
+        let is_card = name
+            .strip_prefix("card")
+            .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
+        if !is_card && !name.starts_with("renderD") {
+            continue;
+        }
+        let dev = e.path().join("device");
+        let Ok(raw) = std::fs::read_to_string(dev.join("mem_info_vram_total")) else {
+            continue;
+        };
+        if let Ok(bytes) = raw.trim().parse::<u64>() {
+            let mb = bytes / (1024 * 1024);
+            if mb > best {
+                best = mb;
+            }
+        }
+    }
+
+    (best > 0).then_some(best)
+}
+
+/// `nvidia-smi` 读总显存（MB）。
+///
+/// 只在 Linux 用到：Windows 走注册表，那个值比 nvidia-smi 的
+/// `memory.total` 更接近标称容量（后者会扣掉保留区）。
+#[cfg(target_os = "linux")]
+fn query_nvidia_smi_total() -> Option<u64> {
+    let mut cmd = Command::new("nvidia-smi");
+    cmd.args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"]);
+
+    let output = cmd.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+}
+
 /// 调 `nvidia-smi` 读空闲显存。没有该命令（非 NVIDIA 机器）就返回 `None`。
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 fn query_nvidia_smi() -> Option<u64> {
@@ -170,6 +340,110 @@ fn query_nvidia_smi() -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 用一棵**假的 sysfs 树**验证 Linux 显存解析。
+    ///
+    /// ## 为什么这样做
+    ///
+    /// 真实路径只在有 AMD / Intel 显卡的机器上才有
+    /// `mem_info_vram_total`。开发机是 N 卡（走 nvidia-smi）、测试虚拟机
+    /// 是 VMware 虚拟显卡（vendor `0x15ad`，没有这个文件）——
+    /// 两处都覆盖不到这条分支。
+    ///
+    /// 而这段代码真正容易写错的地方与"有没有 A 卡"无关：
+    ///
+    /// - `card*` 通配会命中 `card0-Virtual-1` 这类**连接器**目录
+    /// - 多卡时要取最大而不是累加
+    /// - 空文件 / 非数字要跳过而不是崩
+    ///
+    /// 这些都能用假目录完整覆盖。真实 A 卡数据只有一份（RX 6750 GRE
+    /// 10GB，注册表 10720641024 字节），作为第 4 条断言固化进来。
+    #[test]
+    fn linux_vram_reads_sysfs_correctly() {
+        let root = std::env::temp_dir().join("xieyi-fake-drm");
+        let _ = std::fs::remove_dir_all(&root);
+
+        // 一个真实形状的 AMD 卡目录（10GB，取自 RX 6750 GRE 实测值）
+        let card = root.join("card0/device");
+        std::fs::create_dir_all(&card).unwrap();
+        std::fs::write(card.join("mem_info_vram_total"), b"10720641024\n").unwrap();
+        // 连接器目录：`card*` 通配会命中它，但它没有 device/
+        // 连接器目录：`card*` 通配会命中它。
+        //
+        // **必须也放一个 device/mem_info_vram_total**，否则过滤器删掉
+        // 测试照样过——因为本来就读不到文件。放一个更大的值才能区分：
+        // 不过滤就会把它选成 best。
+        let conn = root.join("card0-Virtual-1/device");
+        std::fs::create_dir_all(&conn).unwrap();
+        std::fs::write(conn.join("mem_info_vram_total"), b"34359738368").unwrap(); // 32GB
+        std::fs::create_dir_all(root.join("card0-Virtual-2")).unwrap();
+
+        let got = linux_total_vram_from(&root).expect("应当读到显存");
+        assert_eq!(got, 10720641024 / (1024 * 1024), "10GB 卡应读成 10220 MB");
+
+        // 再加一张更大的卡 → 取最大，不累加
+        let card2 = root.join("card1/device");
+        std::fs::create_dir_all(&card2).unwrap();
+        std::fs::write(card2.join("mem_info_vram_total"), b"17179869184").unwrap(); // 16GB
+        assert_eq!(
+            linux_total_vram_from(&root),
+            Some(17179869184 / (1024 * 1024)),
+            "多卡取最大"
+        );
+
+        // 空文件 / 非数字：跳过而不是崩
+        std::fs::write(card.join("mem_info_vram_total"), b"").unwrap();
+        std::fs::write(card2.join("mem_info_vram_total"), b"nonsense").unwrap();
+        assert_eq!(
+            linux_total_vram_from(&root),
+            None,
+            "读不出数字就当没有，不能返回 0 或崩"
+        );
+
+        // 目录根本不存在 → None（Kali / 无 drm 的环境）
+        assert_eq!(linux_total_vram_from(&root.join("nope")), None);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `renderD*` 也要认：某些驱动只在这里暴露 mem_info。
+    #[test]
+    fn linux_vram_accepts_render_node() {
+        let root = std::env::temp_dir().join("xieyi-fake-drm-render");
+        let _ = std::fs::remove_dir_all(&root);
+        let dev = root.join("renderD128/device");
+        std::fs::create_dir_all(&dev).unwrap();
+        std::fs::write(dev.join("mem_info_vram_total"), b"8589934592").unwrap(); // 8GB
+
+        assert_eq!(
+            linux_total_vram_from(&root),
+            Some(8589934592 / (1024 * 1024))
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 真机探测必须给出一个合理的显存值。
+    ///
+    /// 这条是**集成测试**（真的去问系统），不是单元测试。只验证「拿到的
+    /// 数字落在合理范围」——具体数值取决于这台机器装了什么卡，写死会
+    /// 立刻过期。
+    ///
+    /// 为什么值得保留：探针涉及注册表 / sysfs / 外部命令，全都可能因为
+    /// 权限、驱动、输出格式变化而静默返回 `None`。这条能在环境变化时
+    /// 立刻暴露。
+    ///
+    /// 无显卡的机器（CI、虚拟机）会返回 `None`，这时跳过而不是失败。
+    #[test]
+    fn total_vram_probe_gives_a_plausible_number() {
+        if let Some(mb) = total_vram_mb() {
+            assert!(mb >= 256, "总显存 {mb} MB 太小，探测多半读错了字段");
+            assert!(
+                mb <= 1024 * 1024,
+                "总显存 {mb} MB 超过 1 TB，多半把字节当成 MB 了"
+            );
+        }
+    }
 
     #[test]
     fn parses_cuda_device_line() {

@@ -149,6 +149,17 @@ fn probe_vram(app: tauri::AppHandle) -> Option<u64> {
     hardware::free_vram_mb(engine_server_path(&app).as_deref())
 }
 
+/// 硬件总显存（MB），**不依赖已安装的引擎**。
+///
+/// 与 `probe_vram` 的分工：
+///
+/// - `probe_vram` → 当前**可用**多少，要引擎在磁盘上（引导层用不上）
+/// - 这个 → 硬件**总共**多少，任何时候都能问（预设卡片判断"跑不跑得动"）
+#[tauri::command]
+fn probe_total_vram() -> Option<u64> {
+    hardware::total_vram_mb()
+}
+
 /// 当前配置的推理引擎可执行文件路径。没配置时返回 `None`。
 fn engine_server_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
     runtime::read_info(app)
@@ -182,6 +193,90 @@ fn init_early_logging() {
     };
     if let Some(root) = paths::data_root_early() {
         logging::init(root.join("logs"), level);
+    }
+}
+
+/// 便携模式下把 webview 的数据目录挪进 `data/`。
+///
+/// ## 为什么必须有这一步
+///
+/// "便携模式"的承诺是「文件夹拷走 = 数据全带走」。但两个平台都会把
+/// webview 的缓存与 localStorage 写到**系统标准位置**，与我们的 `data/`
+/// 无关——于是便携是假的：拷走文件夹，界面状态这些仍然留在原机器上。
+///
+/// 实测确认过两个平台都有这个缺口：
+///
+/// - Windows：`%LOCALAPPDATA%\com.xieyi.translate\EBWebView` 确实存在
+/// - Linux：`~/.local/share/com.xieyi.translate/WebKitCache` 确实存在
+///
+/// ## 为什么必须在最早期设置
+///
+/// 两条系统接口都只在**第一次初始化 webview 时**读环境变量，之后再改无效：
+///
+/// | 平台 | 变量 | 读它的时机 |
+/// |---|---|---|
+/// | Windows | `WEBVIEW2_USER_DATA_FOLDER` | 建第一个 WebView2 环境时 |
+/// | Linux | `XDG_DATA_HOME` / `XDG_CACHE_HOME` | WebKitGTK 初始化时 |
+///
+/// 所以只能在 `Builder::new()` 之前调用，`setup` 回调里已经太晚。
+///
+/// 非便携模式什么都不做，保持系统默认位置（那时它本该在用户目录）。
+fn setup_webview_data_dir() {
+    // WebView2 只存在于 Windows
+    #[cfg(target_os = "windows")]
+    {
+        let Some(data) = paths::portable_data_dir() else {
+            return;
+        };
+        let webview = data.join("EBWebView");
+        if let Err(e) = std::fs::create_dir_all(&webview) {
+            // 建不出来就别设：设了但写不进去，WebView2 会直接起不来，
+            // 那比缓存落在用户目录严重得多。
+            logging::warn(
+                "app",
+                format!("便携模式的 WebView2 目录不可用，回退到系统位置：{e}"),
+            );
+            return;
+        }
+        // SAFETY: 这里是单线程早期阶段（Tauri 尚未启动任何线程），
+        // 不存在并发读写环境变量。
+        unsafe {
+            std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &webview);
+        }
+        logging::info(
+            "app",
+            format!("便携模式：WebView2 数据目录 {}", webview.display()),
+        );
+    }
+
+    /*
+     * Linux：WebKitGTK 按 XDG Base Directory 规则找缓存与数据。
+     *
+     * 这里**只改这两个 XDG 变量，不动 HOME**——HOME 一动，用户的
+     * shell 配置、其他程序的数据定位都会跟着变，那是越界。
+     *
+     * 两个变量分开设：
+     * - `XDG_DATA_HOME` → localStorage / IndexedDB / 会话存储
+     * - `XDG_CACHE_HOME` → WebKitCache（实测这个目录最大）
+     */
+    #[cfg(target_os = "linux")]
+    {
+        let Some(data) = paths::portable_data_dir() else {
+            return;
+        };
+        let cache = data.join("cache");
+        for dir in [&data, &cache] {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                logging::warn("app", format!("便携模式目录不可用，回退到系统位置：{e}"));
+                return;
+            }
+        }
+        // SAFETY: 同 Windows 分支，单线程早期阶段。
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &data);
+            std::env::set_var("XDG_CACHE_HOME", &cache);
+        }
+        logging::info("app", format!("便携模式：XDG 数据目录 {}", data.display()));
     }
 }
 
@@ -387,6 +482,17 @@ pub fn run() {
 
     logging::info("app", format!("启动 Xieyi v{}", env!("CARGO_PKG_VERSION")));
 
+    // ── WebView2 数据目录：便携模式必须跟着走 ───────────────────────
+    // 必须在本进程创建任何 WebView **之前**设置：WebView2 加载器在
+    // 首次建环境时读这个变量，之后再改无效。
+    //
+    // 早先只在文档和注释里画了 `data\EBWebView\`，代码里从没设过它。
+    // 结果是"便携模式"并不便携：配置、引擎、模型都进了 `data/`，
+    // 而 WebView2 的缓存、localStorage 仍然写在
+    // `%LOCALAPPDATA%\com.xieyi.translate\EBWebView`（实测确认存在）。
+    // 用户以为把文件夹拷走就带走了全部数据，其实没有。
+    setup_webview_data_dir();
+
     // ── 单实例：必须先于任何 Tauri 代码 ─────────────────────────────
     // `tauri-plugin-single-instance` 的互斥量在 setup 里才检查，
     // 而 WebView 在 `build()` 内部就已创建。两个实例同时启动时
@@ -417,6 +523,14 @@ pub fn run() {
             }
 
             service::load_settings(app.handle());
+
+            // 配置里没有引擎、磁盘上却有 —— 认回来。
+            //
+            // 用户可能为了"重置设置"删掉 config.json 而留下引擎目录。
+            // 不认的话，界面会认为什么都没装，而下载又被"目录已存在"挡住，
+            // 卡死在引导层。这里放在启动阶段做一次，探测一次子进程，
+            // 不进任何轮询。
+            runtime::adopt_existing_engine(app.handle());
             // 磁盘缓存放后台线程装回：解析 JSONL 要几十毫秒，
             // 不该拖慢「双击到看见窗口」。装回来之前翻译只是少命中几次。
             service::load_disk_cache(app.handle());
@@ -430,6 +544,7 @@ pub fn run() {
             set_models_dir,
             open_data_subdir,
             probe_vram,
+            probe_total_vram,
             sync_window_theme,
             runtime::runtime_status,
             runtime::install_runtime,
