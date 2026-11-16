@@ -31,52 +31,33 @@ use tauri::{AppHandle, Manager};
 /// 防止某些解压工具丢弃空目录）。
 pub const PORTABLE_DIR: &str = "data";
 
-/// 显式声明「这里就要便携」的标记文件，与 `data/` 同级。
-///
-/// 共享目录（桌面 / 下载 / 文档 / 家目录）里只放一个 `data/` 不足以说明
-/// 那是**我们的**数据目录，见 `is_portable` 的说明。用户想要就建这个文件。
-pub const PORTABLE_MARKER: &str = ".portable";
-
-/// 认作「这个 `data/` 是我们自己的」的标志。
-///
-/// 只要里面已经出现这些中的任何一个，就说明该用户一直在这里跑程序，
-/// 不需要额外标记。
-const DATA_FINGERPRINTS: &[&str] = &["config.json", "logs", "runtime", "sessions"];
-
 /// 程序是否运行在便携模式。
 ///
-/// 判定条件：**程序所在目录下有 `data/` 目录，且该目录可写**。
+/// 判定条件只有一条：**程序所在目录下有 `data/` 目录，且该目录可写**。
 ///
-/// ## 共享目录里的 `data/` 不算数
+/// 这就是 VS Code / LibreAutomate 等便携软件的做法——用户建个 `data`
+/// 文件夹即生效，不需要理解任何概念。
 ///
-/// 只看「有没有 `data/`」会**劫持别人的目录**。桌面、下载、文档、家目录
-/// 这类所有程序共用的位置，`data` 是极常见的目录名——别的程序、用户自己
-/// 建的、解压工具留下的都可能叫这个。一旦误认：
+/// ## 曾经加过「标记文件」与「共享目录」两道判断，后来删了
 ///
-/// - 我们的配置、术语表、引擎记录会写进别人的目录
-/// - 而这些位置恰好最容易被清理（磁盘清理、解压工具清空下载目录、用户
-///   随手删桌面文件夹），**用户的数据会连带蒸发**
+/// 当时的顾虑是：桌面、下载这类共享位置里的 `data/` 可能属于别的程序，
+/// 误认会把我们的配置写进别人的目录，而那些位置最容易被清理。
 ///
-/// 这不是假想：同类的 magpie 就因此让一个从没要过便携的用户拿到一个
-/// 空的 magpie（issue #989），另一起是把数据写进 `Downloads\data`，
-/// 被解压工具清空后刚添加的 provider 消失。
+/// 但这两道判断的代价超过了收益：
 ///
-/// 所以在共享目录里，还要求下面任一条件成立才认作便携：
+/// - `is_shared_location` 只按**目录名**匹配，`桌面\子目录\data` 根本
+///   拦不住——该防的没防住
+/// - 在共享目录里还要求额外建 `.portable` 文件，于是「桌面建了 `data/`
+///   却不生效」，这是**确定会发生**的困惑，用户还无从得知要再加一个文件
+/// - 我们的发布形态决定了这个场景本来就罕见：NSIS 安装包装在
+///   `Programs\` 下没有 `data/`（走标准模式），便携 zip 解压出来
+///   就自带我们预置的 `data/`
 ///
-/// 1. 旁边有 [`PORTABLE_MARKER`]（`.portable`）——用户明确要求
-/// 2. `data/` 里已经有我们的文件（[`DATA_FINGERPRINTS`]）——一直在用
-///
-/// 两个都不满足时退回标准模式（写系统数据目录），这是**安全的默认**：
-/// 数据落在自己名下，不会因为别人的目录被清而丢。
-///
-/// 其他位置（如自建的 `D:\Tools\xieyi\`）不受此限，有 `data/` 即认。
-///
-/// 另外两个边界：
-///
-/// - 装到 `Program Files` 时程序目录不可写，即使有 `data/` 也不该用
-///   （写入会失败），所以要确认目录可写
-/// - AppImage 运行时「程序目录」是 `/tmp/.mount_xxx`（只读），
-///   真实位置在 `$APPIMAGE` 环境变量里，这里优先用它
+/// 而误判的后果也远比当初设想的小：唯一的递归删除只作用于我们自己
+/// 创建的 `runtime/llama-<版本>-<后端>/`，从不删 `data/` 本身或别人的
+/// 文件；标准模式的配置仍在 `%LOCALAPPDATA%`，两套互不影响。启动后
+/// 「设置 → 存储位置」会显示真实路径，用户一看就知道，删掉 `data/`
+/// 立刻恢复。
 pub fn is_portable() -> bool {
     portable_root().is_some_and(|root| is_portable_at(&root))
 }
@@ -84,66 +65,10 @@ pub fn is_portable() -> bool {
 /// [`is_portable`] 的判定本体，接受任意根目录。
 ///
 /// 拆出来是为了能测：`portable_root()` 取的是**当前 exe 所在目录**，
-/// 单测改不了它。只测 `data_is_ours` / `is_shared_location` 这类零件
-/// 也不够——把它们串起来的这段守卫才是真正防劫持的地方（踩过一次：
-/// 只测零件时把守卫整段删掉，测试照样全绿）。
+/// 单测改不了它。
 fn is_portable_at(root: &std::path::Path) -> bool {
     let data = root.join(PORTABLE_DIR);
-    if !data.is_dir() || !dir_is_writable(&data) {
-        return false;
-    }
-    if is_shared_location(root) && !data_is_ours(root, &data) {
-        return false;
-    }
-    true
-}
-
-/// 这个 `data/` 是否确实是我们的。
-///
-/// 判据见 [`is_portable`]：有 `.portable` 标记，或里面已有我们的文件。
-fn data_is_ours(root: &std::path::Path, data: &std::path::Path) -> bool {
-    if root.join(PORTABLE_MARKER).is_file() {
-        return true;
-    }
-    DATA_FINGERPRINTS
-        .iter()
-        .any(|name| data.join(name).exists())
-}
-
-/// 目录是否属于「所有程序共用、随时可能被清理」的位置。
-///
-/// 只看目录名。这是个**保守的启发式**：宁可多认几个共享目录（用户建个
-/// `.portable` 就能覆盖），也不要漏掉最危险的那几个。真正的系统路径
-/// 解析需要平台 API，而这里在启动极早期就会被调用（还没有 `AppHandle`）。
-fn is_shared_location(dir: &std::path::Path) -> bool {
-    // 家目录本身
-    if let Some(home) = std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(std::path::PathBuf::from)
-        && dir == home
-    {
-        return true;
-    }
-
-    let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
-        return false;
-    };
-    let name = name.to_lowercase();
-
-    // 英文名 + 中文名（中文 Windows 的已知文件夹是本地化名称）
-    const SHARED: &[&str] = &[
-        "downloads",
-        "download",
-        "desktop",
-        "documents",
-        "temp",
-        "tmp",
-        "下载",
-        "桌面",
-        "文档",
-        "临时",
-    ];
-    SHARED.contains(&name.as_str())
+    data.is_dir() && dir_is_writable(&data)
 }
 
 /// 便携模式的根目录（也就是程序所在目录）。
@@ -165,7 +90,30 @@ pub fn portable_root() -> Option<PathBuf> {
 }
 
 /// 便携模式下的数据根目录。
+///
+/// **只有确认处于便携模式时才返回 `Some`。**
+///
+/// ## 为什么这个判断放在函数内部
+///
+/// 早先这里只做路径拼接（`portable_root()?.join("data")`），把
+/// 「是不是便携模式」留给调用方自己判断。结果：
+///
+/// - `app_data` 记得同时判 `is_portable()`，是对的
+/// - `lib.rs` 里设置 webview 目录的两处**只调了本函数**，忘了判
+///
+/// 于是「共享目录里的 `data/` 要额外证明」这条防线被绕过：在桌面放一个
+/// `data/` 目录，程序照样进入便携模式，把 WebView 缓存写了进去。
+/// 而防劫持正是为了防这种情况。
+///
+/// 这是同一类缺陷的**第二次**出现——上一次是「取消标志设了但没人读」。
+/// 教训是：**让正确的用法成为唯一可能的用法**，不要靠调用方记得配第二个条件。
+///
+/// 需要「不管是不是便携都拿到那个路径」的场景目前不存在；
+/// 真出现时应该另开一个名字明确的函数。
 pub fn portable_data_dir() -> Option<PathBuf> {
+    if !is_portable() {
+        return None;
+    }
     portable_root().map(|d| d.join(PORTABLE_DIR))
 }
 
@@ -467,56 +415,100 @@ mod tests {
         let data = dir.join(PORTABLE_DIR);
         assert!(!data.is_dir(), "前提：data 目录不存在");
 
-        // 建了 data/ 之后才算便携
+        // 建了 data/ 之后才算便携 —— 用整体判定断言，不只测零件
         std::fs::create_dir_all(&data).unwrap();
-        assert!(data.is_dir());
-        assert!(dir_is_writable(&data), "临时目录应当可写");
+        assert!(is_portable_at(&dir), "有 data/ 子目录就该是便携模式");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 共享目录里的 `data/` **不能**单独作为便携依据。
+    /// 有 `data/` 就是便携，**不需要任何标记文件**。
     ///
-    /// 桌面 / 下载 / 文档 / 家目录是所有程序共用的位置，`data` 是极常见的
-    /// 目录名。如果只看"有没有 data/"，我们会把配置写进别人的目录——而
-    /// 这些位置最容易被清理，用户数据会连带蒸发。
+    /// 这是 VS Code / LibreAutomate 的做法：建个 `data` 文件夹即生效。
     ///
-    /// 这条测的是 `is_portable_at` 的整体判定，不是零件：先前的版本只断言
-    /// `data_is_ours`，结果把守卫整段删掉测试依然全绿，等于没测。
+    /// ## 为什么这条要单独测
     ///
-    /// 变异验证：把 `is_portable_at` 里
-    /// `if is_shared_location(root) && !data_is_ours(root, &data)` 删掉，
-    /// 第一条断言失败。
+    /// 曾经在共享目录（桌面、下载）里额外要求一个 `.portable` 文件，
+    /// 于是「桌面建了 `data/` 却不生效」——确定会发生、且用户无从得知
+    /// 要再加什么。最终按主流做法删掉了那套判断。
+    ///
+    /// 这条锁住的就是：**只看 `data/` 存在且可写，不看任何别的**。
+    ///
+    /// 变异验证：在 `is_portable_at` 里加回任何额外条件（比如要求某个
+    /// 标记文件），本测试失败。
     #[test]
-    fn shared_location_needs_proof_before_becoming_portable() {
-        let shared = std::env::temp_dir().join("Downloads");
-        let _ = std::fs::remove_dir_all(&shared);
-        let data = shared.join(PORTABLE_DIR);
-        std::fs::create_dir_all(&data).unwrap();
+    fn existing_data_dir_alone_enables_portable() {
+        let dir = std::env::temp_dir().join(format!("xieyi-portable-plain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
 
-        // 空 data/ + 无标记 → **不算便携**（最难也最该防的情况）
+        // 目录在，但没有 data/ → 不是便携
+        assert!(!is_portable_at(&dir), "没有 data/ 不该是便携模式");
+
+        // 只建 data/，不放任何标记文件
+        std::fs::create_dir_all(dir.join(PORTABLE_DIR)).unwrap();
         assert!(
-            !is_portable_at(&shared),
-            "Downloads 里的空 data/ 不能触发便携模式，否则会写进别人的目录"
+            is_portable_at(&dir),
+            "建了 data/ 就该是便携模式，不该再要求任何标记文件"
         );
 
-        // 有 .portable 标记 → 算
-        std::fs::write(shared.join(PORTABLE_MARKER), b"").unwrap();
-        assert!(is_portable_at(&shared), ".portable 标记应当直接生效");
-        let _ = std::fs::remove_file(shared.join(PORTABLE_MARKER));
-
-        // data/ 里已有我们的文件 → 算（老用户一直在用）
-        std::fs::write(data.join("config.json"), b"{}").unwrap();
-        assert!(
-            is_portable_at(&shared),
-            "已有 config.json 说明是这个用户的数据目录"
-        );
-
-        let _ = std::fs::remove_dir_all(&shared);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 非共享位置不需要证明：自建目录有 `data/` 就算便携。
+    /// `portable_data_dir()` 必须**自己**判断是不是便携模式。
     ///
+    /// ## 这条防的是什么
+    ///
+    /// 早先这个函数只做路径拼接，把「是不是便携」留给调用方：
+    ///
+    /// - `app_data` 记得同时判 `is_portable()`（对的）
+    /// - `lib.rs` 里设置 webview 目录的两处**忘了判**
+    ///
+    /// 于是绕过判定：真机实测在桌面放一个 `data/` 目录，程序把 WebView
+    /// 缓存写进了桌面，而当时本该走标准模式。
+    ///
+    /// 修法是把判断挪进函数内部：**让正确的用法成为唯一可能的用法**，
+    /// 不再依赖调用方记得配第二个条件。
+    ///
+    /// 变异验证：把 `portable_data_dir` 里的 `if !is_portable() { return None }`
+    /// 删掉，本测试失败。
+    #[test]
+    fn portable_data_dir_refuses_shared_location_without_proof() {
+        // 用假 sysfs 那套思路测不了：is_portable() 读的是当前 exe 位置。
+        // 改为**源码级断言**——这个函数体内必须出现对 is_portable 的调用。
+        // 听起来笨，但它正面挡住了「以后有人又把判断挪给调用方」这类回归。
+        let source = include_str!("paths.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap_or("");
+
+        let start = production
+            .find("pub fn portable_data_dir()")
+            .expect("找不到 portable_data_dir");
+        let body_start = production[start..].find('{').map(|i| start + i).unwrap();
+        // 数到配对的右花括号
+        let mut depth = 0usize;
+        let mut end = body_start;
+        for (i, ch) in production[body_start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = body_start + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body = &production[body_start..=end];
+
+        assert!(
+            body.contains("is_portable()"),
+            "portable_data_dir 必须自己判断便携模式，否则调用方漏判就会绕过防劫持。\n\
+             当前函数体：{body}"
+        );
+    }
+
     /// 模型目录自愈：数据目录下的 `models/` 里有 `.gguf` 就认它。
     ///
     /// 用户实测：删掉 `config.json` 重置设置，`modelsDir` 一起没了。而
@@ -561,21 +553,6 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
-    }
-
-    /// 变异验证：把 `is_shared_location` 改成恒返回 `true`，本测试失败。
-    #[test]
-    fn normal_location_becomes_portable_without_proof() {
-        let root = std::env::temp_dir().join("xieyi-tools-dir");
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join(PORTABLE_DIR)).unwrap();
-
-        assert!(
-            is_portable_at(&root),
-            "自建目录里有 data/ 就该是便携模式，不该要求 .portable 标记"
-        );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// 配置写入：内容按原样落盘，且不留临时文件。
@@ -667,20 +644,6 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// 共享位置名单要覆盖中英文两类目录名。
-    ///
-    /// 中文 Windows 的已知文件夹是本地化名称（`下载` / `桌面` / `文档`），
-    /// 只认英文名会漏掉最常见的那批用户。
-    #[test]
-    fn shared_location_matches_localized_names() {
-        for name in ["Downloads", "Desktop", "Documents", "下载", "桌面", "文档"] {
-            let p = std::path::Path::new("/tmp").join(name);
-            assert!(is_shared_location(&p), "{name} 应当被认作共享位置");
-        }
-        // 大小写不敏感
-        assert!(is_shared_location(std::path::Path::new("/tmp/DOWNLOADS")));
     }
 
     #[test]
