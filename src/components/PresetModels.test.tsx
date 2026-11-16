@@ -29,6 +29,8 @@ vi.mock("../lib/ipc", async (importOriginal) => {
     downloadPreset: vi.fn(async () => "D:/models/x.gguf"),
     cancelDownload: vi.fn(async () => {}),
     deletePresetPartial: vi.fn(async () => 0),
+    // 默认读不到显存：多数用例不关心兼容性提示
+    probeTotalVram: vi.fn(async () => null),
     onPresetProgress: vi.fn(async () => () => {}),
   };
 });
@@ -417,6 +419,51 @@ describe("PresetModels · featured 模式", () => {
 
     expect(await screen.findByText("自定义 A")).toBeInTheDocument();
     expect(screen.queryByText("自定义 B")).toBeNull();
+  });
+
+  /**
+   * 卡片要给出**这台机器**跑不跑得动的结论。
+   *
+   * 原来只有硬编码的「建议 8 GB 显存」——用户知道自己 4 GB 卡，但界面
+   * 仍然写 8 GB，等于没说。
+   *
+   * 变异验证：把 `evaluateFit` 那段 JSX 删掉，本测试失败。
+   */
+  it("有显存读数时，卡片给出兼容性结论", async () => {
+    vi.mocked(ipc.probeTotalVram).mockResolvedValue(4 * 1024); // 4 GB 卡
+    vi.mocked(ipc.listPresets).mockResolvedValue([
+      preset({
+        id: "Hy-MT2-7B-Q4_K_M",
+        name: "Hy-MT2 7B · 均衡",
+        sizeBytes: 4_624_648_896,
+      }),
+    ]);
+
+    render(<PresetModels mode="full" />);
+
+    // 4 GB 跑 4.3 GB 的模型 → 放不下，结论里必须提到 CPU
+    expect(await screen.findByText(/你的显卡 4 GB/)).toBeInTheDocument();
+    expect(screen.getByText(/基本靠 CPU/)).toBeInTheDocument();
+  });
+
+  /**
+   * 读不到显存时**不显示结论**。
+   *
+   * macOS / 无独显 / 虚拟机都会走到这里。编一个数字比不说更糟。
+   *
+   * 变异验证：把 `fit.level === "unknown"` 那个提前 return 删掉，
+   * 本测试失败。
+   */
+  it("读不到显存时不显示兼容性结论", async () => {
+    vi.mocked(ipc.probeTotalVram).mockResolvedValue(null);
+    vi.mocked(ipc.listPresets).mockResolvedValue([
+      preset({ id: "Hy-MT2-7B-Q4_K_M", name: "Hy-MT2 7B · 均衡" }),
+    ]);
+
+    render(<PresetModels mode="full" />);
+
+    await screen.findByText("Hy-MT2 7B · 均衡");
+    expect(screen.queryByText(/你的显卡/)).toBeNull();
   });
 
   /**

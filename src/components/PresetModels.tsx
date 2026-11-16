@@ -29,9 +29,11 @@ import {
   downloadPreset,
   listPresets,
   onPresetProgress,
+  probeTotalVram,
   type PresetProgress,
   type PresetStatus,
 } from "../lib/ipc";
+import { evaluateFit } from "../lib/modelFit";
 import { useTauriEvent } from "../lib/useTauriEvent";
 
 /** 卡片当前处于哪个视觉状态。 */
@@ -78,6 +80,8 @@ export function percentOf(downloaded: number, total: number): number | null {
 
 interface RowProps {
   preset: PresetStatus;
+  /** 硬件总显存（MB）；`null` = 读不到，此时不显示兼容性结论 */
+  totalVramMb: number | null;
   /** 这个模型的下载进度（由父组件按 id 分发） */
   progress: PresetProgress | null;
   /** 刷新列表（下载完成/删除后） */
@@ -98,6 +102,7 @@ interface RowProps {
 
 function PresetRow({
   preset,
+  totalVramMb,
   progress,
   onRefresh,
   busyId,
@@ -206,9 +211,41 @@ function PresetRow({
             "建议显存。低于这个值时仍可用纯 CPU 运行，只是慢"
           }
         >
-          {formatBytes(preset.sizeBytes)} · {preset.vramHintMb / 1024} GB 显存
+          {formatBytes(preset.sizeBytes)} · 建议 {preset.vramHintMb / 1024} GB 显存
         </span>
       </div>
+
+      {/*
+        兼容性结论：**这台机器跑这一档会怎样**。
+
+        原来只有右侧那句硬编码的「建议 X GB 显存」——不管用户机器什么
+        配置都这么说，用户既不知道自己够不够，也不知道不够时会发生什么，
+        只能下完、加载、失败，然后看到一句「引擎启动失败」。
+
+        `evaluateFit` 在没有读数时返回 `unknown`、`text` 为空，
+        此时**整块不渲染**：宁可不说，也不给错的建议。
+      */}
+      {(() => {
+        const fit = evaluateFit({ sizeBytes: preset.sizeBytes, totalVramMb });
+        // 读不到显存时 text 为空 —— 那一档不给结论，也不占位
+        if (!fit.text) return null;
+        const color =
+          fit.level === "fits"
+            ? "var(--brand-text)"
+            : fit.level === "partial"
+              ? "var(--text-muted)"
+              : "var(--danger)";
+        return (
+          <p
+            className="m-0 mt-1 text-[11px]"
+            style={{ color }}
+            data-fit={fit.level}
+          >
+            {fit.level === "fits" ? "✓ " : fit.level === "partial" ? "◐ " : "⚠ "}
+            {fit.text}
+          </p>
+        );
+      })()}
 
       {/*
         显存与体积合并到标题行右侧（见上面的 span），说明文字只在
@@ -418,6 +455,13 @@ export function PresetModels({
   onPendingChange,
 }: Props) {
   const [list, setList] = useState<PresetStatus[]>([]);
+  /**
+   * 硬件总显存（MB）。`null` = 读不到（无独显 / macOS / 虚拟机）。
+   *
+   * 用 `probeTotalVram` 而不是 `probeVram`：后者要引擎在磁盘上，
+   * 而引导层恰恰是还没下引擎的时候。
+   */
+  const [totalVramMb, setTotalVramMb] = useState<number | null>(null);
   const [loaded, setLoaded] = useState(false);
   /** 同一时刻只允许一个预设下载：后端有闸门，前端先禁用免得用户白点 */
   const [busyId, setBusyId] = useState<string | null>(null);
@@ -442,6 +486,15 @@ export function PresetModels({
   useEffect(() => {
     aliveRef.current = true;
     void refresh();
+    // 探一次显存。与 refresh 并行：它可能慢（Windows 上要起一次
+    // PowerShell），不该拖住列表渲染。
+    void probeTotalVram()
+      .then((mb) => {
+        if (aliveRef.current) setTotalVramMb(mb);
+      })
+      .catch(() => {
+        // 读不到就不显示建议，不报错——没有独显不是错误
+      });
     return () => {
       aliveRef.current = false;
     };
@@ -495,6 +548,7 @@ export function PresetModels({
     <PresetRow
       key={p.id}
       preset={p}
+      totalVramMb={totalVramMb}
       progress={byId[p.id] ?? null}
       onRefresh={refresh}
       busyId={busyId}

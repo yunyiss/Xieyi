@@ -488,7 +488,19 @@ export const compactHistory = (model: string, messages: ChatMessage[]) =>
   invoke<string>("compact_history", { request: { model, messages } });
 export const abort = (model?: string) =>
   invoke<void>("abort", { model: model ?? null });
+/** 当前**可用**显存（MB）。要引擎在磁盘上才问得到。 */
 export const probeVram = () => invoke<number | null>("probe_vram");
+
+/**
+ * 硬件**总**显存（MB），不依赖引擎。
+ *
+ * 与 `probeVram` 的分工：那个问引擎「我现在能分到多少」，这个问系统
+ * 「这块卡总共多少」。引导层还没下引擎，只能用后者判断「这档跑不跑得动」。
+ *
+ * `null` 表示读不到（无独显 / 不支持的平台），界面应退化成不给建议，
+ * 而不是显示错的数字。
+ */
+export const probeTotalVram = () => invoke<number | null>("probe_total_vram");
 export const listSessions = () => invoke<Session[]>("list_sessions");
 export const saveSession = (session: Session) =>
   invoke<void>("save_session", { session });
