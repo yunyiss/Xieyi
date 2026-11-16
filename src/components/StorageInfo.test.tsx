@@ -49,6 +49,18 @@ describe("StorageInfo · 翻译缓存", () => {
     // 只清调用记录，**不清实现**：`vi.clearAllMocks()` 会把 mockResolvedValue
     // 一起复位，导致后面的用例拿到 undefined。用 reset 也不行（同样复位实现）。
     // 这里的默认实现定义在 vi.mock 工厂里，需要保留。
+    // AppInfo 也要复位：某条用例会把它改成 linux 平台，
+    // 不清的话后面的用例会继承成 Linux 写法。
+    vi.mocked(ipc.getAppInfo).mockResolvedValue({
+      os: "windows",
+      arch: "x86_64",
+      version: "0.1.0",
+      dataDir: "C:/data/com.xieyi.translate",
+      modelsDir: "D:/models",
+      modelsDirConfigured: true,
+      runtimeVersion: "b11714",
+      portable: false,
+    } as never);
     vi.mocked(ipc.getCacheStatus).mockResolvedValue({
       entries: 12,
       bytes: 2048,
@@ -124,7 +136,7 @@ describe("StorageInfo · 翻译缓存", () => {
   it("便携模式显示「便携模式」标签", async () => {
     // 用户把 exe 拖走后会从便携变回标准模式，
     // 标签是唯一能告诉他「现在在哪种模式」的地方
-    vi.mocked(ipc.getAppInfo).mockResolvedValueOnce({
+    vi.mocked(ipc.getAppInfo).mockResolvedValue({
       os: "windows",
       arch: "x86_64",
       version: "0.1.0",
@@ -153,6 +165,48 @@ describe("StorageInfo · 翻译缓存", () => {
     await waitFor(() => {
       expect(screen.getByText(/磁盘只读/)).toBeTruthy();
     });
+  });
+
+  /**
+   * 平台差异：webview 缓存目录名与路径分隔符都不能写死 Windows 的。
+   *
+   * 实际踩到过：Linux 截图里「界面缓存」显示成 `EBWebView` 加反斜杠，
+   * 而 Linux 上真实目录是 `WebKitCache`——用户照着名字去文件夹里找会
+   * 找不到。
+   *
+   * 变异验证：把 `webviewCache` 写死成 "EBWebView"，本测试失败。
+   */
+  it("Linux 上显示 WebKitCache 与正斜杠", async () => {
+    vi.mocked(ipc.getAppInfo).mockResolvedValue({
+      os: "linux",
+      arch: "x86_64",
+      version: "0.1.0",
+      dataDir: "/home/u/.local/share/com.xieyi.translate",
+      modelsDir: "/home/u/models",
+      modelsDirConfigured: true,
+      runtimeVersion: "b11714",
+      portable: false,
+    } as never);
+
+    render(<StorageInfo />);
+
+    // 等这一块渲染出来，再用全文断言——子项文本被截断样式包着，
+    // 精确 getByText 匹配很容易被空白/截断搞崩。
+    await waitFor(() => screen.getByText(/界面缓存/));
+    const text = document.body.textContent ?? "";
+    expect(text).toContain("WebKitCache");
+    expect(text).not.toContain("EBWebView");
+    expect(text).toContain("sessions/");
+    expect(text).toContain("logs/");
+    expect(text).toContain("cache/");
+  });
+
+  /** Windows 上仍显示 EBWebView 与反斜杠。 */
+  it("Windows 上显示 EBWebView 与反斜杠", async () => {
+    render(<StorageInfo />);
+    // 用正则避开源码里反斜杠的转义噪音
+    expect(await screen.findByText(/^EBWebView.$/)).toBeInTheDocument();
+    expect(screen.getByText(/^sessions.$/)).toBeInTheDocument();
   });
 
   it("「缓存」措辞不混淆：译文缓存与界面缓存分开标注", async () => {

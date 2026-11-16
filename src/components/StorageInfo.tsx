@@ -35,6 +35,16 @@ const btnStyle = {
 
 const mono = { fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" };
 
+/**
+ * 首帧判平台的兜底：`AppInfo` 还没到的时候用。
+ *
+ * 只看是不是 Windows——Linux 与 macOS 在这个组件里显示方式相同
+ * （都用正斜杠、都叫 `WebKitCache`），不需要再细分。
+ */
+function isWindowsUA(): boolean {
+  return typeof navigator !== "undefined" && /Windows/i.test(navigator.userAgent);
+}
+
 export function StorageInfo({ refreshToken = 0 }: { refreshToken?: number }) {
   const [info, setInfo] = useState<AppInfo | null>(null);
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
@@ -74,7 +84,7 @@ export function StorageInfo({ refreshToken = 0 }: { refreshToken?: number }) {
       <span
         className="min-w-0 flex-1 truncate"
         style={{ ...mono, color: "var(--text)" }}
-        title={info ? `${info.dataDir}\\${name}` : ""}
+        title={info ? `${info.dataDir}${sep}${name}` : ""}
       >
         {name}
       </span>
@@ -82,6 +92,23 @@ export function StorageInfo({ refreshToken = 0 }: { refreshToken?: number }) {
   );
 
   const enginePath = runtime?.installed ? runtime.serverPath : null;
+
+  /*
+   * 路径分隔符与 webview 缓存目录名都按平台取。
+   *
+   * 早先这两处都写死成 Windows 的：分隔符用反斜杠，缓存目录叫
+   * `EBWebView`。Linux 上截图显示成 `EBWebView\` —— 而实际目录是
+   * `WebKitCache`，用户照着这个名字去文件夹里找会找不到。
+   *
+   * `info` 还没到时用 `navigator.userAgent` 兜底：`info?.os` 为
+   * undefined 会被当成"非 Windows"，于是 Windows 用户会先看到一帧
+   * Linux 的写法再跳回来。首帧就判对，不需要猜。
+   */
+  const platform = info?.os ?? (isWindowsUA() ? "windows" : "other");
+  const isWindows = platform === "windows";
+  const sep = isWindows ? "\\" : "/";
+  /** WebView2 在 Windows，WebKitGTK 在 Linux / macOS */
+  const webviewCache = isWindows ? "EBWebView" : "WebKitCache";
 
   return (
     <div className="mb-3">
@@ -146,11 +173,11 @@ export function StorageInfo({ refreshToken = 0 }: { refreshToken?: number }) {
           style={{ borderColor: "var(--border)" }}
         >
           <Sub label="配置" name="config.json" />
-          <Sub label="会话" name={"sessions\\"} />
-          <Sub label="日志" name={"logs\\"} />
-          <Sub label="译文缓存" name={"cache\\"} />
+          <Sub label="会话" name={`sessions${sep}`} />
+          <Sub label="日志" name={`logs${sep}`} />
+          <Sub label="译文缓存" name={`cache${sep}`} />
           {/* 这条是 WebView2 自己的，与译文缓存无关，早先笼统叫「缓存」容易混 */}
-          <Sub label="界面缓存" name={"EBWebView\\"} />
+          <Sub label="界面缓存" name={`${webviewCache}${sep}`} />
         </div>
 
         {/* 引擎：显示真正在运行的那个可执行文件，而不是存放目录 */}
