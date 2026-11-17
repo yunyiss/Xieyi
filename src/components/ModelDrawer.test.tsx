@@ -71,6 +71,9 @@ vi.mock("../lib/ipc", async (importOriginal) => {
     setManualRuntime: vi.fn(async () => ({})),
     discoverRuntimes: vi.fn(async () => []),
     probeVram: vi.fn(async () => null),
+    // 「通用」页的硬件状态：不依赖真实硬件，给固定值
+    probeTotalVram: vi.fn(async () => 8192),
+    probeRam: vi.fn(async () => ({ totalMb: 16384, availableMb: 4096 })),
     openModelsDir: vi.fn(async () => "D:/models"),
     restartService: vi.fn(async () => ({
       running: true,
@@ -134,6 +137,16 @@ function renderDrawer(props: Partial<Parameters<typeof ModelDrawer>[0]> = {}) {
   );
 }
 
+/**
+ * 切到「引擎」页。
+ *
+ * 2026-11-17 把设置抽屉拆成四页后，引擎下载、层数、存储位置都从
+ * 默认的「通用」页挪到了这里。凡是测这些区块的用例都要先切页。
+ */
+async function openEngineTab() {
+  await userEvent.click(await screen.findByRole("tab", { name: "引擎" }));
+}
+
 describe("ModelDrawer · 设置读写", () => {
   beforeEach(async () => {
     // **`clearAllMocks` 不会重置 `mockImplementation`。**
@@ -154,6 +167,7 @@ describe("ModelDrawer · 设置读写", () => {
 
   it("打开时读取设置，并把 TTL 档位显示出来", async () => {
     renderDrawer();
+    await openEngineTab();
     await waitFor(() => {
       expect(ipc.getSettings).toHaveBeenCalled();
     });
@@ -185,10 +199,63 @@ describe("ModelDrawer · 设置读写", () => {
     });
 
     renderDrawer();
+    await openEngineTab();
 
     expect(
       await screen.findByText(/空闲 60 秒释放/),
     ).toBeInTheDocument();
+  });
+
+  /**
+   * 引擎没在跑时**不能**去问路由模型。
+   *
+   * `listRouterModels` 内部走 `ensure()`，会把引擎拉起来。设置抽屉的
+   * 2.5 秒轮询原来无条件调它，于是"打开设置"等于"启动推理引擎"——
+   * 既慢（首次数百毫秒）又违背「不常驻」的定位。
+   *
+   * 变异验证：把 `if (s.running)` 守卫去掉，本测试失败。
+   */
+  it("引擎没在跑时不去问路由模型，避免打开设置就拉起引擎", async () => {
+    vi.mocked(ipc.getSettings).mockResolvedValue({
+      ttlSecs: 300,
+      gpuLayers: 1001,
+      pinned: [],
+      modelsDir: "D:/models",
+      running: false,
+      port: 0,
+    } as never);
+
+    renderDrawer();
+
+    await waitFor(() => {
+      expect(ipc.getSettings).toHaveBeenCalled();
+    });
+    expect(ipc.listRouterModels).not.toHaveBeenCalled();
+  });
+
+  /**
+   * 切走再切回「通用」不能重新探测硬件。
+   *
+   * 之前 `HardwareStatus` 自己发探测请求，而页签内容是条件渲染的——
+   * 每次切回都会卸载重建，界面先闪一下「检测中…」。
+   * 现在数据放在长期挂载的 `ModelDrawer` 里，视图只负责显示。
+   *
+   * 变异验证：把硬件探测移回 `HardwareStatus` 的 `useEffect`，本测试失败。
+   */
+  it("切走再切回「通用」不会重新探测硬件", async () => {
+    const user = userEvent.setup();
+    renderDrawer();
+
+    await waitFor(() => expect(ipc.probeTotalVram).toHaveBeenCalledTimes(1));
+
+    await user.click(screen.getByRole("tab", { name: "引擎" }));
+    await user.click(screen.getByRole("tab", { name: "通用" }));
+
+    // 数值立即在（父级状态还在），且没有再探测一次
+    expect(await screen.findByText("8.0 GB · 可用未知")).toBeInTheDocument();
+    // 内存条的数据也还在，说明不是重新挂载后现拉的
+    expect(screen.getByText("16.0 GB · 可用 4.0 GB")).toBeInTheDocument();
+    expect(ipc.probeTotalVram).toHaveBeenCalledTimes(1);
   });
 
   it("设置里提供「下载引擎」入口，并能触发下载", async () => {
@@ -201,6 +268,7 @@ describe("ModelDrawer · 设置读写", () => {
     //
     // 变异验证：把 downloadEngine 那个按钮删掉 → 本条失败。
     renderDrawer();
+    await openEngineTab();
 
     await userEvent.click(
       await screen.findByRole("button", { name: /重新下载/ }),
@@ -240,8 +308,9 @@ describe("ModelDrawer · 设置读写", () => {
     );
 
     renderDrawer();
+    await openEngineTab();
 
-    // 停在「通用」页即可，引擎区块默认就显示在这里
+    // 引擎区块在「引擎」页；此时状态还没到，只该显示「正在读取…」
     expect(await screen.findByText(/正在读取/)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /下载引擎/ })).toBeNull();
     expect(screen.queryByRole("button", { name: /重新下载/ })).toBeNull();
@@ -261,6 +330,7 @@ describe("ModelDrawer · 设置读写", () => {
    */
   it("已装引擎时第一下只变文字，不发起下载", async () => {
     renderDrawer(); // 默认 mock 里 installed = true
+    await openEngineTab();
 
     await userEvent.click(
       await screen.findByRole("button", { name: /重新下载/ }),
@@ -276,6 +346,7 @@ describe("ModelDrawer · 设置读写", () => {
   /** 第二下才真正开始下载。 */
   it("再点一次「确认重装」才真正下载", async () => {
     renderDrawer();
+    await openEngineTab();
 
     await userEvent.click(
       await screen.findByRole("button", { name: /重新下载/ }),
@@ -306,6 +377,7 @@ describe("ModelDrawer · 设置读写", () => {
     });
 
     renderDrawer();
+    await openEngineTab();
 
     await userEvent.click(
       await screen.findByRole("button", { name: /下载引擎/ }),
@@ -331,6 +403,7 @@ describe("ModelDrawer · 设置读写", () => {
    */
   it("待确认的按钮文案与「重新下载」等长，不会撑宽布局", async () => {
     renderDrawer();
+    await openEngineTab();
 
     const before = await screen.findByRole("button", { name: /重新下载/ });
     const widthBefore = before.textContent?.length ?? 0;
@@ -356,6 +429,7 @@ describe("ModelDrawer · 设置读写", () => {
     vi.mocked(ipc.installRuntime).mockRejectedValue("解压失败: i/o error");
 
     renderDrawer();
+    await openEngineTab();
     await userEvent.click(
       await screen.findByRole("button", { name: /重新下载/ }),
     );
@@ -374,6 +448,7 @@ describe("ModelDrawer · 设置读写", () => {
     vi.mocked(ipc.installRuntime).mockRejectedValue("磁盘空间不足");
 
     renderDrawer();
+    await openEngineTab();
     await userEvent.click(
       await screen.findByRole("button", { name: /重新下载/ }),
     );

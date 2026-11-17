@@ -14,6 +14,8 @@ import {
   type RuntimeProgress,
   listRouterModels,
   openModelsDir,
+  probeRam,
+  probeTotalVram,
   probeVram,
   restartService,
   setGlossary,
@@ -27,12 +29,14 @@ import {
   type DiscoveredRuntime,
   type GlossaryEntry,
   type LocalModel,
+  type MemoryInfo,
   type RuntimeProbe,
   type RuntimeStatus,
   type Settings,
 } from "../lib/ipc";
 import { useTauriEvent } from "../lib/useTauriEvent";
 import { DownloadSourceSettings } from "./DownloadSourceSettings";
+import { HardwareStatus } from "./HardwareStatus";
 import { PresetModels } from "./PresetModels";
 import { Select } from "./Select";
 import { StorageInfo } from "./StorageInfo";
@@ -89,8 +93,14 @@ function ctxOptions(model: LocalModel): number[] {
   return list.sort((a, b) => a - b);
 }
 
-/** 设置抽屉的三个页签。 */
-export type DrawerTab = "general" | "models" | "network";
+/**
+ * 设置抽屉的四个页签。
+ *
+ * 「引擎」单独成页是 2026-11-17 拆的：原来「通用」一页同时装了主题、
+ * 空闲释放、推理引擎、层数、存储位置五类东西，找一样要滚半天。
+ * 现在按「偏好 / 引擎 / 模型 / 下载」分开。
+ */
+export type DrawerTab = "general" | "engine" | "models" | "network";
 
 interface Props {
   open: boolean;
@@ -240,6 +250,17 @@ export function ModelDrawer({
   const [glossaryText, setGlossaryText] = useState("");
   const [glossarySaved, setGlossarySaved] = useState(false);
   const [freeVram, setFreeVram] = useState<number | null>(null);
+  /**
+   * 硬件总量放在这里而不是 `HardwareStatus` 里。
+   *
+   * 抽屉是长期挂载的，而页签内容是条件渲染的——切走再切回会重新挂载
+   * 子组件。数据若跟着子组件走，每次切回都要重新探测，界面先闪一下
+   * 「检测中…」。硬件总量又极少变化，没必要跟着视图生命周期走。
+   *
+   * `undefined` = 还没读过；`null` = 读过但读不到。两者语义不同。
+   */
+  const [totalVramMb, setTotalVramMb] = useState<number | null | undefined>(undefined);
+  const [ramInfo, setRamInfo] = useState<MemoryInfo | null | undefined>(undefined);
   /** 切换引擎后 +1，让「存储位置」重取当前的引擎路径。 */
   const [engineToken, setEngineToken] = useState(0);
   /** 改过上下文后需要重启引擎才生效 */
@@ -253,12 +274,17 @@ export function ModelDrawer({
 
   useTauriEvent(onRuntimeProgress, setDlProgress);
 
-  const refresh = useCallback(async () => {
+  /**
+   * 轻量轮询：只读配置与引擎状态。
+   *
+   * `listRouterModels` 内部走 `ensure()`，**会把引擎拉起来**。设置抽屉
+   * 一打开就调它，等于「看设置」变成「启动推理引擎」——既慢又违背按需加载。
+   * 所以只有引擎已经在跑时才问模型状态。
+   */
+  const refreshCore = useCallback(async () => {
     try {
       const s = await getSettings();
       setSettings(s);
-      setLocal(await listLocalModels());
-      setFreeVram(await probeVram());
       setRuntime(await getRuntimeStatus());
       setRuntimeLoaded(true);
 
@@ -267,12 +293,16 @@ export function ModelDrawer({
         (prev) => prev || terms.map((t) => `${t.from}=${t.to}`).join("\n"),
       );
 
-      try {
-        const router = await listRouterModels();
-        const map: Record<string, string> = {};
-        router.forEach((m) => (map[m.id] = m.state));
-        setStates(map);
-      } catch {
+      if (s.running) {
+        try {
+          const router = await listRouterModels();
+          const map: Record<string, string> = {};
+          router.forEach((m) => (map[m.id] = m.state));
+          setStates(map);
+        } catch {
+          setStates({});
+        }
+      } else {
         setStates({});
       }
     } catch (e) {
@@ -280,12 +310,63 @@ export function ModelDrawer({
     }
   }, []);
 
+  /**
+   * 重量级探测：扫模型目录 + 问显存。
+   *
+   * 这两件事分别要读多个 GGUF 头、起子进程问显存，比读配置慢一个数量级。
+   * 原来跟 2.5 秒轮询绑在一起，会让点击 / 滚动不定时卡一下。
+   * 现在单独走 10 秒；失败时保留上一次结果，不覆盖成空。
+   */
+  const refreshHeavy = useCallback(async () => {
+    try {
+      setLocal(await listLocalModels());
+    } catch {
+      // 扫不到就保持上一次的列表
+    }
+    try {
+      setFreeVram(await probeVram());
+    } catch {
+      // 显存读不到就保持上一次的值
+    }
+    try {
+      // 内存可用量随系统占用变化，跟可用显存一起按 10 秒刷新
+      setRamInfo(await probeRam());
+    } catch {
+      // 读不到就保持上一次的值，不把已有数字清空
+    }
+  }, []);
+
+  /**
+   * 硬件总量：只在打开抽屉时探一次，不跟着页签切换重跑。
+   *
+   * 显存总量与内存总量都几乎不变，没必要放进轮询；可用量由
+   * `refreshHeavy` 按 10 秒刷新。两件事分开，切页签也不会闪「检测中」。
+   */
+  const refreshHardware = useCallback(async () => {
+    setTotalVramMb(await probeTotalVram().catch(() => null));
+  }, []);
+
+  const refresh = useCallback(async () => {
+    await Promise.all([refreshCore(), refreshHeavy()]);
+  }, [refreshCore, refreshHeavy]);
+
+  /** 「重新检测」：总量与可用显存一起重读。 */
+  const redetectHardware = useCallback(() => {
+    void refreshHardware();
+    void refreshHeavy();
+  }, [refreshHardware, refreshHeavy]);
+
   useEffect(() => {
     if (!open) return;
-    refresh();
-    const timer = window.setInterval(refresh, 2500);
-    return () => window.clearInterval(timer);
-  }, [open, refresh]);
+    void refresh();
+    void refreshHardware();
+    const core = window.setInterval(() => void refreshCore(), 2500);
+    const heavy = window.setInterval(() => void refreshHeavy(), 10000);
+    return () => {
+      window.clearInterval(core);
+      window.clearInterval(heavy);
+    };
+  }, [open, refresh, refreshCore, refreshHeavy, refreshHardware]);
 
   /**
    * 每次「打开」时应用外部指定的页签。
@@ -689,7 +770,7 @@ export function ModelDrawer({
           </button>
         </header>
 
-        {/* 两个页签：引擎这类进程级参数放「通用」，模型与术语放「模型」。
+        {/* 四页签：通用（偏好 + 硬件 + 存储）/ 引擎 / 模型与术语 / 下载源。
             全都堆一页时已经要滚半天，再加能力开关就彻底找不着了。 */}
         <div
           className="flex shrink-0 items-center gap-1 border-b px-3 py-1.5"
@@ -699,6 +780,7 @@ export function ModelDrawer({
           {(
             [
               { key: "general", label: "通用" },
+              { key: "engine", label: "引擎" },
               { key: "models", label: "模型与术语" },
               { key: "network", label: "下载源" },
             ] as const
@@ -730,46 +812,65 @@ export function ModelDrawer({
         </div>
 
         <div className="min-h-0 flex-1 overflow-auto px-4 py-3">
-          {/* 引擎设置 */}
-          {tab === "general" && (
+          {/* 通用：只剩系统信息（硬件 + 存储）。偏好与引擎参数都在「引擎」页。 */}
+          {tab === "engine" && (
           <section className="mb-4">
-            <div className="section-title mb-1.5">引擎设置</div>
+            <div className="section-title mb-1.5">空闲释放</div>
 
-            <div className="flex flex-col gap-2">
-              <div className="flex items-center gap-2 text-[12px]">
-                <span className="w-[64px] shrink-0" style={{ color: "var(--text-muted)" }}>
-                  空闲释放
-                </span>
-                <Select
-                  className="min-w-0 flex-1"
-                  size="sm"
-                  value={settings?.ttlSecs ?? DEFAULT_TTL_SECS}
-                  options={ttlOptionsWith(settings?.ttlSecs ?? DEFAULT_TTL_SECS)}
-                  onChange={(v) => changeTtl(v)}
-                  title="模型空闲多久后自动卸载，释放显存"
-                />
-              </div>
+            <div className="flex items-center gap-2 text-[12px]">
+              <span className="w-[64px] shrink-0" style={{ color: "var(--text-muted)" }}>
+                释放时机
+              </span>
+              <Select
+                className="min-w-0 flex-1"
+                size="sm"
+                value={settings?.ttlSecs ?? DEFAULT_TTL_SECS}
+                options={ttlOptionsWith(settings?.ttlSecs ?? DEFAULT_TTL_SECS)}
+                onChange={(v) => changeTtl(v)}
+                title="模型空闲多久后自动卸载，释放显存"
+              />
+            </div>
 
-              <div className="flex items-center gap-2 text-[12px]">
-                <span className="w-[64px] shrink-0" style={{ color: "var(--text-muted)" }}>
-                  推理档位
-                </span>
-                <Select
-                  className="min-w-0 flex-1"
-                  size="sm"
-                  value={settings?.gpuLayers ?? 1001}
-                  options={LAYER_OPTIONS}
-                  onChange={(v) => changeLayers(v)}
-                  title="给 GPU 分配多少层，自动档按空闲显存估算"
-                />
-              </div>
+            <p className="m-0 mt-1 text-[11px] leading-relaxed" style={{ color: "var(--text-muted)" }}>
+              模型闲置后自动卸载，把显存还给前台程序；引擎空壳不退出，下次请求会重新拉起模型。
+            </p>
+          </section>
+          )}
+
+          {/* 硬件与存储属于系统信息，不是引擎配置，留在「通用」。 */}
+          {tab === "general" && (
+            <HardwareStatus
+              freeVramMb={freeVram}
+              totalVramMb={totalVramMb}
+              ram={ramInfo}
+              onRedetect={redetectHardware}
+            />
+          )}
+
+          {tab === "general" && <StorageInfo refreshToken={engineToken} />}
+
+          {tab === "engine" && (
+          <section className="mb-4">
+            <div className="section-title mb-1.5">推理档位</div>
+
+            <div className="flex items-center gap-2 text-[12px]">
+              <span className="w-[64px] shrink-0" style={{ color: "var(--text-muted)" }}>
+                层数
+              </span>
+              <Select
+                className="min-w-0 flex-1"
+                size="sm"
+                value={settings?.gpuLayers ?? 1001}
+                options={LAYER_OPTIONS}
+                onChange={(v) => changeLayers(v)}
+                title="给 GPU 分配多少层，自动档按空闲显存估算"
+              />
             </div>
 
             <p className="m-0 mt-1 text-[11px]" style={{ color: "var(--text-muted)" }}>
-              {freeVram != null
-                ? `当前可用显存 ${freeVram} MB`
-                : "未能读取显存信息（纯 CPU 运行，或引擎尚未配置）"}
-              {settings?.gpuLayers === 1001 ? " · 自动档按模型体积分配层数" : ""}
+              {settings?.gpuLayers === 1001
+                ? "自动档按模型体积与当前可用显存分配层数。"
+                : "固定层数不会随模型变化；显存放不下时会加载失败。"}
             </p>
 
             <div className="mt-2 flex items-center gap-2">
@@ -796,7 +897,7 @@ export function ModelDrawer({
           </section>
           )}
 
-          {tab === "general" && (
+          {tab === "engine" && (
           <section className="mb-4">
             <div className="flex items-baseline gap-2">
               <span className="section-title">推理引擎</span>
@@ -1043,8 +1144,6 @@ export function ModelDrawer({
 
           </section>
           )}
-
-          {tab === "general" && <StorageInfo refreshToken={engineToken} />}
 
           {/*
             下载源单独一页。
