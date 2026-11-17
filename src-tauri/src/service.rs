@@ -2705,12 +2705,16 @@ pub struct LocalModelInfo {
 ///
 /// 真正要翻译时，`translate` / `chat` / `batch` 各自会 `ensure()`，
 /// 引擎该起的时候自然会起。
-#[tauri::command]
+/// `async`：扫目录 + stat 在模型多或网络盘上可能耗时几百毫秒，
+/// 同步命令会挡在主线程上，设置抽屉轮询时表现为不定时卡顿。
+#[tauri::command(async)]
 pub fn count_local_models(app: AppHandle) -> usize {
     models::scan(&app).len()
 }
 
-#[tauri::command]
+/// `async`：除了扫目录，还要读每个 GGUF 的头（能力探测），
+/// 比读配置慢一个数量级，不能占主线程。
+#[tauri::command(async)]
 pub fn list_local_models(app: AppHandle) -> Vec<LocalModelInfo> {
     // 先取一次全部参数：params::get 每次都会重读 config.json，
     // 放在 map 里就是「一个模型读一次盘」。模型多的用户能明显感到差别。

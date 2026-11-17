@@ -29,14 +29,51 @@ import {
   downloadPreset,
   listPresets,
   onPresetProgress,
+  probeTotalRam,
   probeTotalVram,
   type PresetProgress,
   type PresetStatus,
 } from "../lib/ipc";
-import { evaluateFit } from "../lib/modelFit";
+import { evaluateFit, type KvShape } from "../lib/modelFit";
 import { useTauriEvent } from "../lib/useTauriEvent";
 
 /** 卡片当前处于哪个视觉状态。 */
+/**
+ * 估算预设兼容性时用的上下文长度。
+ *
+ * 预设模型**还没下载**，不存在「它的 ctx」，所以只能取一个代表性值。
+ * 不跟全局设置走：全局默认是 4096，但用户可能为某个已下载的模型单独
+ * 调过——那是那个模型的，不是这个没下载的。
+ *
+ * 取 4096 与后端的 `params::DEFAULT_CTX` 保持一致，减少「两个地方说
+ * 不同数」的困惑。
+ */
+const PRESET_ESTIMATE_CTX = 4096;
+
+/**
+ * 三档预设的 KV 结构参数，**实测确认过**（不是猜的）。
+ *
+ * 来源：`cargo test -- --ignored --nocapture kvshape_live` 读取本机真实
+ * GGUF 头得到，与 `llama-server -v` 打印的 KV buffer 对得上。
+ *
+ * 预设模型下载前没有文件可读，所以这些值只能写死。**换预设模型时必须
+ * 同步更新这里**，否则兼容性判定会用错参数——但不会崩，只是结论不准。
+ *
+ * 不在表里的 id 返回 undefined，判定会自动退回体积估算。
+ */
+function presetKvShape(id: string): KvShape | null {
+  switch (id) {
+    case "Hy-MT2-1.8B-Q8_0":
+      return { layers: 32, kvHeads: 4, keyLen: 128, valueLen: 128 };
+    case "Hy-MT2-7B-Q4_K_M":
+    case "HY-MT2-7B-Q8_0":
+      // 7B 两档是同一个基座，KV 结构相同
+      return { layers: 32, kvHeads: 8, keyLen: 128, valueLen: 128 };
+    default:
+      return null;
+  }
+}
+
 type Phase =
   | { kind: "idle" }
   | { kind: "downloading"; downloaded: number; total: number }
@@ -80,8 +117,12 @@ export function percentOf(downloaded: number, total: number): number | null {
 
 interface RowProps {
   preset: PresetStatus;
-  /** 硬件总显存（MB）；`null` = 读不到，此时不显示兼容性结论 */
+  /** 硬件总显存（MB）；`null` = 读不到 */
   totalVramMb: number | null;
+  /** 物理总内存（MB）；`null` = 读不到 */
+  totalRamMb: number | null;
+  /** 苹果统一内存：显存与内存共用一个池，判定方式不同 */
+  isAppleSilicon: boolean;
   /** 这个模型的下载进度（由父组件按 id 分发） */
   progress: PresetProgress | null;
   /** 刷新列表（下载完成/删除后） */
@@ -103,6 +144,8 @@ interface RowProps {
 function PresetRow({
   preset,
   totalVramMb,
+  totalRamMb,
+  isAppleSilicon,
   progress,
   onRefresh,
   busyId,
@@ -226,22 +269,34 @@ function PresetRow({
         此时**整块不渲染**：宁可不说，也不给错的建议。
       */}
       {(() => {
-        const fit = evaluateFit({ sizeBytes: preset.sizeBytes, totalVramMb });
-        // 读不到显存时 text 为空 —— 那一档不给结论，也不占位
+        const fit = evaluateFit({
+          sizeBytes: preset.sizeBytes,
+          // 预设模型还没下载，这里用一个**代表性**的上下文长度估算。
+          // 不跟全局设置走：用户此刻还没选这个模型，没有「它的 ctx」。
+          ctxLength: PRESET_ESTIMATE_CTX,
+          totalVramMb,
+          totalRamMb,
+          kvShape: presetKvShape(preset.id),
+          isAppleSilicon,
+        });
+        // 读不到硬件时 text 为空 —— 那一档不给结论，也不占位
         if (!fit.text) return null;
         const color =
-          fit.level === "fits"
+          fit.level === "green"
             ? "var(--brand-text)"
-            : fit.level === "partial"
+            : fit.level === "yellow"
               ? "var(--text-muted)"
               : "var(--danger)";
+        const mark =
+          fit.level === "green" ? "✓ " : fit.level === "yellow" ? "◐ " : "⚠ ";
         return (
           <p
             className="m-0 mt-1 text-[11px]"
             style={{ color }}
             data-fit={fit.level}
+            title={`按 ${PRESET_ESTIMATE_CTX} 上下文估算；实际取决于你为这个模型设置的上下文长度`}
           >
-            {fit.level === "fits" ? "✓ " : fit.level === "partial" ? "◐ " : "⚠ "}
+            {mark}
             {fit.text}
           </p>
         );
@@ -462,6 +517,24 @@ export function PresetModels({
    * 而引导层恰恰是还没下引擎的时候。
    */
   const [totalVramMb, setTotalVramMb] = useState<number | null>(null);
+  /** 物理总内存（MB）。显存放不下时靠它判断「能不能退回内存跑」。 */
+  const [totalRamMb, setTotalRamMb] = useState<number | null>(null);
+
+  /*
+   * 苹果统一内存：显存与内存是同一个池，没有「独立显存」这个概念。
+   *
+   * 用 UA 判断而不是问后端：这个值只影响这一处判定的分支，
+   * 不值得为它加一个命令和一次 IPC。
+   *
+   * 注意只在 **macOS + arm64** 才算统一内存——Intel Mac 是独立显卡，
+   * 走常规判定。
+   */
+  const isAppleSilicon =
+    typeof navigator !== "undefined" &&
+    /Macintosh|Mac OS X/i.test(navigator.userAgent) &&
+    // arm64 才是统一内存；Intel Mac 是独立显卡
+    !/Intel/i.test(navigator.userAgent);
+
   const [loaded, setLoaded] = useState(false);
   /** 同一时刻只允许一个预设下载：后端有闸门，前端先禁用免得用户白点 */
   const [busyId, setBusyId] = useState<string | null>(null);
@@ -486,11 +559,18 @@ export function PresetModels({
   useEffect(() => {
     aliveRef.current = true;
     void refresh();
-    // 探一次显存。与 refresh 并行：它可能慢（Windows 上要起一次
-    // PowerShell），不该拖住列表渲染。
-    void probeTotalVram()
-      .then((mb) => {
-        if (aliveRef.current) setTotalVramMb(mb);
+    /*
+     * 探一次硬件。与 refresh 并行：Windows 上这两项各要起一次
+     * PowerShell（约 100-200 ms），不该拖住列表渲染。
+     *
+     * 显存和内存**都要**：只看显存会把「显存放不下但内存放得下」
+     * 误判成跑不动——而 llama.cpp 允许一部分层留在内存里跑。
+     */
+    void Promise.allSettled([probeTotalVram(), probeTotalRam()])
+      .then(([vram, ram]) => {
+        if (!aliveRef.current) return;
+        if (vram.status === "fulfilled") setTotalVramMb(vram.value);
+        if (ram.status === "fulfilled") setTotalRamMb(ram.value);
       })
       .catch(() => {
         // 读不到就不显示建议，不报错——没有独显不是错误
@@ -549,6 +629,8 @@ export function PresetModels({
       key={p.id}
       preset={p}
       totalVramMb={totalVramMb}
+      totalRamMb={totalRamMb}
+      isAppleSilicon={isAppleSilicon}
       progress={byId[p.id] ?? null}
       onRefresh={refresh}
       busyId={busyId}

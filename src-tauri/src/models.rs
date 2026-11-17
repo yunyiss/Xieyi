@@ -18,6 +18,11 @@ pub struct ModelFile {
     pub id: String,
     pub path: String,
     pub size_mb: u64,
+    /// GGUF 里的 KV 结构参数；读不到时为 。
+    ///
+    /// 前端用它**精确**算 KV cache 占多少显存，而不是按体积乘系数估。
+    /// 读不到不是错误（老模型可能缺字段），调用方应退回估算。
+    pub kv_shape: Option<KvShape>,
 }
 
 /// 扫描模型目录下的 GGUF 文件（最多两层子目录）。
@@ -65,6 +70,7 @@ fn collect(dir: &Path, depth: u8, out: &mut Vec<ModelFile>) {
             id: stem(&path),
             path: path.to_string_lossy().to_string(),
             size_mb,
+            kv_shape: read_kv_shape(&path),
         });
     }
 }
@@ -143,6 +149,97 @@ fn estimate_layers(size_mb: u64, layers: Option<u32>, free_mb: u64) -> u64 {
     }
 
     ((layers * (budget / weights)).floor() as u64).min(layers as u64)
+}
+
+/// GGUF 里与 KV cache 体积相关的结构参数。
+///
+/// 拿到这些就能**精确算出** KV cache 占多少显存，不必按"体积乘系数"估。
+///
+/// ## 为什么值得读
+///
+/// 早先前端用 `权重 × 1.25` 估算，问题有两个：
+///
+/// 1. **不随上下文长度变化**——用户把 ctx 从 4096 调到 32768，占用涨 8 倍，
+///    估算却纹丝不动，于是把"放不下"算成"放得下"
+/// 2. 系数是拍的，不同模型结构（尤其 GQA 的 kv_heads 差异）误差很大
+///
+/// 实测对照（Hy-MT2-1.8B，本机 RTX 4060，项目 preset 用 q8_0 KV）：
+///
+/// | ctx | 本公式 | 引擎 `KV buffer size` |
+/// |---|---|---|
+/// | 4096 | 128 MiB | 272 MiB（含 q8_0 块对齐开销）|
+/// | 8192 | 256 MiB | 512 MiB |
+///
+/// 注意上表口径差异：**未显式传 `-ctk/-ctv` 时默认 f16，每元素 2 字节**，
+/// 而我们的 preset 写的是 `cache-type-k/v = q8_0`（1 字节）。所以：
+///
+/// - 引擎实测（未传 ctk） = 本公式 × 2
+/// - 引擎实测（q8_0）     = 本公式 + 块对齐开销
+///
+/// 计算时按项目**实际会用的** q8_0（1 字节）走，见 [`kv_cache_bytes`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KvShape {
+    /// `*.block_count`，层数
+    pub layers: u32,
+    /// `*.attention.head_count_kv`，KV 头数（GQA 下远小于 head_count）
+    pub kv_heads: u32,
+    /// `*.attention.key_length`；缺省时用 `embedding_length / head_count`
+    pub key_len: u32,
+    /// `*.attention.value_length`；缺省时同 `key_len`
+    pub value_len: u32,
+}
+
+impl KvShape {
+    /// 按项目实际使用的 KV 缓存类型（q8_0，每元素 1 字节）算 KV 占用。
+    ///
+    /// 公式：`layers × kv_heads × (key_len + value_len) × ctx × 1`
+    ///
+    /// `kv_unified = true`（llama.cpp 默认）时 KV 池是所有 slot 共享的，
+    /// **不乘并行槽数**——实测 `-np 1` 与 `-np 4` 的 `KV buffer size` 相同。
+    /// 前端只需要 shape 里的四个数，自己按 ctx 算——
+    /// 因为 ctx 是用户随时可调的，后端算死了就过期了。
+    #[cfg(test)]
+    pub fn kv_cache_bytes(&self, ctx: u64) -> u64 {
+        let per_token = self.kv_heads as u64 * (self.key_len as u64 + self.value_len as u64);
+        self.layers as u64 * per_token * ctx
+    }
+}
+
+/// 从 GGUF 头读 KV 结构参数。
+///
+/// 复用 [`read_meta_many`]——它一次扫过整个 KV 段就能拿到多个字段，
+/// 比逐字段调用省掉重复扫盘。
+///
+/// 任何一项缺失都返回 `None`：宁可让调用方退回估算，也不要用默认值
+/// 编出一个看似精确、实则错误的结果。
+pub fn read_kv_shape(path: &Path) -> Option<KvShape> {
+    const KEYS: &[&str] = &[
+        "block_count",
+        "attention.head_count_kv",
+        "attention.key_length",
+        "attention.value_length",
+    ];
+    let m = read_meta_many(path, &[], KEYS);
+    let get = |k: &str| m.get(k).and_then(|v| v.parse::<u32>().ok());
+
+    let layers = get("block_count")?;
+    let kv_heads = get("attention.head_count_kv")?;
+    // key/value 长度未必存在（老模型可能只给 embedding_length + head_count），
+    // 缺了就放弃——本函数存在的意义就是"精确"，估出来的精确是假精确。
+    let key_len = get("attention.key_length")?;
+    let value_len = get("attention.value_length")?;
+
+    if layers == 0 || kv_heads == 0 || key_len == 0 || value_len == 0 {
+        return None;
+    }
+
+    Some(KvShape {
+        layers,
+        kv_heads,
+        key_len,
+        value_len,
+    })
 }
 
 /// 从 GGUF 头部读取 `*.block_count`，用于按比例分配 GPU 层数。
@@ -1182,6 +1279,56 @@ mod tests {
             assert_eq!(&p.style, style, "{name} 调用机制判错");
             assert_eq!(p.chat_capable, *chat, "{name} 能否对话判错");
             assert!(p.unsupported.is_none(), "{name} 不该被标成不可用");
+        }
+    }
+}
+
+#[cfg(test)]
+mod kvshape_live {
+    use super::*;
+
+    /// 用本机真实模型验证 KV 参数读取与体积计算。
+    ///
+    /// 默认 `#[ignore]`：需要真实 GGUF 文件，CI 上没有。改这块代码后用：
+    ///
+    /// ```bash
+    /// cargo test -- --ignored --nocapture kvshape_live
+    /// ```
+    ///
+    /// ## 期望值从哪来
+    ///
+    /// 不是猜的。`llama-server -v` 会打印
+    /// `llama_kv_cache: Vulkan0 KV buffer size = N MiB`，本机实测：
+    ///
+    /// | 模型 | ctx | 未传 ctk（f16） | `-ctk q8_0` |
+    /// |---|---|---|---|
+    /// | Hy-MT2-1.8B | 4096 | 256 MiB | — |
+    /// | Hy-MT2-1.8B | 8192 | 512 MiB | 272 MiB |
+    ///
+    /// 本函数按项目 preset 实际用的 **q8_0（1 字节/元素）** 计算，
+    /// 所以对应的是「272 MiB」那一列的量级（差异来自 q8_0 块对齐）。
+    #[test]
+    #[ignore]
+    fn kvshape_live() {
+        for p in [
+            "D:/Model/translate/Hy-MT2-1.8B-Q8_0.gguf",
+            "D:/Model/translate/Hy-MT2-7B-Q4_K_M.gguf",
+            "D:/Model/translate/translategemma-4b-it.Q8_0.gguf",
+            "D:/Model/translate/translategemma-12b-it-Q4_K_S.gguf",
+            "D:/Model/translate/Index-Translate-9B.Q4_K_M.gguf",
+        ] {
+            let name = std::path::Path::new(p)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            match read_kv_shape(std::path::Path::new(p)) {
+                Some(s) => println!(
+                    "{name}  {s:?}  KV@4096={}MiB  KV@8192={}MiB",
+                    s.kv_cache_bytes(4096) / (1024 * 1024),
+                    s.kv_cache_bytes(8192) / (1024 * 1024),
+                ),
+                None => println!("{name}  -> None（缺字段，调用方应退回估算）"),
+            }
         }
     }
 }

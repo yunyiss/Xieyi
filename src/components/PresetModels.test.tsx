@@ -31,6 +31,7 @@ vi.mock("../lib/ipc", async (importOriginal) => {
     deletePresetPartial: vi.fn(async () => 0),
     // 默认读不到显存：多数用例不关心兼容性提示
     probeTotalVram: vi.fn(async () => null),
+    probeTotalRam: vi.fn(async () => null),
     onPresetProgress: vi.fn(async () => () => {}),
   };
 });
@@ -429,8 +430,20 @@ describe("PresetModels · featured 模式", () => {
    *
    * 变异验证：把 `evaluateFit` 那段 JSX 删掉，本测试失败。
    */
-  it("有显存读数时，卡片给出兼容性结论", async () => {
-    vi.mocked(ipc.probeTotalVram).mockResolvedValue(4 * 1024); // 4 GB 卡
+  /**
+   * **核心用例**：4GB 显存 + 16GB 内存跑 7B 均衡档。
+   *
+   * 旧实现只看显存 → 判「跑不动」。
+   * 新实现看到显存 + 内存够 → 判「部分层在内存里跑」。
+   *
+   * 这是本次改造最能说明价值的一条：**不把能跑的情况说成跑不动**。
+   *
+   * 变异验证：把  里  改成只看
+   * ，本测试失败（会渲染成 red）。
+   */
+  it("显存不够但内存够时，提示部分层在内存里跑", async () => {
+    vi.mocked(ipc.probeTotalVram).mockResolvedValue(4 * 1024); // 4 GB 显存
+    vi.mocked(ipc.probeTotalRam).mockResolvedValue(16 * 1024); // 16 GB 内存
     vi.mocked(ipc.listPresets).mockResolvedValue([
       preset({
         id: "Hy-MT2-7B-Q4_K_M",
@@ -441,9 +454,28 @@ describe("PresetModels · featured 模式", () => {
 
     render(<PresetModels mode="full" />);
 
-    // 4 GB 跑 4.3 GB 的模型 → 放不下，结论里必须提到 CPU
-    expect(await screen.findByText(/你的显卡 4 GB/)).toBeInTheDocument();
-    expect(screen.getByText(/基本靠 CPU/)).toBeInTheDocument();
+    // 结论里必须提到「内存」，且不能说成跑不动
+    expect(await screen.findByText(/部分层在内存里跑/)).toBeInTheDocument();
+    expect(screen.queryByText(/都不够/)).toBeNull();
+  });
+
+  /**
+   * 显存与内存都不够时才说跑不动。
+   */
+  it("显存和内存都不够时提示跑不动", async () => {
+    vi.mocked(ipc.probeTotalVram).mockResolvedValue(2 * 1024);
+    vi.mocked(ipc.probeTotalRam).mockResolvedValue(4 * 1024);
+    vi.mocked(ipc.listPresets).mockResolvedValue([
+      preset({
+        id: "HY-MT2-7B-Q8_0",
+        name: "Hy-MT2 7B · 高质量",
+        sizeBytes: 7_981_928_896,
+      }),
+    ]);
+
+    render(<PresetModels mode="full" />);
+
+    expect(await screen.findByText(/都不够/)).toBeInTheDocument();
   });
 
   /**

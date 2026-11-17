@@ -501,6 +501,27 @@ export const probeVram = () => invoke<number | null>("probe_vram");
  * 而不是显示错的数字。
  */
 export const probeTotalVram = () => invoke<number | null>("probe_total_vram");
+
+/**
+ * 物理总内存（MB），不依赖引擎。
+ *
+ * 与显存一起用于判断「模型跑不跑得动」：显存放不下时可以有一部分层
+ * 留在内存里跑，只看显存会把这种情况误判成跑不动。
+ */
+export const probeTotalRam = () => invoke<number | null>("probe_total_ram");
+
+/**
+ * 内存总量与可用量（MB），一次取回。
+ *
+ * 界面上的内存条需要「总 − 可用」。分成两次命令会取到不同时刻的值，
+ * 进度条会跳；后端用 `sysinfo` 一次读出两个数。
+ * `null` 表示读不到——界面应显示「读取不到」，不要猜。
+ */
+export interface MemoryInfo {
+  totalMb: number;
+  availableMb: number;
+}
+export const probeRam = () => invoke<MemoryInfo | null>("probe_ram");
 export const listSessions = () => invoke<Session[]>("list_sessions");
 export const saveSession = (session: Session) =>
   invoke<void>("save_session", { session });

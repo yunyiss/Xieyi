@@ -142,7 +142,10 @@ fn open_data_subdir(app: tauri::AppHandle, name: String) -> Result<String, Strin
     Ok(path)
 }
 
-#[tauri::command]
+/// `async`：这个命令会起 `llama-server --list-devices` 与 `nvidia-smi`
+/// 两个子进程。Tauri 的同步命令默认在主线程执行，设置抽屉轮询它时
+/// 会不定时卡住界面；交给 async runtime 后只占用后台线程。
+#[tauri::command(async)]
 fn probe_vram(app: tauri::AppHandle) -> Option<u64> {
     // 优先问引擎自己：它对 AMD / Intel / Metal 都能报，
     // 不像 nvidia-smi 只认 NVIDIA 一家。
@@ -155,9 +158,28 @@ fn probe_vram(app: tauri::AppHandle) -> Option<u64> {
 ///
 /// - `probe_vram` → 当前**可用**多少，要引擎在磁盘上（引导层用不上）
 /// - 这个 → 硬件**总共**多少，任何时候都能问（预设卡片判断"跑不跑得动"）
-#[tauri::command]
+/// `async`：读注册表 / sysfs，跨平台实现可能较慢，不占主线程。
+#[tauri::command(async)]
 fn probe_total_vram() -> Option<u64> {
     hardware::total_vram_mb()
+}
+
+/// 内存总量 / 可用量，一次返回两个值。
+///
+/// 界面上的内存条需要「总 − 可用」；分成两个命令会让两个数字来自
+/// 不同时刻。`async` 的取舍见 `probe_vram`。
+#[tauri::command(async)]
+fn probe_ram() -> Option<hardware::MemoryInfo> {
+    hardware::memory_mb()
+}
+
+/// 物理总内存（MB）。判定「模型跑不跑得动」时与显存一起看。
+///
+/// 显存放不下时可以有一部分层留在内存里，只看显存会把这种情况误判成跑不动。
+/// 三平台都走 `sysinfo` 的进程内调用，不再起 PowerShell。
+#[tauri::command(async)]
+fn probe_total_ram() -> Option<u64> {
+    hardware::total_ram_mb()
 }
 
 /// 当前配置的推理引擎可执行文件路径。没配置时返回 `None`。
@@ -545,6 +567,8 @@ pub fn run() {
             open_data_subdir,
             probe_vram,
             probe_total_vram,
+            probe_total_ram,
+            probe_ram,
             sync_window_theme,
             runtime::runtime_status,
             runtime::install_runtime,

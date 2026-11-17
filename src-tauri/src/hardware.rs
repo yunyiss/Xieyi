@@ -169,6 +169,65 @@ pub fn total_vram_mb() -> Option<u64> {
     }
 }
 
+/// 内存总量与可用量（MB）。
+///
+/// 两个值一起返回：显存条要画「总 / 可用」，内存条同理；分开探测会出现
+/// 两个数字来自不同时刻的撕裂。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryInfo {
+    pub total_mb: u64,
+    pub available_mb: u64,
+}
+
+/// 物理内存总量 / 可用量（MB），不依赖引擎，任何时候都能问。
+///
+/// ## 为什么改成 `sysinfo`
+///
+/// 早先 Windows 上起 PowerShell 查 `TotalPhysicalMemory`，一次约 100–200 ms；
+/// 而且**只有总量、没有可用量**，界面只能显示一个光秃秃的数字。
+///
+/// LocModel 的做法是引入 `sysinfo`，三平台统一：
+///
+/// | 平台 | 实际手段（sysinfo 内部） |
+/// |---|---|
+/// | Windows | `GlobalMemoryStatusEx` → `ullTotalPhys` / `ullAvailPhys` |
+/// | Linux | `/proc/meminfo` 的 `MemTotal` / `MemAvailable`（缺失时按 Free+Buffers+Cached+SReclaimable−Shmem 估算）|
+/// | macOS | 总量 `sysctl(HW_MEMSIZE)`；可用 `host_statistics64(HOST_VM_INFO64)` 的 `free + inactive + purgeable − compressor` |
+///
+/// 全是进程内调用，不起子进程，所以可以放心放进轮询。
+/// 这里只开 `system` 特性，不引入磁盘 / 网络 / 进程 / rayon。
+///
+/// ## 为什么需要它
+///
+/// 判断"某个模型跑不跑得动"时，**只看显存会给出错误结论**。
+/// llama.cpp 的 `-ngl N` 允许一部分层留在内存里由 CPU 跑，所以：
+///
+/// - 显存放得下全部 → 全速
+/// - 显放不下但**显存 + 内存**放得下 → 能跑，比全 GPU 慢
+/// - 两者都不够 → 真跑不动
+pub fn memory_mb() -> Option<MemoryInfo> {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+
+    let total_mb = sys.total_memory() / (1024 * 1024);
+    if total_mb == 0 {
+        return None;
+    }
+    // 某些平台在极端情况下会报可用 > 总量，夹一下，避免进度条超过 100%
+    let available_mb = (sys.available_memory() / (1024 * 1024)).min(total_mb);
+
+    Some(MemoryInfo {
+        total_mb,
+        available_mb,
+    })
+}
+
+/// 物理总内存（MB）。判定「模型跑不跑得动」时与显存一起看。
+pub fn total_ram_mb() -> Option<u64> {
+    memory_mb().map(|m| m.total_mb)
+}
+
 /// Windows：读注册表里驱动写下的显存大小。
 ///
 /// 走 PowerShell 而不是引入 `windows` crate：后者为一个数字加进来
@@ -526,5 +585,38 @@ mod tests {
         // 显存被占满时是真实的 0，要如实返回——上层会据此选 CPU 兜底
         let out = "  CUDA0: X (8187 MiB, 0 MiB free)";
         assert_eq!(parse_free_mb(out), Some(0));
+    }
+}
+
+#[cfg(test)]
+mod ram_probe_live {
+    use super::*;
+
+    /// 内存探测的自洽性：总量必须为正，可用不能超过总量。
+    ///
+    /// 不标 `#[ignore]`：它不依赖特定硬件，三平台都该成立；
+    /// 读不到时（`None`）直接跳过，不把环境缺失当成失败。
+    #[test]
+    fn memory_probe_is_consistent() {
+        if let Some(m) = memory_mb() {
+            assert!(m.total_mb > 0, "总内存应为正数");
+            assert!(
+                m.available_mb <= m.total_mb,
+                "可用内存 {} 不应超过总量 {}",
+                m.available_mb,
+                m.total_mb
+            );
+        }
+    }
+
+    /// 真机读一次总内存 / 可用内存，打印出来核对。
+    ///
+    /// `cargo test -- --ignored --nocapture ram_probe_live`
+    #[test]
+    #[ignore]
+    fn ram_probe_live() {
+        println!("memory_mb = {:?}", memory_mb());
+        println!("total_ram_mb = {:?}", total_ram_mb());
+        println!("total_vram_mb = {:?}", total_vram_mb());
     }
 }

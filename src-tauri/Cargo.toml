@@ -27,6 +27,9 @@ tokio = { version = "1", features = ["process", "time", "sync", "rt-multi-thread
 reqwest = { version = "0.12", features = ["json", "stream"] }
 futures-util = "0.3"
 sha2 = "0.10"
+# 内存总量 / 可用量：三平台统一口径（与 LocModel 的选择一致）。
+# 只开 system，不引入磁盘/网络/进程等无关能力，也不拉 rayon。
+sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 encoding_rs = "0.8"
 
