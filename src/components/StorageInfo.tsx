@@ -48,6 +48,18 @@ function isWindowsUA(): boolean {
 export function StorageInfo({ refreshToken = 0 }: { refreshToken?: number }) {
   const [info, setInfo] = useState<AppInfo | null>(null);
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
+  /**
+   * 「打开」按钮的失败原因。
+   *
+   * 早先这些按钮直接 `onClick={() => openDataSubdir("root")}`——没有 await、
+   * 没有 catch。后端返回错误时前端**静默吞掉**，按钮点了毫无反应，
+   * 用户既不知道失败，也看不到原因（例如未配置引擎时的「尚未配置推理引擎」）。
+   *
+   * 只补错误反馈，**不改打开机制**：正常桌面会话下 opener 一直可用，
+   * 之前的「打不开」是受限会话里起不了 GUI 子进程导致的（详见
+   * `docs/当前状态快照.md`「二点六」）。
+   */
+  const [openError, setOpenError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -59,6 +71,21 @@ export function StorageInfo({ refreshToken = 0 }: { refreshToken?: number }) {
       setRuntime(await getRuntimeStatus());
     } catch {
       // 引擎未安装是正常状态
+    }
+  }, []);
+
+  /**
+   * 统一包装「打开目录」。
+   *
+   * `fn` 返回打开成功的路径，失败时抛出后端给的错误。这里接住并显示，
+   * 而不是让它变成没人处理的 Promise rejection——那正是「点了没反应」的来源。
+   */
+  const openDir = useCallback(async (fn: () => Promise<string>) => {
+    setOpenError(null);
+    try {
+      await fn();
+    } catch (e) {
+      setOpenError(String(e));
     }
   }, []);
 
@@ -161,7 +188,7 @@ export function StorageInfo({ refreshToken = 0 }: { refreshToken?: number }) {
           <button
             className={btnClass}
             style={btnStyle}
-            onClick={() => openDataSubdir("root")}
+            onClick={() => void openDir(() => openDataSubdir("root"))}
             title="删掉这个目录等于还原出厂设置"
           >
             打开
@@ -202,7 +229,7 @@ export function StorageInfo({ refreshToken = 0 }: { refreshToken?: number }) {
             <button
               className={btnClass}
               style={btnStyle}
-              onClick={() => void openEngineDir()}
+              onClick={() => void openDir(() => openEngineDir())}
               title="打开当前引擎所在的目录"
             >
               打开
@@ -216,6 +243,27 @@ export function StorageInfo({ refreshToken = 0 }: { refreshToken?: number }) {
         >
           清除数据目录可恢复默认设置；模型目录由用户指定，不受影响。
         </p>
+
+        {/*
+          「打开」失败时的说明。
+
+          必须显示出来：这些按钮点下去是交给系统文件管理器处理的，
+          失败原因五花八门（权限、路径失效、引擎未配置），
+          不说清楚用户只会以为按钮坏了。
+        */}
+        {openError && (
+          <p
+            className="m-0 mt-2 rounded-[6px] border px-2 py-1.5 text-[10px] leading-relaxed"
+            style={{
+              color: "var(--danger)",
+              borderColor: "color-mix(in srgb, var(--danger) 40%, var(--border))",
+              background: "color-mix(in srgb, var(--danger) 8%, transparent)",
+            }}
+            role="alert"
+          >
+            打开失败：{openError}
+          </p>
+        )}
       </div>
 
       <TranslateCache refreshToken={refreshToken} />

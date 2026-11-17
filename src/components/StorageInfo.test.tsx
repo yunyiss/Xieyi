@@ -209,6 +209,32 @@ describe("StorageInfo · 翻译缓存", () => {
     expect(screen.getByText(/^sessions.$/)).toBeInTheDocument();
   });
 
+  /**
+   * 「打开」失败时必须说清原因。
+   *
+   * 早先这些按钮是 `onClick={() => openDataSubdir("root")}`——没有 await、
+   * 没有 catch。后端返回错误时前端**静默吞掉**，按钮点了毫无反应，
+   * 用户既不知道失败也看不到原因。
+   *
+   * 变异验证：把 onClick 改回直接调用、去掉 openDir 包装，本测试失败。
+   */
+  it("打开目录失败时显示后端给的原因", async () => {
+    vi.mocked(ipc.openDataSubdir).mockRejectedValueOnce(
+      new Error("无法打开目录 C:/data：拒绝访问"),
+    );
+    const user = userEvent.setup();
+    render(<StorageInfo />);
+    await waitFor(() => screen.getByText("12"));
+
+    // 「数据根目录」那一行的打开按钮
+    const btns = screen.getAllByRole("button", { name: "打开" });
+    await user.click(btns[0]);
+
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent(/拒绝访问/);
+    });
+  });
+
   it("「缓存」措辞不混淆：译文缓存与界面缓存分开标注", async () => {
     render(<StorageInfo />);
     await waitFor(() => screen.getByText("12"));
