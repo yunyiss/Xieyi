@@ -1,4 +1,22 @@
-@import "tailwindcss";
+/*
+ * 只扫源码，关掉 Tailwind 的自动内容探测。
+ *
+ * 自动探测会从仓库根目录往下遍历，而 `src-tauri/target` 有 20+ GB
+ * 构建产物、`vendor/` 有 800 MB。实测后果：
+ *   GET /src/index.css 超过 180 秒不返回
+ *   GET /src/App.tsx   177 秒
+ * 开发模式下 WebView 等不到样式模块，表现为一直白屏。
+ *
+ * 显式声明后只扫 index.html 与 src 下的 ts/tsx。
+ *
+ * **忘了加 @source 的风险由测试兜底**：
+ * `src/lib/tailwindSources.test.ts` 会扫描仓库，一旦发现 `src/` 之外
+ * 出现带 className 的界面文件就失败，并提示补哪一条 `@source`。
+ * 所以这里可以放心用“快但需要声明”的方案。
+ */
+@import "tailwindcss" source(none);
+@source "../index.html";
+@source "../src";
 
 /*
  * 设计基调：克制的圆角 + 极轻的阴影 + 短促的过渡。

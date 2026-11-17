@@ -26,8 +26,12 @@ export default defineConfig(() => ({
         }
       : undefined,
     watch: {
-      // 3. tell Vite to ignore watching `src-tauri`
-      ignored: ["**/src-tauri/**"],
+      // 3. 忽略构建产物与离线依赖。
+      //
+      // `src-tauri/target` 现在有 20+ GB、`vendor/` 有 800 MB。它们既不参与
+      // 前端构建，也不该进文件监听——Tailwind v4 的 dev 编译会因此多花
+      // 几十秒，导致 WebView 迟迟等不到 CSS（表现为白屏）。
+      ignored: ["**/src-tauri/**", "**/vendor/**", "**/docs/**"],
     },
   },
 }));
