@@ -49,7 +49,7 @@
 > [!IMPORTANT]
 > **No network, no daemon, no resource hogging.**
 > What stays resident is only the engine's **empty router process** (0 VRAM).
-> Models are spawned on first request and unloaded after 120 seconds idle,
+> Models are spawned on first request and unloaded after 300 seconds (5 min) idle,
 > returning VRAM to the system.
 > Apart from the one-time engine download, the app makes no network requests.
 
@@ -282,7 +282,7 @@ engine backend and residency state. Pure CPU works but is far slower; a 1.8B
 model on CPU manages tens of tokens per second.
 
 **Q: VRAM is full / I want it released sooner.**
-Idle unload defaults to 120 seconds. Shorten the TTL in settings, or unload manually.
+Idle unload defaults to 300 seconds (5 min). Adjust the TTL in settings, or unload manually.
 
 **Q: I closed the app but VRAM wasn't released.**
 That shouldn't happen — Windows uses a Job Object and Linux uses
