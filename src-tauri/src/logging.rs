@@ -268,7 +268,19 @@ fn local_offset_secs() -> i64 {
     use std::mem::MaybeUninit;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    /// glibc / Darwin 的 `struct tm` 布局一致：9 个 int，顺序相同。
+    /// glibc / Darwin 的 `struct tm` 布局一致：9 个 int，之后是
+    /// `long tm_gmtoff` 与 `const char *tm_zone`。
+    ///
+    /// ## 后两个字段**必须声明**
+    ///
+    /// 曾经只声明前 9 个 int（36 字节），注释写着「我们不需要，不声明」。
+    /// 但 `localtime_r` 不管调用方要不要，**照样会写满整个结构体**
+    /// （glibc 上是 56 字节）——于是每次算时区偏移都往栈上越界写 20 字节。
+    ///
+    /// 实测后果（Kali x86_64, glibc 2.4x）：C 探针里 canary 被覆盖；
+    /// 在 Rust 侧，日志线程的栈被写坏后 `writer_loop` 再也走不到
+    /// 创建日志文件那一步 —— **Linux 上日志文件从未生成过**，
+    /// 而 Windows（走 `GetLocalTime`，无此 FFI）一直正常，所以此前没暴露。
     #[repr(C)]
     struct Tm {
         tm_sec: i32,
@@ -280,7 +292,8 @@ fn local_offset_secs() -> i64 {
         tm_wday: i32,
         tm_yday: i32,
         tm_isdst: i32,
-        // 后面还有 tm_gmtoff / tm_zone，但我们不需要，不声明
+        tm_gmtoff: i64,
+        tm_zone: *const i8,
     }
 
     unsafe extern "C" {
@@ -301,15 +314,11 @@ fn local_offset_secs() -> i64 {
             return 0;
         }
         let tm = out.assume_init();
-        let _ = tm.tm_isdst; // 夏令时已由 localtime_r 算进 tm_hour
 
-        // 把「本地时间各字段」和「UTC 各字段」都换算成当天秒数再相减。
-        // 不能直接 `tm_hour * 3600` 了事——那样算的是「本地时钟读数」，
-        // 不是「偏移量」，遇到跨日（如 UTC 23:00 对应东八区次日 07:00）
-        // 就会得到负数。
-        let local_secs_of_day = tm.tm_hour as i64 * 3600 + tm.tm_min as i64 * 60 + tm.tm_sec as i64;
-        let utc = now.rem_euclid(86_400);
-        local_secs_of_day - utc
+        // `tm_gmtoff` 就是「本地时区相对 UTC 的偏移（秒）」，
+        // 夏令时已经算进去了。早先手工用「本地时分秒 − UTC 秒数」相减，
+        // 同样依赖这个结构体，且更容易在跨日时算错——直接用系统给的偏移。
+        tm.tm_gmtoff
     }
 }
 
