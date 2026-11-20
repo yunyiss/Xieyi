@@ -62,6 +62,8 @@ vi.mock("./lib/ipc", async (importOriginal) => {
       partialBytes: 0,
       running: false,
       port: null,
+      preload: false,
+      preloadModel: null,
     })),
     countLocalModels: vi.fn(async () => 5),
     // 必须显式打桩：否则 `...actual` 带进来的是真实函数，

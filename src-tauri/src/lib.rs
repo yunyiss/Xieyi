@@ -557,6 +557,8 @@ pub fn run() {
             // 不该拖慢「双击到看见窗口」。装回来之前翻译只是少命中几次。
             service::load_disk_cache(app.handle());
             service::spawn_ttl_watcher(app.handle().clone());
+            // 用户显式开启「启动时预加载」才跑；默认什么都不做。
+            service::maybe_preload(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -590,6 +592,8 @@ pub fn run() {
             service::clear_translate_cache,
             service::cache_status,
             service::set_gpu_layers,
+            service::set_preload,
+            service::set_preload_model,
             service::set_pinned,
             service::get_settings,
             sources::get_download_source_config,

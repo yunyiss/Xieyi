@@ -93,6 +93,10 @@ export interface Settings {
   modelsDir: string;
   running: boolean;
   port: number | null;
+  /** 启动时预加载模型；默认关闭，下次启动生效 */
+  preload: boolean;
+  /** 预加载哪个模型；`null` 表示按「常驻 → 第一个」回退 */
+  preloadModel: string | null;
 }
 
 export interface LocalModel {
@@ -305,6 +309,12 @@ export const setModelsDir = (path: string) =>
 export const setTtl = (seconds: number) => invoke<void>("set_ttl", { seconds });
 export const setGpuLayers = (layers: number) =>
   invoke<void>("set_gpu_layers", { layers });
+/** 开关「启动时预加载模型」；下次启动生效。 */
+export const setPreload = (enabled: boolean) =>
+  invoke<void>("set_preload", { enabled });
+/** 指定预加载哪个模型；下次启动生效。 */
+export const setPreloadModel = (model: string) =>
+  invoke<void>("set_preload_model", { model });
 /** 保存单个模型的上下文与思考开关；上下文改动需重启引擎。 */
 export const setModelParams = (model: string, ctx: number, thinking: ThinkingMode) =>
   invoke<{ ctx: number; thinking: ThinkingMode }>("set_model_params", {

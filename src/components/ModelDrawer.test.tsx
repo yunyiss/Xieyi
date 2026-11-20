@@ -42,6 +42,8 @@ vi.mock("../lib/ipc", async (importOriginal) => {
       partialBytes: 0,
       running: true,
       port: 8080,
+      preload: false,
+      preloadModel: null,
     })),
     listLocalModels: vi.fn(async () => [
       {
@@ -61,6 +63,8 @@ vi.mock("../lib/ipc", async (importOriginal) => {
     setGlossary: vi.fn(async () => {}),
     setTtl: vi.fn(async () => {}),
     setGpuLayers: vi.fn(async () => {}),
+    setPreload: vi.fn(async () => {}),
+    setPreloadModel: vi.fn(async () => {}),
     setModelsDir: vi.fn(async () => "D:/models"),
     setPinned: vi.fn(async () => []),
     setModelParams: vi.fn(async () => ({
@@ -163,6 +167,32 @@ describe("ModelDrawer · 设置读写", () => {
       modelsDir: "D:/models",
       partialBytes: 0,
     });
+
+    // 有的用例会临时改成多个模型 / 开启预加载，跑完必须恢复默认，
+    // 否则后续用例会继承这些实现（clearAllMocks 不会重置实现）。
+    vi.mocked(ipc.getSettings).mockResolvedValue({
+      ttlSecs: 120,
+      gpuLayers: 1001,
+      pinned: [],
+      modelsDir: "D:/models",
+      running: true,
+      port: 8080,
+      preload: false,
+      preloadModel: null,
+    } as never);
+    vi.mocked(ipc.listLocalModels).mockResolvedValue([
+      {
+        id: "Hy-MT2-1.8B-Q8_0",
+        path: "D:/models/Hy-MT2-1.8B-Q8_0.gguf",
+        size: 1_908_528_192,
+        contextSize: 4096,
+        thinking: "off",
+        family: "Hy-MT2",
+        style: "chinese-official",
+        chatCapable: true,
+        chatOverride: null,
+      },
+    ] as never);
   });
 
   it("打开时读取设置，并把 TTL 档位显示出来", async () => {
@@ -196,6 +226,8 @@ describe("ModelDrawer · 设置读写", () => {
       modelsDir: "D:/models",
       running: true,
       port: 8080,
+      preload: false,
+      preloadModel: null,
     });
 
     renderDrawer();
@@ -223,6 +255,8 @@ describe("ModelDrawer · 设置读写", () => {
       modelsDir: "D:/models",
       running: false,
       port: 0,
+      preload: false,
+      preloadModel: null,
     } as never);
 
     renderDrawer();
@@ -256,6 +290,64 @@ describe("ModelDrawer · 设置读写", () => {
     // 内存条的数据也还在，说明不是重新挂载后现拉的
     expect(screen.getByText("16.0 GB · 可用 4.0 GB")).toBeInTheDocument();
     expect(ipc.probeTotalVram).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * 「启动时预加载」默认关闭；勾选后写配置，并提示下次启动生效。
+   *
+   * 变异验证：把 onChange 改成空实现，本测试失败。
+   */
+  it("可以开启启动预加载，并提示下次启动生效", async () => {
+    const user = userEvent.setup();
+    renderDrawer();
+    await openEngineTab();
+
+    const sw = await screen.findByRole("switch", {
+      name: /启动时预加载模型/,
+    });
+    expect(sw).toHaveAttribute("aria-checked", "false");
+
+    await user.click(sw);
+
+    await waitFor(() => {
+      expect(ipc.setPreload).toHaveBeenCalledWith(true);
+    });
+    expect(sw).toHaveAttribute("aria-checked", "true");
+  });
+
+  /**
+   * 多个模型时，用户可以指定预加载哪一个。
+   *
+   * 变异验证：把下拉的 onChange 去掉，本测试失败。
+   */
+  it("多个模型时可选择预加载哪个", async () => {
+    vi.mocked(ipc.listLocalModels).mockResolvedValue([
+      { id: "A-model" },
+      { id: "B-model" },
+    ] as never);
+    vi.mocked(ipc.getSettings).mockResolvedValue({
+      ttlSecs: 300,
+      gpuLayers: 1001,
+      pinned: [],
+      modelsDir: "D:/models",
+      running: true,
+      port: 8080,
+      preload: true,
+      preloadModel: null,
+    } as never);
+
+    const user = userEvent.setup();
+    renderDrawer();
+    await openEngineTab();
+
+    // 没显式选过时，默认显示第一个模型
+    const trigger = await screen.findByRole("button", { name: "A-model" });
+    await user.click(trigger);
+    await user.click(await screen.findByRole("option", { name: "B-model" }));
+
+    await waitFor(() => {
+      expect(ipc.setPreloadModel).toHaveBeenCalledWith("B-model");
+    });
   });
 
   it("设置里提供「下载引擎」入口，并能触发下载", async () => {

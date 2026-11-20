@@ -561,6 +561,10 @@ pub struct Settings {
     pub models_dir: String,
     pub running: bool,
     pub port: Option<u16>,
+    /// 启动时预加载模型。默认关闭。
+    pub preload: bool,
+    /// 预加载哪个模型；`None` 表示按「常驻 → 第一个」回退。
+    pub preload_model: Option<String>,
 }
 
 /// 启动时把持久化设置装回内存。
@@ -591,6 +595,97 @@ pub fn load_settings(app: &AppHandle) {
             });
         }
     }
+}
+
+/// 启动时预加载模型（仅当用户显式开启）。
+///
+/// 默认关闭：模型按需加载是产品定位，启动即占显存不是默认行为。
+/// 开启后把「首次翻译要等约 5 秒」挪到启动阶段，代价是启动变慢、
+/// 且一启动就占用显存。
+///
+/// 延迟 2 秒再开始：窗口先画完首帧，别让读几 GB 权重和首屏抢磁盘。
+pub fn maybe_preload(app: &AppHandle) {
+    let enabled = paths::config_value(app, "preload")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !enabled {
+        return;
+    }
+
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let Some(model) = pick_preload_model(&handle).await else {
+            return;
+        };
+
+        let state = handle.state::<AppState>();
+        match ensure(&handle, &state).await {
+            Ok(service) => {
+                state.cancel.store(false, Ordering::Relaxed);
+                match service.load(&handle, &model, &state.cancel).await {
+                    Ok(()) => {
+                        *state.last_used.lock().await = Instant::now();
+                        crate::logging::info("preload", format!("已预加载 {model}"));
+                    }
+                    Err(e) => {
+                        crate::logging::warn("preload", format!("预加载 {model} 失败：{e}"));
+                    }
+                }
+            }
+            Err(e) => crate::logging::warn("preload", format!("启动引擎失败：{e}")),
+        }
+    });
+}
+
+/// 预加载哪个模型：用户显式指定 → 第一个「常驻」→ 扫描结果第一个。
+///
+/// 显式指定来自设置里的下拉；没指定时退回常驻，再退回第一个。
+/// 无论哪一档，都要确认模型仍在磁盘上（用户可能刚删过文件）。
+async fn pick_preload_model(app: &AppHandle) -> Option<String> {
+    let scanned: Vec<String> = models::scan(app).into_iter().map(|m| m.id).collect();
+    if scanned.is_empty() {
+        return None;
+    }
+
+    let pinned = {
+        let state = app.state::<AppState>();
+        let set = state.pinned.lock().await;
+        let mut list: Vec<String> = set.iter().cloned().collect();
+        list.sort();
+        list
+    };
+
+    let configured = paths::config_value(app, "preloadModel")
+        .and_then(|v| v.as_str().map(String::from))
+        .filter(|s| !s.is_empty());
+
+    choose_preload_model(&scanned, &pinned, configured.as_deref())
+}
+
+/// 选择预加载模型（纯函数，便于单测）。
+///
+/// 顺序：用户显式指定的 → 第一个常驻 → 扫描结果第一个。
+/// 指定或常驻的模型如果已经被删掉，就跳过它，不在这里报错。
+fn choose_preload_model(
+    scanned: &[String],
+    pinned: &[String],
+    configured: Option<&str>,
+) -> Option<String> {
+    if let Some(id) = configured
+        && scanned.iter().any(|m| m == id)
+    {
+        return Some(id.to_string());
+    }
+
+    for id in pinned {
+        if scanned.iter().any(|m| m == id) {
+            return Some(id.clone());
+        }
+    }
+
+    scanned.first().cloned()
 }
 
 /// 启动时把磁盘缓存装回内存。
@@ -1823,6 +1918,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn preload_model_prefers_explicit_choice() {
+        let scanned = vec!["a".to_string(), "b".to_string()];
+        let pinned = vec!["b".to_string()];
+        assert_eq!(
+            choose_preload_model(&scanned, &pinned, Some("a")),
+            Some("a".to_string()),
+            "显式选择应压过常驻"
+        );
+    }
+
+    #[test]
+    fn preload_model_falls_back_to_pinned_then_first() {
+        let scanned = vec!["a".to_string(), "b".to_string()];
+        let pinned = vec!["b".to_string()];
+        assert_eq!(
+            choose_preload_model(&scanned, &pinned, None),
+            Some("b".to_string()),
+            "没指定时优先常驻"
+        );
+        assert_eq!(
+            choose_preload_model(&scanned, &[], None),
+            Some("a".to_string()),
+            "没有常驻时退回第一个"
+        );
+    }
+
+    #[test]
+    fn preload_model_skips_missing_entries() {
+        let scanned = vec!["a".to_string()];
+        let pinned = vec!["gone".to_string()];
+        assert_eq!(
+            choose_preload_model(&scanned, &pinned, Some("gone")),
+            Some("a".to_string()),
+            "指定/常驻的模型已被删除时，应跳过而不是返回不存在的 id"
+        );
+        assert_eq!(
+            choose_preload_model(&[], &pinned, Some("a")),
+            None,
+            "一个模型都没有时不预加载"
+        );
+    }
+
+    #[test]
     fn empty_reply_blames_thinking_when_reasoning_present() {
         // 真正"思考吃光预算"才会带 finish_reason=length
         let message = empty_reply_message(2985, 1024, "length");
@@ -2570,6 +2708,26 @@ pub fn set_gpu_layers(
     Ok(())
 }
 
+/// 开启 / 关闭「启动时预加载模型」。
+///
+/// 只写配置，不影响当前会话；下次启动才生效。
+#[tauri::command]
+pub fn set_preload(app: AppHandle, enabled: bool) -> Result<(), String> {
+    paths::set_config_value(&app, "preload", serde_json::json!(enabled))
+}
+
+/// 指定预加载哪个模型。只写配置，下次启动生效。
+///
+/// 不在这里校验模型是否存在：用户可能在设置之后才把文件删掉。
+/// 真正的兜底在启动时——找不到就按「常驻 → 第一个」回退。
+#[tauri::command]
+pub fn set_preload_model(app: AppHandle, model: String) -> Result<(), String> {
+    if model.trim().is_empty() {
+        return Err("预加载模型不能为空".into());
+    }
+    paths::set_config_value(&app, "preloadModel", serde_json::json!(model))
+}
+
 #[tauri::command]
 pub async fn set_pinned(
     app: AppHandle,
@@ -2620,6 +2778,12 @@ pub async fn get_settings(
             .unwrap_or_default(),
         running,
         port,
+        preload: paths::config_value(&app, "preload")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        preload_model: paths::config_value(&app, "preloadModel")
+            .and_then(|v| v.as_str().map(String::from))
+            .filter(|s| !s.is_empty()),
     })
 }
 

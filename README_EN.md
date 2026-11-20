@@ -281,6 +281,12 @@ First check that it's actually using the GPU — the settings drawer shows the
 engine backend and residency state. Pure CPU works but is far slower; a 1.8B
 model on CPU manages tens of tokens per second.
 
+**Q: The first translation takes a few seconds.**
+The model has to be loaded from disk and warmed up on first use. To skip that
+wait, enable "Preload model at startup" under Settings → Engine: startup takes
+a few seconds longer and claims VRAM immediately, but the first translation is
+nearly instant afterwards. Off by default.
+
 **Q: VRAM is full / I want it released sooner.**
 Idle unload defaults to 300 seconds (5 min). Adjust the TTL in settings, or unload manually.
 

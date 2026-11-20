@@ -23,6 +23,8 @@ import {
   setManualRuntime,
   setModelParams,
   setModelChatCapable,
+  setPreload,
+  setPreloadModel,
   setModelsDir,
   setPinned,
   setTtl,
@@ -40,6 +42,7 @@ import { HardwareStatus } from "./HardwareStatus";
 import { PresetModels } from "./PresetModels";
 import { Select } from "./Select";
 import { StorageInfo } from "./StorageInfo";
+import { Switch } from "./Switch";
 
 /**
  * 空闲释放档位。
@@ -734,6 +737,51 @@ export function ModelDrawer({
     }
   };
 
+  /**
+   * 开关「启动时预加载模型」。
+   *
+   * 只写配置，不影响当前会话；下次启动才生效——所以提示里要写清楚，
+   * 否则用户会以为勾了没反应。
+   */
+  const togglePreload = async (enabled: boolean) => {
+    setError("");
+    try {
+      await setPreload(enabled);
+      setSettings((prev) => (prev ? { ...prev, preload: enabled } : prev));
+      setNotice(enabled ? "已开启启动预加载，下次启动生效" : "已关闭启动预加载");
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  /** 指定预加载哪个模型；与开关一样，下次启动生效。 */
+  const changePreloadModel = async (model: string) => {
+    setError("");
+    try {
+      await setPreloadModel(model);
+      setSettings((prev) => (prev ? { ...prev, preloadModel: model } : prev));
+      setNotice("已更新预加载模型，下次启动生效");
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  /**
+   * 下拉里显示的预加载模型。
+   *
+   * 与后端选择顺序保持一致：显式指定 → 第一个常驻 → 第一个模型。
+   * 只有存在于当前列表里的 id 才认，避免显示一个已被删除的名字。
+   */
+  const preloadId = (() => {
+    const ids = new Set(local.map((m) => m.id));
+    if (settings?.preloadModel && ids.has(settings.preloadModel)) {
+      return settings.preloadModel;
+    }
+    const pinned = settings?.pinned.find((id) => ids.has(id));
+    if (pinned) return pinned;
+    return local[0]?.id ?? "";
+  })();
+
   return (
     <>
       <div
@@ -834,6 +882,86 @@ export function ModelDrawer({
             <p className="m-0 mt-1 text-[11px] leading-relaxed" style={{ color: "var(--text-muted)" }}>
               模型闲置后自动卸载，把显存还给前台程序；引擎空壳不退出，下次请求会重新拉起模型。
             </p>
+          </section>
+          )}
+
+          {/* 启动：预加载模型（默认关，显式开启才生效） */}
+          {tab === "engine" && (
+          <section className="mb-4">
+            <div className="section-title mb-1.5">预加载</div>
+
+            {/*
+              用浅底卡片收住这一项，和下方「推理引擎」保持一致。
+              裸行 + 右侧开关会让中间留出一大段空白，看起来像没画完。
+            */}
+            <div
+              className="rounded-[10px] border p-2.5"
+              style={{
+                background: "var(--surface-muted)",
+                borderColor: "var(--border)",
+              }}
+            >
+              <div className="flex items-center gap-2 text-[12px]">
+                <span>启动时预加载模型</span>
+                <span className="ml-auto">
+                  <Switch
+                    checked={settings?.preload ?? false}
+                    onChange={(v) => void togglePreload(v)}
+                    label="启动时预加载模型"
+                  />
+                </span>
+              </div>
+
+              <p
+                className="m-0 mt-1 text-[11px] leading-relaxed"
+                style={{ color: "var(--text-muted)" }}
+              >
+                首次翻译几乎立即；启动会多几秒并占用显存，下次启动生效。
+              </p>
+
+              {/* 多个模型时让用户明确选；只有一个就直说，不摆一个假下拉 */}
+              {settings?.preload && local.length > 1 && (
+                <div className="mt-2 flex items-center gap-2 text-[12px]">
+                  <span
+                    className="w-[64px] shrink-0"
+                    style={{ color: "var(--text-muted)" }}
+                  >
+                    预加载模型
+                  </span>
+                  <Select
+                    className="min-w-0 flex-1"
+                    size="sm"
+                    value={preloadId}
+                    options={local.map((m) => ({ value: m.id, label: m.id }))}
+                    onChange={(v) => void changePreloadModel(v)}
+                    title="启动时预加载哪个模型"
+                  />
+                </div>
+              )}
+
+              {settings?.preload && local.length === 1 && (
+                <div className="mt-2 flex items-center gap-2 text-[12px]">
+                  <span
+                    className="w-[64px] shrink-0"
+                    style={{ color: "var(--text-muted)" }}
+                  >
+                    预加载
+                  </span>
+                  <span className="min-w-0 flex-1 truncate" title={local[0].id}>
+                    {local[0].id}
+                  </span>
+                </div>
+              )}
+
+              {settings?.preload && local.length === 0 && (
+                <p
+                  className="m-0 mt-2 text-[11px]"
+                  style={{ color: "var(--text-muted)" }}
+                >
+                  模型目录里还没有 .gguf 文件
+                </p>
+              )}
+            </div>
           </section>
           )}
 
