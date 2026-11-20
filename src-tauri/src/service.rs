@@ -3118,6 +3118,8 @@ pub struct LocalModelInfo {
     pub chat_auto: bool,
     /// 用户是否手动改过"能不能对话"。
     pub chat_overridden: bool,
+    /// GGUF 里的 KV 结构参数；读不到时为 None，前端退回体积估算。
+    pub kv_shape: Option<crate::models::KvShape>,
 }
 
 /// 只数一下模型目录里有几个可用的 .gguf，**不启动引擎**。
@@ -3181,6 +3183,7 @@ pub fn list_local_models(app: AppHandle) -> Vec<LocalModelInfo> {
                 id: m.id,
                 path: m.path,
                 size_mb: m.size_mb,
+                kv_shape: m.kv_shape,
             }
         })
         .collect()

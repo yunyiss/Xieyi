@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
+import type { KvShape } from "./modelFit";
 
 export interface AppInfo {
   os: string;
@@ -125,6 +126,8 @@ export interface LocalModel {
   chatAuto: boolean;
   /** 用户是否手动改过「能不能对话」 */
   chatOverridden: boolean;
+  /** GGUF 里的 KV 结构参数；读不到为 null，兼容性判定会退回体积估算 */
+  kvShape?: KvShape | null;
 }
 
 /**

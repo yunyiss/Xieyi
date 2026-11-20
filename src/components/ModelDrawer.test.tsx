@@ -725,4 +725,48 @@ describe("ModelDrawer · 设置读写", () => {
     await user.click(screen.getByRole("tab", { name: "引擎" }));
     expect(screen.queryByRole("button", { name: /一键让位/ })).toBeNull();
   });
+
+  /**
+   * 本地模型列表也要用 GGUF 里的 KV 结构给兼容性结论。
+   *
+   * 这条锁住后端 `kvShape` → 前端 `evaluateFit` 的接线：只修后端解析、
+   * 不把字段带到列表里，用户是看不到任何变化的。
+   *
+   * 变异验证：把 `kvShape: m.kvShape` 删掉，前端退回“权重 × 10%”的
+   * 体积估算，KV 从 256 MB 变成 460 MB，结论会从绿色掉到黄色，
+   * 本测试失败。
+   */
+  it("模型列表用 KV 结构给出兼容性结论", async () => {
+    vi.mocked(ipc.listLocalModels).mockResolvedValue([
+      {
+        id: "local-model",
+        path: "D:/models/local.gguf",
+        sizeMb: 4600,
+        ctxSize: 4096,
+        trainedCtx: 8192,
+        thinking: "off",
+        supportsThinking: false,
+        chatCapable: true,
+        family: "Test",
+        unsupportedReason: null,
+        chatAuto: true,
+        chatOverridden: false,
+        kvShape: { layers: 32, kvHeads: 8, keyLen: 128, valueLen: 128 },
+      },
+    ] as never);
+    // 总显存 7100 - 预留 2200 = 可用 4900 MB；
+    // 精确 KV 256 MB → 4856，刚好绿色；体积粗估 460 MB → 5060，会变黄。
+    vi.mocked(ipc.probeTotalVram).mockResolvedValue(7100);
+    vi.mocked(ipc.probeRam).mockResolvedValue({
+      totalMb: 16384,
+      availableMb: 8192,
+    });
+
+    const user = userEvent.setup();
+    renderDrawer();
+    await user.click(await screen.findByRole("tab", { name: /模型与术语/ }));
+
+    expect(await screen.findByText("可全速")).toBeInTheDocument();
+    expect(screen.queryByText("部分内存")).toBeNull();
+  });
 });

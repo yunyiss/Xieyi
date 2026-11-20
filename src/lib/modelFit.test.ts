@@ -62,6 +62,31 @@ describe("estimateKvMb", () => {
   });
 
   /**
+   * 混合注意力：只算真正有全上下文 KV 的层，局部层按滑动窗口算。
+   *
+   * 变异验证：退回 `layers × kvHeads`（相当于按全部 48 层全上下文算），
+   * 结果会从 72 MiB 变成 384 MiB，本测试失败。
+   */
+  it("混合注意力只算真正有 KV 的层", () => {
+    const hybrid = {
+      layers: 48,
+      kvHeads: 4,
+      kvHeadLayers: 8 * 4,
+      localKvHeadLayers: 40 * 4,
+      slidingWindow: 1024,
+      keyLen: 128,
+      valueLen: 128,
+    };
+    const kv = estimateKvMb({
+      sizeBytes: SIZE_7B_Q4,
+      ctxLength: 4096,
+      kvShape: hybrid,
+    });
+    // (8层×4头×4096 + 40层×4头×1024) × 256 字节 = 72 MiB
+    expect(kv).toBeCloseTo(72, 0);
+  });
+
+  /**
    * **ctx 翻倍，KV 必须翻倍**。
    *
    * 这是旧实现最严重的错误：它用固定系数，ctx 从 4096 调到 32768 时

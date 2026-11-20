@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 // 这个组件的 props 里已经有 `open`（抽屉是否展开），
 // 所以文件对话框的函数要改个名字，避免遮蔽。
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { evaluateFit } from "../lib/modelFit";
 import {
   abort,
   discoverRuntimes,
@@ -1458,6 +1459,30 @@ export function ModelDrawer({
               const isPinned = pinned.includes(m.id);
               const working = state === "loading" || state === "unloading";
 
+              // 兼容性只在硬件数据齐全时给结论；读不到就不占位、不编数字。
+              const fit =
+                totalVramMb !== undefined && ramInfo?.totalMb
+                  ? evaluateFit({
+                      sizeBytes: m.sizeMb * 1024 * 1024,
+                      ctxLength: m.ctxSize,
+                      totalVramMb,
+                      totalRamMb: ramInfo.totalMb,
+                      kvShape: m.kvShape,
+                    })
+                  : null;
+              const fitColor =
+                fit?.level === "green"
+                  ? "var(--brand-text)"
+                  : fit?.level === "yellow"
+                    ? "var(--text-muted)"
+                    : "var(--danger)";
+              const fitLabel =
+                fit?.level === "green"
+                  ? "可全速"
+                  : fit?.level === "yellow"
+                    ? "部分内存"
+                    : "内存不足";
+
               return (
                 <li
                   key={m.id}
@@ -1535,6 +1560,21 @@ export function ModelDrawer({
                     <span className="text-[11px]" style={{ color: "var(--text-muted)" }}>
                       {m.sizeMb} MB
                     </span>
+
+                    {fit && fit.level !== "unknown" && (
+                      <span
+                        className="inline-flex items-center gap-1 text-[11px]"
+                        style={{ color: fitColor }}
+                        data-fit={fit.level}
+                        title={fit.text}
+                      >
+                        <span
+                          className="inline-block h-1.5 w-1.5 rounded-full"
+                          style={{ background: fitColor }}
+                        />
+                        {fitLabel}
+                      </span>
+                    )}
 
                     {/* 能力开关：勾上就能进对话页。自动识别不准时用它改，
                         不必去动模型文件名——这是识别的兜底。 */}

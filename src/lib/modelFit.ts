@@ -68,6 +68,12 @@ export interface KvShape {
   kvHeads: number;
   keyLen: number;
   valueLen: number;
+  /** 全上下文层的“头 × 层”总和；老数据没有时退回 layers × kvHeads */
+  kvHeadLayers?: number;
+  /** 滑动窗口层的“头 × 层”总和 */
+  localKvHeadLayers?: number;
+  /** 滑动窗口大小；没有则为 null */
+  slidingWindow?: number | null;
 }
 
 /**
@@ -124,9 +130,14 @@ export function estimateKvMb({
 
   if (kvShape && kvShape.layers > 0 && kvShape.kvHeads > 0) {
     // 精确公式。q8_0 = 1 字节/元素；kv_unified=true 不乘并行槽数。
-    const perToken =
-      kvShape.kvHeads * (kvShape.keyLen + kvShape.valueLen);
-    const bytes = kvShape.layers * perToken * ctx;
+    // 混合注意力模型只有部分层有全上下文 KV，其余层按滑动窗口算；
+    // 老数据没有这两个字段时退回 layers × kvHeads。
+    const fullHeads = kvShape.kvHeadLayers ?? kvShape.layers * kvShape.kvHeads;
+    const localHeads = kvShape.localKvHeadLayers ?? 0;
+    const window = kvShape.slidingWindow ?? 0;
+    const localCtx = window > 0 ? Math.min(ctx, window) : ctx;
+    const weighted = fullHeads * ctx + localHeads * localCtx;
+    const bytes = weighted * (kvShape.keyLen + kvShape.valueLen);
     return bytes / (1024 * 1024);
   }
 

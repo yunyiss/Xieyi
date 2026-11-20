@@ -193,27 +193,131 @@ fn estimate_layers(size_mb: u64, layers: Option<u32>, free_mb: u64) -> u64 {
 pub struct KvShape {
     /// `*.block_count`，层数
     pub layers: u32,
-    /// `*.attention.head_count_kv`，KV 头数（GQA 下远小于 head_count）
+    /// `*.attention.head_count_kv`，KV 头数
+    ///
+    /// 混合注意力模型里不同层可能不同，这里取一个代表值（最大头数）；
+    /// 真正参与计算的是 [`Self::kv_head_layers`]。
     pub kv_heads: u32,
     /// `*.attention.key_length`；缺省时用 `embedding_length / head_count`
     pub key_len: u32,
     /// `*.attention.value_length`；缺省时同 `key_len`
     pub value_len: u32,
+    /// **所有“全上下文”层的 KV 头数之和**。
+    ///
+    /// 普通模型 = `layers × kv_heads`；混合注意力模型只统计真正有
+    /// 全上下文 KV 的层，否则会把 KV 高估好几倍。
+    pub kv_head_layers: u64,
+    /// 滑动窗口层的 KV 头数之和。Gemma 这类“局部 + 全局”混合模型才有；
+    /// 这些层的 KV 只按窗口大小算，不按整个上下文算。
+    pub local_kv_head_layers: u64,
+    /// `*.attention.sliding_window`，局部注意力窗口；没有则为 `None`。
+    pub sliding_window: Option<u32>,
 }
 
 impl KvShape {
     /// 按项目实际使用的 KV 缓存类型（q8_0，每元素 1 字节）算 KV 占用。
     ///
-    /// 公式：`layers × kv_heads × (key_len + value_len) × ctx × 1`
+    /// 公式：`Σ(kv_heads × 有效 token 数) × (key_len + value_len) × 1`
+    ///
+    /// - 全上下文层：有效 token = ctx
+    /// - 滑动窗口层：有效 token = min(ctx, window)
     ///
     /// `kv_unified = true`（llama.cpp 默认）时 KV 池是所有 slot 共享的，
     /// **不乘并行槽数**——实测 `-np 1` 与 `-np 4` 的 `KV buffer size` 相同。
-    /// 前端只需要 shape 里的四个数，自己按 ctx 算——
-    /// 因为 ctx 是用户随时可调的，后端算死了就过期了。
+    ///
+    /// 前端只需要 shape 里的这些数，自己按 ctx 算——因为 ctx 是用户随时
+    /// 可调的，后端算死了就过期了。
     #[cfg(test)]
     pub fn kv_cache_bytes(&self, ctx: u64) -> u64 {
-        let per_token = self.kv_heads as u64 * (self.key_len as u64 + self.value_len as u64);
-        self.layers as u64 * per_token * ctx
+        let ctx = ctx.max(1);
+        let window = self.sliding_window.unwrap_or(0) as u64;
+        let local_tokens = if window > 0 { ctx.min(window) } else { ctx };
+        let weighted = self
+            .kv_head_layers
+            .saturating_mul(ctx)
+            .saturating_add(self.local_kv_head_layers.saturating_mul(local_tokens));
+        weighted.saturating_mul((self.key_len as u64).saturating_add(self.value_len as u64))
+    }
+
+    /// 从 GGUF 原始字段组装。
+    ///
+    /// `kv_heads_raw` 可能是单个数字（`"4"`），也可能是每层一个数字的
+    /// 数组（`"4,4,0,4,..."`，0 表示该层没有 KV）。数组长度必须等于
+    /// 层数，否则宁可返回 `None` 让调用方退回估算——错位比没有更危险。
+    fn from_parts(
+        layers: u32,
+        kv_heads_raw: &str,
+        key_len: u32,
+        value_len: u32,
+        full_attention_interval: Option<u32>,
+        sliding_window: Option<u32>,
+    ) -> Option<Self> {
+        if layers == 0 || key_len == 0 || value_len == 0 {
+            return None;
+        }
+
+        let raw = kv_heads_raw.trim();
+        if raw.is_empty() {
+            return None;
+        }
+
+        // 数组：每层一个 KV 头数，0 表示该层没有 KV（线性注意力等）。
+        if raw.contains(',') {
+            let list: Vec<u32> = raw
+                .split(',')
+                .map(|s| s.trim().parse::<u32>().ok())
+                .collect::<Option<_>>()?;
+            if list.len() != layers as usize {
+                return None;
+            }
+            let kv_head_layers: u64 = list.iter().map(|v| *v as u64).sum();
+            if kv_head_layers == 0 {
+                return None;
+            }
+            let kv_heads = list.iter().copied().max().unwrap_or(0);
+            return Some(Self {
+                layers,
+                kv_heads,
+                key_len,
+                value_len,
+                kv_head_layers,
+                local_kv_head_layers: 0,
+                sliding_window: None,
+            });
+        }
+
+        // 单个数字：普通模型，或“每隔 N 层一次全注意力”的混合模型。
+        let kv_heads: u32 = raw.parse().ok()?;
+        if kv_heads == 0 {
+            return None;
+        }
+
+        let full_layers = match full_attention_interval {
+            Some(interval) if interval > 1 => layers.div_ceil(interval),
+            _ => layers,
+        };
+        let local_layers = layers.saturating_sub(full_layers);
+
+        // 有滑动窗口信息时，局部层按窗口大小算；没有就保守地按全上下文算，
+        // 避免把“局部层也有 KV”的模型估少。
+        let (full, local) = if local_layers > 0 && sliding_window.is_some_and(|w| w > 0) {
+            (
+                full_layers as u64 * kv_heads as u64,
+                local_layers as u64 * kv_heads as u64,
+            )
+        } else {
+            (layers as u64 * kv_heads as u64, 0)
+        };
+
+        Some(Self {
+            layers,
+            kv_heads,
+            key_len,
+            value_len,
+            kv_head_layers: full,
+            local_kv_head_layers: local,
+            sliding_window: if local > 0 { sliding_window } else { None },
+        })
     }
 }
 
@@ -230,27 +334,28 @@ pub fn read_kv_shape(path: &Path) -> Option<KvShape> {
         "attention.head_count_kv",
         "attention.key_length",
         "attention.value_length",
+        "full_attention_interval",
+        "attention.sliding_window",
     ];
     let m = read_meta_many(path, &[], KEYS);
     let get = |k: &str| m.get(k).and_then(|v| v.parse::<u32>().ok());
 
     let layers = get("block_count")?;
-    let kv_heads = get("attention.head_count_kv")?;
+    // head_count_kv 可能是标量，也可能是逗号分隔的数组；原样交给 from_parts。
+    let kv_heads_raw = m.get("attention.head_count_kv")?;
     // key/value 长度未必存在（老模型可能只给 embedding_length + head_count），
     // 缺了就放弃——本函数存在的意义就是"精确"，估出来的精确是假精确。
     let key_len = get("attention.key_length")?;
     let value_len = get("attention.value_length")?;
 
-    if layers == 0 || kv_heads == 0 || key_len == 0 || value_len == 0 {
-        return None;
-    }
-
-    Some(KvShape {
+    KvShape::from_parts(
         layers,
-        kv_heads,
+        kv_heads_raw,
         key_len,
         value_len,
-    })
+        get("full_attention_interval"),
+        get("attention.sliding_window"),
+    )
 }
 
 /// 从 GGUF 头部读取 `*.block_count`，用于按比例分配 GPU 层数。
@@ -713,6 +818,45 @@ fn read_meta_many(
                         continue;
                     }
                     return out;
+                }
+                // 数组：每层一个数字（如 head_count_kv）。转成逗号分隔字符串，
+                // 让上层能区分“标量”和“逐层数组”。
+                9 => {
+                    let Some(elem_type) = read_u32(&mut reader) else {
+                        return out;
+                    };
+                    let Some(count) = read_u64(&mut reader) else {
+                        return out;
+                    };
+                    if count > 100_000 {
+                        return out;
+                    }
+                    if elem_type == 4 || elem_type == 10 {
+                        let mut vals = Vec::with_capacity(count as usize);
+                        for _ in 0..count {
+                            let v = if elem_type == 4 {
+                                match read_u32(&mut reader) {
+                                    Some(v) => v as u64,
+                                    None => return out,
+                                }
+                            } else {
+                                match read_u64(&mut reader) {
+                                    Some(v) => v,
+                                    None => return out,
+                                }
+                            };
+                            vals.push(v.to_string());
+                        }
+                        out.entry(suffix.to_string()).or_insert(vals.join(","));
+                        continue;
+                    }
+                    // 元素类型不是整数：跳过整个数组，继续往后扫。
+                    for _ in 0..count {
+                        if skip_value(&mut reader, elem_type, 0).is_none() {
+                            return out;
+                        }
+                    }
+                    continue;
                 }
                 _ => {}
             }
@@ -1341,5 +1485,148 @@ mod kvshape_live {
                 None => println!("{name}  -> None（缺字段，调用方应退回估算）"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod kvshape_unit {
+    use super::*;
+
+    /// 普通模型：所有层都有 KV，公式与旧版一致。
+    #[test]
+    fn scalar_shape_matches_old_formula() {
+        let s = KvShape::from_parts(32, "4", 128, 128, None, None).unwrap();
+        assert_eq!(s.kv_heads, 4);
+        assert_eq!(s.kv_head_layers, 32 * 4);
+        assert_eq!(s.local_kv_head_layers, 0);
+        // 32 层 × 4 头 × 256 维 × 4096 token × 1 字节 = 128 MiB
+        assert_eq!(s.kv_cache_bytes(4096), 128 * 1024 * 1024);
+    }
+
+    /// 混合注意力数组：0 表示该层没有 KV，不能按全部层数算。
+    #[test]
+    fn array_shape_only_counts_layers_with_kv() {
+        // 48 层，每 6 层一个全注意力层
+        let mut list = vec!["0"; 48];
+        for i in (0..48).step_by(6) {
+            list[i] = "4";
+        }
+        let s = KvShape::from_parts(48, &list.join(","), 128, 128, None, None).unwrap();
+
+        assert_eq!(s.kv_heads, 4);
+        assert_eq!(s.kv_head_layers, 8 * 4);
+        assert_eq!(s.local_kv_head_layers, 0);
+        assert_eq!(s.kv_cache_bytes(4096), 8 * 4 * 256 * 4096);
+    }
+
+    /// 标量 + 全注意力间隔：全注意力层按 ctx，局部层按滑动窗口。
+    #[test]
+    fn interval_shape_uses_sliding_window_for_local_layers() {
+        let s = KvShape::from_parts(48, "4", 128, 128, Some(6), Some(1024)).unwrap();
+
+        assert_eq!(s.kv_head_layers, 8 * 4);
+        assert_eq!(s.local_kv_head_layers, 40 * 4);
+        assert_eq!(s.sliding_window, Some(1024));
+
+        // 全上下文 8 层 + 局部 40 层 × min(4096, 1024)
+        let expected = (8 * 4 * 4096 + 40 * 4 * 1024) * 256;
+        assert_eq!(s.kv_cache_bytes(4096), expected);
+    }
+
+    /// 数组长度对不上层数时宁可放弃，不能错位计算。
+    #[test]
+    fn mismatched_array_length_is_rejected() {
+        assert!(KvShape::from_parts(32, "4,0,4", 128, 128, None, None).is_none());
+    }
+
+    /// 所有层都没有 KV 的数组没有意义，返回 None。
+    #[test]
+    fn all_zero_array_is_rejected() {
+        let zeros = vec!["0"; 32].join(",");
+        assert!(KvShape::from_parts(32, &zeros, 128, 128, None, None).is_none());
+    }
+
+    /// 端到端读一份带 **数组** `head_count_kv` 的 GGUF 头。
+    ///
+    /// 这验证的是 `read_meta_many` 的数组分支，而不只是 `from_parts`。
+    #[test]
+    fn reads_array_metadata_from_gguf() {
+        let mut list = vec![0u32; 48];
+        for i in (0..48).step_by(6) {
+            list[i] = 4;
+        }
+
+        let mut buf = Vec::new();
+        write_header(&mut buf, 5);
+        put_u32_kv(&mut buf, "test.block_count", 48);
+        put_u32_array_kv(&mut buf, "test.attention.head_count_kv", &list);
+        put_u32_kv(&mut buf, "test.attention.key_length", 128);
+        put_u32_kv(&mut buf, "test.attention.value_length", 128);
+        put_u32_kv(&mut buf, "test.full_attention_interval", 6);
+
+        let path = write_temp_gguf(&buf);
+        let s = read_kv_shape(&path).expect("应能读出数组元数据");
+        assert_eq!(s.layers, 48);
+        assert_eq!(s.kv_head_layers, 8 * 4);
+        assert_eq!(s.local_kv_head_layers, 0);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 端到端读“标量 + 全注意力间隔 + 滑动窗口”。
+    #[test]
+    fn reads_interval_and_window_from_gguf() {
+        let mut buf = Vec::new();
+        write_header(&mut buf, 6);
+        put_u32_kv(&mut buf, "test.block_count", 48);
+        put_u32_kv(&mut buf, "test.attention.head_count_kv", 4);
+        put_u32_kv(&mut buf, "test.attention.key_length", 128);
+        put_u32_kv(&mut buf, "test.attention.value_length", 128);
+        put_u32_kv(&mut buf, "test.full_attention_interval", 6);
+        put_u32_kv(&mut buf, "test.attention.sliding_window", 1024);
+
+        let path = write_temp_gguf(&buf);
+        let s = read_kv_shape(&path).expect("应能读出间隔与窗口");
+        assert_eq!(s.kv_head_layers, 8 * 4);
+        assert_eq!(s.local_kv_head_layers, 40 * 4);
+        assert_eq!(s.sliding_window, Some(1024));
+        std::fs::remove_file(&path).ok();
+    }
+
+    fn write_header(buf: &mut Vec<u8>, kv_count: u64) {
+        buf.extend_from_slice(b"GGUF");
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf.extend_from_slice(&kv_count.to_le_bytes());
+    }
+
+    fn put_string(buf: &mut Vec<u8>, s: &str) {
+        buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        buf.extend_from_slice(s.as_bytes());
+    }
+
+    fn put_u32_kv(buf: &mut Vec<u8>, key: &str, value: u32) {
+        put_string(buf, key);
+        buf.extend_from_slice(&4u32.to_le_bytes());
+        buf.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u32_array_kv(buf: &mut Vec<u8>, key: &str, values: &[u32]) {
+        put_string(buf, key);
+        buf.extend_from_slice(&9u32.to_le_bytes()); // ARRAY
+        buf.extend_from_slice(&4u32.to_le_bytes()); // UINT32
+        buf.extend_from_slice(&(values.len() as u64).to_le_bytes());
+        for v in values {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+
+    fn write_temp_gguf(buf: &[u8]) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!("xieyi-kv-{nanos}.gguf"));
+        std::fs::write(&path, buf).expect("写临时 GGUF");
+        path
     }
 }
