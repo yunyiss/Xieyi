@@ -704,4 +704,25 @@ describe("ModelDrawer · 设置读写", () => {
       ]);
     });
   });
+
+  /**
+   * 「一键让位」属于模型操作：它卸载的是驻留模型，不是引擎本身。
+   *
+   * 用户反馈：为了卸载模型要跑到「引擎」页不合理；模型页又只能一个一个
+   * 手动卸。所以按钮应该跟着模型列表走。
+   *
+   * 变异验证：把按钮留在引擎页 / 不渲染在模型页，本测试失败。
+   */
+  it("一键让位在模型页，不在引擎页", async () => {
+    const user = userEvent.setup();
+    renderDrawer();
+
+    await user.click(await screen.findByRole("tab", { name: /模型与术语/ }));
+    expect(
+      await screen.findByRole("button", { name: /一键让位/ }),
+    ).toBeInTheDocument();
+
+    await user.click(screen.getByRole("tab", { name: "引擎" }));
+    expect(screen.queryByRole("button", { name: /一键让位/ })).toBeNull();
+  });
 });

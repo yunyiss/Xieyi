@@ -164,15 +164,31 @@ export interface QualityReport {
 
 /**
  * 模型状态事件。`loading` / `warming` 时附带加载阶段信息，用于显示进度。
- * `percent` 是按模型体积估算的，不是 llama.cpp 的真实进度。
+ *
+ * `percent` / `readBytes` / `speedBps` 都是**按体积和耗时估算**的，不是
+ * llama.cpp 的真实进度；界面要带「约」字。`gpuLayers` / `kvBytes` / `ctx`
+ * 来自引擎日志解析，是实际值；解析不到时为 undefined。
  */
 export interface ModelStatePayload {
   model: string;
   state: string;
   phase?: string;
+  /** 机器可读阶段：prepare / read / cache / warmup / ready */
+  stage?: string;
   elapsedMs?: number;
   estimateMs?: number;
   percent?: number;
+  readBytes?: number;
+  totalBytes?: number;
+  speedBps?: number;
+  gpuLayers?: number;
+  totalLayers?: number;
+  kvBytes?: number;
+  ctx?: number;
+  gpuModelBytes?: number;
+  cpuModelBytes?: number;
+  vramProjectedBytes?: number;
+  vramFreeBytes?: number;
 }
 
 export interface TranslateRequest {

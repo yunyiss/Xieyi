@@ -3,6 +3,11 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { LoadIndicator, toLoadState, type LoadState } from "../components/LoadIndicator";
 import { ModelStateBadge, stateLabel } from "../components/ModelStateBadge";
+import {
+  ModelLoadInfoChip,
+  toLoadActual,
+  type LoadActual,
+} from "../components/ModelLoadInfoChip";
 import { RunButton } from "../components/RunButton";
 import { Select } from "../components/Select";
 import { SOURCE_LANGUAGES, TARGET_LANGUAGES } from "../lib/languages";
@@ -99,6 +104,7 @@ export function Batch({ refreshSignal = 0, active = true }: Props) {
   const [error, setError] = useState("");
   const [summary, setSummary] = useState<BatchSummary | null>(null);
   const [load, setLoad] = useState<LoadState | null>(null);
+  const [actual, setActual] = useState<LoadActual | null>(null);
 
   /**
    * 准备模型列表：**只扫目录，不启动引擎**（与翻译页同理）。
@@ -140,6 +146,7 @@ export function Batch({ refreshSignal = 0, active = true }: Props) {
       prev.map((m) => (m.id === p.model ? { ...m, state: mapped } : m)),
     );
     setLoad(toLoadState(p));
+    setActual(toLoadActual(p));
   });
 
   // 批量进度
@@ -333,6 +340,7 @@ export function Batch({ refreshSignal = 0, active = true }: Props) {
         />
 
         <ModelStateBadge state={currentModelState} />
+        <ModelLoadInfoChip actual={actual} model={model} />
       </div>
 
       {load && <LoadIndicator load={load} />}

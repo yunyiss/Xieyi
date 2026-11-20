@@ -106,6 +106,17 @@ pub fn write_preset(
     };
 
     let mut ini = String::new();
+    // b11714 起支持在 preset 里写 `log-verbosity`；只有打开它，引擎才会
+    // 打印 `load_tensors: offloaded N/M layers` 和 `KV buffer size`，
+    // 前端才能显示“实际分配”。老引擎不加，免得起不来。
+    let verbose = crate::runtime::read_info(app)
+        .and_then(|i| {
+            i.version
+                .strip_prefix('b')
+                .and_then(|v| v.parse::<u32>().ok())
+        })
+        .is_some_and(|v| v >= 11714);
+    let verbosity = if verbose { "log-verbosity = 4\n" } else { "" };
     // 先一次性取回所有模型参数：params::ctx_of 会每次重读 config.json，
     // 放在循环里就是「一个模型读一次盘」。
     let all_params = params::all(app);
@@ -122,8 +133,8 @@ pub fn write_preset(
         let ctx = params::from_map(&all_params, &m.id).ctx;
 
         ini.push_str(&format!(
-            "[{}]\nmodel = {}\njinja = 1\nctx-size = {}\nn-gpu-layers = {}\ncache-type-k = q8_0\ncache-type-v = q8_0\n\n",
-            m.id, m.path, ctx, layers
+            "[{}]\nmodel = {}\njinja = 1\nctx-size = {}\nn-gpu-layers = {}\ncache-type-k = q8_0\ncache-type-v = q8_0\n{}\n",
+            m.id, m.path, ctx, layers, verbosity
         ));
     }
 

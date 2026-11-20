@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::cache::DiskCache;
+use crate::engine_log::{self, LoadInfo, LoadStage};
 use crate::models;
 
 /// 退出时回收推理进程树，**带超时、不阻塞事件循环**。
@@ -221,11 +222,28 @@ pub struct Service {
     child: tokio::sync::Mutex<tokio::process::Child>,
     loaded: tokio::sync::Mutex<Vec<String>>,
     client: reqwest::Client,
+    /// 当前这次加载的探针：日志解析线程写，`wait_loaded` 读。
+    ///
+    /// 用 `std::sync::Mutex` 而不是 tokio 的：日志线程每行只做一次
+    /// 微秒级的字符串匹配，没必要引入异步锁；`wait_loaded` 也只短暂持有。
+    probe: Arc<std::sync::Mutex<Option<LoadProbe>>>,
     /// Windows Job Object 句柄。持有期间推理进程树受内核级保护：
     /// 主进程无论正常退出还是被强杀，整个组都会被一并终止。
     ///
     /// Unix 上没有对应概念（进程组已覆盖），恒为 `None`。
     _job: Option<crate::job_object::JobHandle>,
+}
+
+/// 一次模型加载的上下文，供日志解析与状态上报共用。
+struct LoadProbe {
+    model: String,
+    /// 模型文件字节数，用于把“已读多少”估出来。
+    total_bytes: u64,
+    /// 按体积估算的总加载时长（毫秒）。
+    estimate_ms: u64,
+    /// 进入“读取模型”阶段的时刻；没有它就算不出读取速度。
+    read_started: Option<Instant>,
+    info: LoadInfo,
 }
 
 #[derive(Serialize, Clone)]
@@ -304,12 +322,48 @@ struct ModelStatePayload {
     /// 加载阶段的可读描述（如「装填权重」「预热」）。
     #[serde(skip_serializing_if = "Option::is_none")]
     phase: Option<String>,
+    /// 机器可读的阶段码：prepare / read / cache / ready。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stage: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     elapsed_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     estimate_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     percent: Option<u8>,
+    /// 估算的已读字节数（读取阶段才给，单位字节）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    read_bytes: Option<u64>,
+    /// 模型文件总字节数。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_bytes: Option<u64>,
+    /// 估算的读取速度（字节/秒）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    speed_bps: Option<u64>,
+    /// 引擎日志里实际放上显卡的层数。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gpu_layers: Option<u32>,
+    /// 模型总层数。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_layers: Option<u32>,
+    /// 实际 KV cache 占用（字节）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kv_bytes: Option<u64>,
+    /// 实际上下文长度。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ctx: Option<u64>,
+    /// 显卡上的模型权重缓冲（字节）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gpu_model_bytes: Option<u64>,
+    /// 内存里的模型权重缓冲（字节）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cpu_model_bytes: Option<u64>,
+    /// 引擎预计占用的显存（字节）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vram_projected_bytes: Option<u64>,
+    /// 加载前显卡空闲显存（字节）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vram_free_bytes: Option<u64>,
 }
 
 impl ModelStatePayload {
@@ -318,10 +372,36 @@ impl ModelStatePayload {
             model: model.to_string(),
             state: state.to_string(),
             phase: None,
+            stage: None,
             elapsed_ms: None,
             estimate_ms: None,
             percent: None,
+            read_bytes: None,
+            total_bytes: None,
+            speed_bps: None,
+            gpu_layers: None,
+            total_layers: None,
+            kv_bytes: None,
+            ctx: None,
+            gpu_model_bytes: None,
+            cpu_model_bytes: None,
+            vram_projected_bytes: None,
+            vram_free_bytes: None,
         }
+    }
+
+    /// 把“实际分配”字段填进来。拿不到就保持 `None`，前端会隐藏详情。
+    fn with_load_info(mut self, info: &LoadInfo) -> Self {
+        self.stage = Some(info.stage.as_str());
+        self.gpu_layers = info.gpu_layers;
+        self.total_layers = info.total_layers;
+        self.kv_bytes = info.kv_bytes;
+        self.ctx = info.ctx;
+        self.gpu_model_bytes = info.gpu_model_bytes;
+        self.cpu_model_bytes = info.cpu_model_bytes;
+        self.vram_projected_bytes = info.projected_bytes;
+        self.vram_free_bytes = info.free_bytes;
+        self
     }
 
     /// 加载中：llama.cpp 不提供真实进度，这里按体积估算并附带已耗时。
@@ -333,10 +413,84 @@ impl ModelStatePayload {
             model: model.to_string(),
             state: "loading".into(),
             phase: Some("装填权重".into()),
+            stage: Some("prepare"),
             elapsed_ms: Some(elapsed_ms),
             estimate_ms: Some(estimate_ms),
             percent: Some(percent),
+            read_bytes: None,
+            total_bytes: None,
+            speed_bps: None,
+            gpu_layers: None,
+            total_layers: None,
+            kv_bytes: None,
+            ctx: None,
+            gpu_model_bytes: None,
+            cpu_model_bytes: None,
+            vram_projected_bytes: None,
+            vram_free_bytes: None,
         }
+    }
+
+    /// 带阶段/读取进度的加载中状态。
+    ///
+    /// `read_bytes` / `speed_bps` 是**按体积和耗时估算**的，不是引擎真实
+    /// 读盘计数——llama.cpp 没有暴露逐字节进度。前端会带“约”字展示。
+    fn loading_progress(model: &str, elapsed_ms: u64, probe: &LoadProbe) -> Self {
+        let stage = probe.info.stage;
+        let read_elapsed_ms = probe
+            .read_started
+            .map(|t| t.elapsed().as_millis() as u64)
+            .unwrap_or(0);
+        // 读取阶段大约占总加载时间的 80%，用它把估算进度铺开。
+        let read_budget_ms = (probe.estimate_ms.max(1) as f64 * 0.8).max(1.0);
+        let read_ratio = (read_elapsed_ms as f64 / read_budget_ms).clamp(0.0, 1.0);
+
+        let percent = match stage {
+            LoadStage::Prepare => 2,
+            LoadStage::Read => (5.0 + 78.0 * read_ratio) as u8,
+            LoadStage::Cache => 88,
+            LoadStage::Ready => 94,
+        };
+
+        let (read_bytes, speed_bps) = match stage {
+            LoadStage::Prepare => (None, None),
+            LoadStage::Read => {
+                let bytes = (probe.total_bytes as f64 * read_ratio) as u64;
+                let speed = (read_elapsed_ms > 200)
+                    .then(|| (bytes as f64 / (read_elapsed_ms as f64 / 1000.0)) as u64);
+                (Some(bytes), speed)
+            }
+            LoadStage::Cache | LoadStage::Ready => (Some(probe.total_bytes), None),
+        };
+
+        let phase = match stage {
+            LoadStage::Prepare => "准备",
+            LoadStage::Read => "读取模型",
+            LoadStage::Cache => "分配缓存",
+            LoadStage::Ready => "就绪",
+        };
+
+        Self {
+            model: model.to_string(),
+            state: "loading".into(),
+            phase: Some(phase.into()),
+            stage: Some(stage.as_str()),
+            elapsed_ms: Some(elapsed_ms),
+            estimate_ms: Some(probe.estimate_ms),
+            percent: Some(percent),
+            read_bytes,
+            total_bytes: Some(probe.total_bytes),
+            speed_bps,
+            gpu_layers: None,
+            total_layers: None,
+            kv_bytes: None,
+            ctx: None,
+            gpu_model_bytes: None,
+            cpu_model_bytes: None,
+            vram_projected_bytes: None,
+            vram_free_bytes: None,
+        }
+        .with_load_info(&probe.info)
     }
 
     /// 预热中：首推理开销（Vulkan 着色器编译约 3 秒）已挪到这一阶段。
@@ -345,9 +499,21 @@ impl ModelStatePayload {
             model: model.to_string(),
             state: "warming".into(),
             phase: Some("预热".into()),
+            stage: Some("warmup"),
             elapsed_ms: Some(0),
             estimate_ms: Some(estimate_ms),
-            percent: Some(94),
+            percent: Some(97),
+            read_bytes: None,
+            total_bytes: None,
+            speed_bps: None,
+            gpu_layers: None,
+            total_layers: None,
+            kv_bytes: None,
+            ctx: None,
+            gpu_model_bytes: None,
+            cpu_model_bytes: None,
+            vram_projected_bytes: None,
+            vram_free_bytes: None,
         }
     }
 }
@@ -356,6 +522,51 @@ impl ModelStatePayload {
 /// 仅用于展示预计剩余，不是精确值。
 fn estimate_load_ms(size_mb: u64) -> u64 {
     1200 + size_mb * 12 / 10
+}
+
+/// 持续读走子进程的一个日志管道。
+///
+/// 两个职责：
+/// 1. **必须读**：管道写满后子进程会阻塞，所以即使不解析也要把数据抽走；
+/// 2. 有加载探针时顺手喂给 [`engine_log::parse_line`]。
+///
+/// stderr 里出现 error/failed/panic 时写一条我们自己的日志，方便排查
+/// “引擎为什么起不来”；正常 info 日志不落盘，避免日志爆炸。
+fn spawn_log_pipe<R>(reader: R, probe: Arc<std::sync::Mutex<Option<LoadProbe>>>, log_errors: bool)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tauri::async_runtime::spawn(async move {
+        use tokio::io::AsyncBufReadExt;
+        use tokio::io::BufReader;
+
+        let mut lines = BufReader::new(reader).lines();
+        loop {
+            let line = match lines.next_line().await {
+                Ok(Some(line)) => line,
+                Ok(None) => break,
+                Err(_) => break,
+            };
+
+            if log_errors {
+                let lower = line.to_ascii_lowercase();
+                if lower.contains("error") || lower.contains("failed") || lower.contains("panic") {
+                    crate::logging::warn("engine", line.trim());
+                }
+            }
+
+            let Ok(mut guard) = probe.lock() else {
+                continue;
+            };
+            let Some(active) = guard.as_mut() else {
+                continue;
+            };
+            let changed = engine_log::parse_line(&mut active.info, &line);
+            if changed && active.info.stage >= LoadStage::Read && active.read_started.is_none() {
+                active.read_started = Some(Instant::now());
+            }
+        }
+    });
 }
 
 /// 从本地模型目录查体积；只读文件元数据，开销很小。
@@ -864,14 +1075,24 @@ impl Service {
                     let elapsed = started.elapsed();
                     if elapsed.saturating_sub(last_emit) >= Duration::from_millis(500) {
                         last_emit = elapsed;
-                        let _ = app.emit(
-                            "model://state-changed",
-                            ModelStatePayload::loading(
-                                model,
-                                elapsed.as_millis() as u64,
-                                estimate_ms,
-                            ),
-                        );
+                        let payload = {
+                            let guard = self.probe.lock().ok();
+                            match guard.as_ref().and_then(|g| g.as_ref()) {
+                                Some(probe) if probe.model == model => {
+                                    ModelStatePayload::loading_progress(
+                                        model,
+                                        elapsed.as_millis() as u64,
+                                        probe,
+                                    )
+                                }
+                                _ => ModelStatePayload::loading(
+                                    model,
+                                    elapsed.as_millis() as u64,
+                                    estimate_ms,
+                                ),
+                            }
+                        };
+                        let _ = app.emit("model://state-changed", payload);
                     }
                 }
                 "unloaded" | "failed" if seen_loading => {
@@ -1137,10 +1358,25 @@ impl Service {
             return Ok(());
         }
 
-        let estimate_ms = estimate_load_ms(model_size_mb(app, model));
+        let size_mb = model_size_mb(app, model);
+        let total_bytes = size_mb.saturating_mul(1024 * 1024);
+        let estimate_ms = estimate_load_ms(size_mb);
+
+        // 开始加载前就把探针挂上：日志线程一看到 `load_model: loading model`
+        // 就能开始更新阶段。
+        if let Ok(mut guard) = self.probe.lock() {
+            *guard = Some(LoadProbe {
+                model: model.to_string(),
+                total_bytes,
+                estimate_ms,
+                read_started: None,
+                info: LoadInfo::default(),
+            });
+        }
+
         let _ = app.emit(
             "model://state-changed",
-            ModelStatePayload::loading(model, 0, estimate_ms),
+            ModelStatePayload::loading(model, 0, estimate_ms).with_load_info(&LoadInfo::default()),
         );
         self.post_json("/models/load", serde_json::json!({ "model": model }))
             .await?;
@@ -1155,6 +1391,9 @@ impl Service {
                 .post_json("/models/unload", serde_json::json!({ "model": model }))
                 .await;
             self.loaded.lock().await.retain(|m| m != model);
+            if let Ok(mut guard) = self.probe.lock() {
+                *guard = None;
+            }
             let _ = app.emit(
                 "model://state-changed",
                 ModelStatePayload::simple(model, "cold"),
@@ -1162,10 +1401,29 @@ impl Service {
             return outcome;
         }
 
+        // 日志线程在 `model loaded` 之前就把实际分配写进探针了；但管道是
+        // 异步的，`/models` 报 loaded 时最后几行可能还没被消费。等一小会
+        // （最多 300ms），确保 `load_tensors` / KV 那几行已经落进探针。
+        let mut info = LoadInfo::default();
+        for _ in 0..10 {
+            let snapshot = self
+                .probe
+                .lock()
+                .ok()
+                .and_then(|guard| guard.as_ref().map(|p| p.info.clone()));
+            if let Some(snapshot) = snapshot {
+                info = snapshot;
+                if info.has_placement() || info.stage == LoadStage::Ready {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+
         // 权重已就位，接着把首推理开销消化掉，用户的第一句话就不会卡在着色器编译上
         let _ = app.emit(
             "model://state-changed",
-            ModelStatePayload::warming(model, estimate_ms),
+            ModelStatePayload::warming(model, estimate_ms).with_load_info(&info),
         );
         let _ = self.warmup(model, cancel).await;
 
@@ -1177,8 +1435,13 @@ impl Service {
 
         let _ = app.emit(
             "model://state-changed",
-            ModelStatePayload::simple(model, "warm"),
+            ModelStatePayload::simple(model, "warm").with_load_info(&info),
         );
+
+        // 加载结束，摘掉探针；后面的请求日志不再影响状态。
+        if let Ok(mut guard) = self.probe.lock() {
+            *guard = None;
+        }
         Ok(())
     }
 
@@ -1273,8 +1536,10 @@ async fn spawn(app: &AppHandle, gpu_layers: u64) -> Result<Service, String> {
         &key,
     ])
     .stdin(std::process::Stdio::null())
-    .stdout(std::process::Stdio::null())
-    .stderr(std::process::Stdio::null())
+    // 必须接管 stdout/stderr：一是解析加载阶段，二是**不能让它写满管道**
+    // 把子进程憋死。日志只在内存里过一遍，不落盘。
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
     .kill_on_drop(true);
 
     #[cfg(windows)]
@@ -1333,12 +1598,22 @@ async fn spawn(app: &AppHandle, gpu_layers: u64) -> Result<Service, String> {
         }
     }
 
-    let child = cmd.spawn().map_err(|e| format!("启动推理引擎失败: {e}"))?;
+    let mut child = cmd.spawn().map_err(|e| format!("启动推理引擎失败: {e}"))?;
 
     // **紧接 spawn 之后**加入 Job Object：这是内核级的进程树保护，
     // 覆盖「主进程被强杀」这类 `Service::kill()` 跑不到的路径。
     // 失败只记日志不阻断——没有 Job 时仍能靠 kill() 清理。
     let job = child.id().and_then(crate::job_object::JobHandle::assign);
+
+    // 当前加载探针：日志线程写、wait_loaded 读。一个服务同一时刻只加载
+    // 一个模型（`--models-max 1`），所以不需要按模型分桶。
+    let probe: Arc<std::sync::Mutex<Option<LoadProbe>>> = Arc::new(std::sync::Mutex::new(None));
+    if let Some(stdout) = child.stdout.take() {
+        spawn_log_pipe(stdout, probe.clone(), false);
+    }
+    if let Some(stderr) = child.stderr.take() {
+        spawn_log_pipe(stderr, probe.clone(), true);
+    }
 
     // 只记端口和路径，**不记 api-key**：日志可能被发出来排查问题，
     // 本地 key 虽然只在进程内有效，但没有理由写进磁盘。
@@ -1365,6 +1640,7 @@ async fn spawn(app: &AppHandle, gpu_layers: u64) -> Result<Service, String> {
         key,
         loaded: tokio::sync::Mutex::new(Vec::new()),
         client: reqwest::Client::new(),
+        probe,
         _job: job,
     };
 

@@ -3,6 +3,11 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { LoadIndicator, toLoadState, type LoadState } from "../components/LoadIndicator";
 import { ModelStateBadge, stateLabel } from "../components/ModelStateBadge";
+import {
+  ModelLoadInfoChip,
+  toLoadActual,
+  type LoadActual,
+} from "../components/ModelLoadInfoChip";
 import { QualityHint } from "../components/QualityHint";
 import { RunButton } from "../components/RunButton";
 import { Select } from "../components/Select";
@@ -110,6 +115,7 @@ export function Translate({
   const [model, setModel] = useState("");
   const [engineError, setEngineError] = useState("");
   const [load, setLoad] = useState<LoadState | null>(null);
+  const [actual, setActual] = useState<LoadActual | null>(null);
   const [segmentProgress, setSegmentProgress] = useState({
     done: 0,
     total: 0,
@@ -196,6 +202,7 @@ export function Translate({
       prev.map((m) => (m.id === p.model ? { ...m, state: mapped } : m)),
     );
     setLoad(toLoadState(p));
+    setActual(toLoadActual(p));
   });
 
   useEffect(() => {
@@ -467,6 +474,7 @@ export function Translate({
         />
 
         <ModelStateBadge state={currentModelState} />
+        <ModelLoadInfoChip actual={actual} model={model} />
       </div>
 
       {load && <LoadIndicator load={load} />}

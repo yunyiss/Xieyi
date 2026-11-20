@@ -2,6 +2,7 @@ mod batch;
 mod cache;
 mod download_gate;
 mod downloader;
+mod engine_log;
 mod hardware;
 mod job_object;
 mod logging;

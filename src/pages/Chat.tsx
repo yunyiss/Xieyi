@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { LoadIndicator, toLoadState, type LoadState } from "../components/LoadIndicator";
+import {
+  ModelLoadInfoChip,
+  toLoadActual,
+  type LoadActual,
+} from "../components/ModelLoadInfoChip";
 import { ContextMeter } from "../components/ContextMeter";
 import { ModelPicker } from "../components/ModelPicker";
 import { SessionPicker } from "../components/SessionPicker";
@@ -164,6 +169,7 @@ export function Chat({
   const [sessions, setSessions] = useState<Session[]>([]);
   const [sessionId, setSessionId] = useState(() => newSessionId());
   const [load, setLoad] = useState<LoadState | null>(null);
+  const [actual, setActual] = useState<LoadActual | null>(null);
   const [usage, setUsage] = useState<UsagePayload | null>(null);
   /** 本次会话累计用量 */
   const [totals, setTotals] = useState({ prompt: 0, generated: 0 });
@@ -313,6 +319,7 @@ export function Chat({
       prev.map((m) => (m.id === p.model ? { ...m, state: mapped } : m)),
     );
     setLoad(toLoadState(p));
+    setActual(toLoadActual(p));
   });
 
   useEffect(() => {
@@ -1012,6 +1019,8 @@ export function Chat({
                 thinkingSupported={supportsThinking}
                 disabled={busy}
               />
+
+              <ModelLoadInfoChip actual={actual} model={model} />
 
               <button
                 className="flex h-9 w-9 items-center justify-center rounded-full transition-colors disabled:opacity-40"

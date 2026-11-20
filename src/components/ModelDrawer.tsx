@@ -541,6 +541,12 @@ export function ModelDrawer({
     }
   };
 
+  /** 当前有多少个模型占着显存/正在加载，用于决定“一键让位”是否可用。 */
+  const residentCount = local.filter((m) => {
+    const s = states[m.id] ?? "unloaded";
+    return s === "loaded" || s === "loading" || s === "unloading";
+  }).length;
+
   /**
    * 下载推理引擎。
    *
@@ -1010,14 +1016,6 @@ export function ModelDrawer({
               >
                 {busy === "restart" ? "重启中…" : "重启引擎"}
               </button>
-              <button
-                className={btnClass}
-                style={btnStyle}
-                onClick={releaseAll}
-                disabled={busy === "release"}
-              >
-                {busy === "release" ? "处理中…" : "一键让位"}
-              </button>
               <span className="text-[11px]" style={{ color: "var(--text-muted)" }}>
                 {needsRestart ? "上下文已改，重启后生效" : "档位改动后需重启生效"}
               </span>
@@ -1423,13 +1421,28 @@ export function ModelDrawer({
             <span className="text-[11px]" style={{ color: "var(--text-muted)" }}>
               共 {local.length} 个模型
             </span>
-            <button
-              className={`ml-auto ${btnClass}`}
-              style={btnStyle}
-              onClick={refresh}
-            >
-              刷新
-            </button>
+            <div className="ml-auto flex items-center gap-2">
+              <button
+                className={btnClass}
+                style={btnStyle}
+                onClick={releaseAll}
+                disabled={busy === "release" || residentCount === 0}
+                title={
+                  residentCount === 0
+                    ? "当前没有驻留模型"
+                    : "卸载所有驻留模型，把显存还给前台程序"
+                }
+              >
+                {busy === "release" ? "处理中…" : "一键让位"}
+              </button>
+              <button
+                className={btnClass}
+                style={btnStyle}
+                onClick={refresh}
+              >
+                刷新
+              </button>
+            </div>
           </div>
 
           <ul className="m-0 flex list-none flex-col gap-2 p-0">
