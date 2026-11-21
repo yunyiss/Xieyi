@@ -502,7 +502,7 @@ Function un.ConfirmShow ; Add add a `Delete app data` check box
   ; 只删 $INSTDIR\models —— 用户通过设置指向的其他模型目录不在这里，
   ; 卸载器也无从得知，天然不会被误删。
   IntOp $5 $5 + $7
-  System::Call 'user32::CreateWindowEx(i r3, w "${__NSD_CheckBox_CLASS}", w "删除 models 里的模型 / Delete models", i ${__NSD_CheckBox_STYLE}, i r4, i r5, i r6, i r7, p r9, i0, i0, i0) i .s'
+  System::Call 'user32::CreateWindowEx(i r3, w "${__NSD_CheckBox_CLASS}", w "删除程序目录中的模型文件 / Delete models in app folder", i ${__NSD_CheckBox_STYLE}, i r4, i r5, i r6, i r7, p r9, i0, i0, i0) i .s'
   Pop $DeleteModelsCheckbox
   SendMessage $HWNDPARENT ${WM_GETFONT} 0 0 $1
   SendMessage $DeleteModelsCheckbox ${WM_SETFONT} $1 1
