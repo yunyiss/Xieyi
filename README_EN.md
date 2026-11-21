@@ -276,8 +276,10 @@ Inside:
   - **Delete the application data**: removes the data root (config, sessions,
     downloaded engine).
   - **删除 models 里的模型 / Delete models**: removes only `.gguf` files under
-    the app's own `models/`. Model directories you picked in Settings are not
-    touched — the uninstaller does not know where they are, and must not guess.
+    the app's own `models/`; if that leaves the install folder empty, the
+    folder is removed as well. Model directories you picked in Settings are
+    not touched — the uninstaller does not know where they are, and must not
+    guess.
   - Both unchecked: data and models are fully kept for a future reinstall.
   - Silent uninstall (`/S`) skips the UI and behaves like "both unchecked".
 - **Portable build**: there is no install/uninstall step — data and models live

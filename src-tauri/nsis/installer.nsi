@@ -963,6 +963,11 @@ Section Uninstall
     RMDir /r "$INSTDIR\models"
   ${EndIf}
 
+  ; 上面的 RMDir /r 把 models/ 连同目录本身一起删掉后，安装目录可能已经空了
+  ; （模板前面那次 `RMDir "$INSTDIR"` 发生在删模型之前，所以没能收尾）。
+  ; `RMDir` 只在目录为空时成功：用户还放了别的东西就原样保留，不会误删。
+  RMDir "$INSTDIR"
+
   !ifmacrodef NSIS_HOOK_POSTUNINSTALL
     !insertmacro NSIS_HOOK_POSTUNINSTALL
   !endif
