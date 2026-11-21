@@ -268,6 +268,17 @@ Inside:
 > **Deleting the data root = factory reset.** Model directories live elsewhere
 > and are unaffected.
 
+### What uninstall leaves behind
+
+- **Installer build** (on Windows it installs to `%LOCALAPPDATA%\Xieyi`, no
+  admin rights needed): the uninstaller removes program files, shortcuts and
+  the registry entry only. The data root above (config, sessions, downloaded
+  engine) is kept, and any `models/` you put next to the executable is left
+  untouched. Delete both manually for a full wipe.
+- **Portable build**: there is no install/uninstall step — data and models live
+  in `data/` and `models/` beside the executable. Delete the folder to remove
+  everything; nothing is left in system directories.
+
 ---
 
 ## FAQ
