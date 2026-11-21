@@ -271,10 +271,16 @@ Inside:
 ### What uninstall leaves behind
 
 - **Installer build** (on Windows it installs to `%LOCALAPPDATA%\Xieyi`, no
-  admin rights needed): the uninstaller removes program files, shortcuts and
-  the registry entry only. The data root above (config, sessions, downloaded
-  engine) is kept, and any `models/` you put next to the executable is left
-  untouched. Delete both manually for a full wipe.
+  admin rights needed): the uninstaller shows a **"Delete the application
+  data"** checkbox, unchecked by default.
+  - Unchecked: only program files, shortcuts and the registry entry are
+    removed; the data root and `models/` are kept for a future reinstall.
+  - Checked: the data root is removed too (config, sessions, downloaded
+    engine).
+  - Neither case deletes `.gguf` files under `models/` — models can be many
+    GB, and a wrong deletion is expensive. Remove that folder yourself if
+    you want it gone.
+  - Silent uninstall (`/S`) skips the UI and behaves like "unchecked".
 - **Portable build**: there is no install/uninstall step — data and models live
   in `data/` and `models/` beside the executable. Delete the folder to remove
   everything; nothing is left in system directories.
