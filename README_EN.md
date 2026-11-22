@@ -81,17 +81,20 @@ manager, or a multi-model concurrent server.
 | :--- | :--- | :--- |
 | **Windows 10 / 11** | ✅ Tested | `Xieyi_x.y.z_x64-setup.exe` from [Releases](https://github.com/yunyiss/Xieyi/releases) |
 | **Linux (x64)** | ✅ Tested (X11; window focus unavailable on Wayland) | `Xieyi_x.y.z_amd64.deb` or `.rpm` |
-| **macOS (Apple Silicon)** | ⚠️ **Builds from source; runtime unverified** | No prebuilt binaries — build from source |
+| **macOS (Apple Silicon / Intel)** | ⚠️ **Builds from source; smoke-tested only** | No prebuilt binaries — build from source |
 
 > **About macOS**: there are complete macOS code paths (single instance,
 > `NSRunningApplication` focus, `ps`-based cleanup, Metal backend) and CI
-> compiles it on real hardware. But **nobody has run the full flow on a Mac**,
-> so no binaries are published and no support is claimed.
+> compiles it on real hardware. The engine is picked per architecture
+> (`macos-arm64` for Apple Silicon, `macos-x64` for Intel), and startup,
+> onboarding and engine self-check have been verified on an Intel machine.
+> The **full translation flow is still unverified**, so no binaries are
+> published and no support is claimed.
 > If you try it and report back, that would be genuinely useful.
 
 **The installer is ~3 MB** because it ships neither the inference engine nor
-any model — both are fetched on first run. The engine download is ~30 MB and
-is SHA-256 verified.
+any model — both are fetched on first run. The engine download is ~12–31 MB
+depending on platform and is SHA-256 verified.
 
 ---
 

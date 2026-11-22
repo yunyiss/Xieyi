@@ -78,15 +78,17 @@
 | :--- | :--- | :--- |
 | **Windows 10 / 11** | ✅ 实测通过 | [Releases](https://github.com/yunyiss/Xieyi/releases) 下载 `Xieyi_x.y.z_x64-setup.exe` |
 | **Linux (x64)** | ✅ 实测通过（X11；Wayland 下窗口聚焦不可用） | `Xieyi_x.y.z_amd64.deb` 或 `.rpm` |
-| **macOS (Apple Silicon)** | ⚠️ **源码可编译，运行行为未验证** | 不提供预编译包，请从源码构建 |
+| **macOS (Apple Silicon / Intel)** | ⚠️ **源码可编译，仅冒烟验证** | 不提供预编译包，请从源码构建 |
 
 > **关于 macOS**：代码里有完整的 macOS 分支（单实例、`NSRunningApplication`
 > 聚焦、`ps` 兜底清理、Metal 推理后端），CI 也会在真机上编译一次。
-> 但**没有任何人在 Mac 上实际跑过完整流程**，所以不发布安装包、也不声称支持。
+> 推理引擎按架构选用上游包（Apple Silicon 用 `macos-arm64`，Intel 用
+> `macos-x64`），已在 Intel 机型上验证到启动、引导与引擎自检；
+> 但**完整翻译流程仍未验证**，所以不发布安装包、也不声称支持。
 > 如果你愿意试并反馈，非常欢迎。
 
 **安装包只有 3 MB 左右**，因为不含推理引擎和模型——两者都在首次启动时按需获取。
-推理引擎下载约 30 MB，带 SHA-256 校验。
+推理引擎下载约 12–31 MB（视平台），带 SHA-256 校验。
 
 ---
 
