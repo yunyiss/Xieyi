@@ -84,7 +84,7 @@ export function DownloadSourceSettings({ kind }: { kind: "engine" | "model" }) {
   const title = kind === "engine" ? "推理引擎" : "翻译模型";
   const subtitle =
     kind === "engine"
-      ? "约 31 MB。从 GitHub 下载，网络不通时可用加速代理或自建镜像。"
+      ? "约 12–31 MB（视平台）。从 GitHub 下载，网络不通时可用加速代理或自建镜像。"
       : "数百 MB 到数 GB。优先从魔搭下载，失败自动改用 HuggingFace。";
 
   return (

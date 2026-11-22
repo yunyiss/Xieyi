@@ -724,7 +724,7 @@ export function Onboarding({ onDone, onChanged }: Props) {
                     style={btnStyle}
                     onClick={download}
                     disabled={busy !== ""}
-                    title="从 GitHub 下载 llama.cpp 推理引擎（Vulkan 版，约 31 MB）"
+                    title="从 GitHub 下载 llama.cpp 推理引擎（约 12–31 MB，视平台）"
                   >
                     下载推理引擎…
                   </button>
@@ -736,7 +736,8 @@ export function Onboarding({ onDone, onChanged }: Props) {
                 className="m-0 mt-2 text-[11px]"
                 style={{ color: "var(--text-muted)" }}
               >
-                下载的是 llama.cpp 推理引擎（Vulkan 版，约 31 MB）。
+                下载的是 llama.cpp 官方预编译引擎：Windows/Linux 为 Vulkan 版
+                （约 31 MB），macOS 为 Metal/CPU 版（约 12 MB）。
                 如果本机已有 llama-server，直接用上面的候选即可。
               </p>
 

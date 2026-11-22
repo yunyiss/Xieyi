@@ -1086,7 +1086,7 @@ export function ModelDrawer({
                       className="m-0 mt-0.5 text-[11px]"
                       style={{ color: "var(--brand-text)" }}
                     >
-                      将覆盖安装，约 31 MB · 再点一次确认（5 秒后自动取消）
+                      将覆盖安装，约 12–31 MB（视平台） · 再点一次确认（5 秒后自动取消）
                     </p>
                   ) : (
                     <p
@@ -1151,10 +1151,10 @@ export function ModelDrawer({
                     disabled={busy !== ""}
                     title={
                       confirmReinstall
-                        ? "再点一次即开始重新下载并覆盖安装（约 31 MB）"
+                        ? "再点一次即开始重新下载并覆盖安装（约 12–31 MB，视平台）"
                         : runtime?.installed
                           ? "重新下载并覆盖当前引擎。引擎损坏时可用它修复"
-                          : "从官方或加速镜像下载 llama.cpp 运行时（Vulkan 版，约 31 MB）"
+                          : "从官方或加速镜像下载 llama.cpp 运行时（Windows/Linux 为 Vulkan，macOS 为 Metal/CPU；约 12–31 MB）"
                     }
                   >
                     {busy === "download-engine"

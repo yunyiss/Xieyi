@@ -51,12 +51,19 @@ fn expected_sha256(backend: &str) -> Option<&'static str> {
 
     #[cfg(target_os = "macos")]
     {
-        // llama-b11714-bin-macos-arm64.tar.gz
+        // 上游对 macOS 按架构分两个包，SHA-256 各不相同：
+        //   llama-b11714-bin-macos-arm64.tar.gz（Apple Silicon，Metal）
+        //   llama-b11714-bin-macos-x64.tar.gz（Intel 芯片，CPU/Accelerate）
         //
-        // 只支持 Apple Silicon：上游不再为 x86_64 macOS 出 Vulkan 包，
-        // 而 Metal 后端在 arm64 上是唯一被验证过的路径。
+        // 早先这里不分架构、一律下 arm64，导致 Intel Mac 上下载"成功"
+        // 却跑不起来（arm64 二进制无法在 x86_64 上执行），界面只能报
+        // 「已装好但无法运行」。现在按 `target_arch` 取对应包。
         let _ = backend;
-        Some("063f58b7d8458d89eacb2f28a10a6d6e0efa2a81866690b0f6f8ebac6e3846bb")
+        if cfg!(target_arch = "x86_64") {
+            Some("f9c54c14c09e0530ff460029f463bc42ded15639f11752067a44a99db66a212d")
+        } else {
+            Some("063f58b7d8458d89eacb2f28a10a6d6e0efa2a81866690b0f6f8ebac6e3846bb")
+        }
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
@@ -76,6 +83,30 @@ pub struct RuntimeInfo {
     pub source: String,
     #[serde(default)]
     pub sha256: String,
+}
+
+/// 把界面传来的后端名换成该平台**实际**使用的后端。
+///
+/// 前端只有一处下载入口（`installRuntime("vulkan")`），Windows/Linux 上
+/// 这就是我们要的默认后端。macOS 上游只按架构发包，本身不区分后端；
+/// 若照原样记成 vulkan，设置抽屉会显示出本机并不存在的「Vulkan」。
+///
+/// - Apple Silicon：Metal（llama.cpp 在 arm64 mac 上的默认加速）
+/// - Intel mac：CPU（x64 包走 Accelerate，界面上更适合叫 CPU）
+fn platform_backend(backend: &str) -> String {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = backend;
+        if cfg!(target_arch = "x86_64") {
+            "cpu".to_string()
+        } else {
+            "metal".to_string()
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        backend.to_string()
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -224,9 +255,10 @@ fn already_installed(root: &Path, backend: &str) -> Option<String> {
     find_executable(&dir).map(|_| dir.to_string_lossy().to_string())
 }
 
-/// 该不该拦住这次安装。
+/// 磁盘上是否已有同一个后端的引擎目录。
 ///
-/// 返回 `Some(路径)` 表示拒绝，`None` 表示放行。
+/// 返回 `Some(路径)` 表示有，`None` 表示没有。有也不代表能用——
+/// 调用方还要探测一下；探测失败时会照常重下覆盖（见 `install_runtime`）。
 ///
 /// ## 为什么需要 `force`
 ///
@@ -468,7 +500,13 @@ fn asset_url_full(
             _ => format!("llama-{v}-bin-win-vulkan-x64.{ext}"),
         }
     } else if cfg!(target_os = "macos") {
-        format!("llama-{v}-bin-macos-arm64.{ext}")
+        // 按架构取包：Intel Mac 不能跑 arm64 的 llama-server。
+        let arch = if cfg!(target_arch = "x86_64") {
+            "x64"
+        } else {
+            "arm64"
+        };
+        format!("llama-{v}-bin-macos-{arch}.{ext}")
     } else {
         match backend {
             "cpu" => format!("llama-{v}-bin-ubuntu-x64.{ext}"),
@@ -538,6 +576,10 @@ pub async fn install_runtime(
     backend: String,
     force: Option<bool>,
 ) -> Result<RuntimeStatus, String> {
+    // 前端统一传 "vulkan"，但 macOS 上游包根本不区分后端。把 mac 记成
+    // vulkan 会让界面显示一个本机并不存在的后端，所以先换成实际标签。
+    let backend = platform_backend(&backend);
+
     // 引擎目前只有 GitHub 一个真实来源（上游不在别处发 release），
     // 但走 candidates + download_from_sources 之后，将来加镜像
     // 只需要在 sources.rs 里补一个源，这里零改动。
@@ -594,11 +636,27 @@ pub async fn install_runtime(
                 );
                 return Ok(status(&app));
             }
+
+            /*
+             * **装好了但跑不起来：重下，而不是把用户堵死。**
+             *
+             * 早先这里直接返回「这个后端已经装好了，但无法运行……请在设置里
+             * 用「重新下载」」。问题是引导层里根本没有「重新下载」这个入口
+             * （那个按钮只会装好后隐藏），用户就卡在第一步走不下去。
+             *
+             * 典型触发场景：Intel Mac 上残留的 arm64 包——文件在、但架构
+             * 不对，执行即失败。这类情况重下正确平台包就能好，不该拒绝。
+             *
+             * 旧目录由下面解压前的 `reset_install_dir` 清掉，这里只要放行。
+             */
+            crate::logging::warn(
+                "runtime",
+                format!(
+                    "已有 {backend} 引擎无法运行（{}），改为重新下载",
+                    probe.detail
+                ),
+            );
         }
-        return Err(format!(
-            "这个后端（{backend}）已经装好了，但无法运行：{existing}\n\
-             如需重装，请在设置里用「重新下载」。"
-        ));
     }
 
     paths::ensure(&downloads)?;
@@ -1047,7 +1105,7 @@ mod tests {
         }
     }
 
-    /// macOS 不分后端：上游只提供 `macos-arm64` 一个包（Metal）。
+    /// macOS 不分后端（上游只按架构出包），但**必须**区分架构。
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_ignores_backend_choice() {
@@ -1055,6 +1113,35 @@ mod tests {
             asset_url_for(sources::Source::GitHub, "cpu").unwrap(),
             asset_url_for(sources::Source::GitHub, "vulkan").unwrap()
         );
+    }
+
+    /// Intel Mac 上取 x64 包，Apple Silicon 上取 arm64 包。
+    ///
+    /// 这条测试针对一个真实缺陷：早先不管架构一律下 arm64，
+    /// Intel Mac 下载后无法执行，界面只报「已装好但无法运行」。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_picks_package_for_its_arch() {
+        let url = asset_url_for(sources::Source::GitHub, "cpu").unwrap();
+        let expected = if cfg!(target_arch = "x86_64") {
+            "-macos-x64."
+        } else {
+            "-macos-arm64."
+        };
+        assert!(url.contains(expected), "URL 与架构不符：{url}");
+    }
+
+    /// macOS 上显示的后端名要与本机实际能力一致，不能照抄前端传来的
+    /// "vulkan"（mac 没有 Vulkan，用户会以为装错了东西）。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_reports_real_backend() {
+        let expected = if cfg!(target_arch = "x86_64") {
+            "cpu"
+        } else {
+            "metal"
+        };
+        assert_eq!(super::platform_backend("vulkan"), expected);
     }
 
     #[test]
