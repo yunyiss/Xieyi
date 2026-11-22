@@ -81,16 +81,17 @@ manager, or a multi-model concurrent server.
 | :--- | :--- | :--- |
 | **Windows 10 / 11** | ✅ Tested | `Xieyi_x.y.z_x64-setup.exe` from [Releases](https://github.com/yunyiss/Xieyi/releases) |
 | **Linux (x64)** | ✅ Tested (X11; window focus unavailable on Wayland) | `Xieyi_x.y.z_amd64.deb` or `.rpm` |
-| **macOS (Apple Silicon / Intel)** | ⚠️ **Builds from source; smoke-tested only** | No prebuilt binaries — build from source |
+| **macOS (Intel / Apple Silicon)** | ⚠️ **Builds from source; full flow verified on Intel x86_64** | No prebuilt binaries — build from source |
 
 > **About macOS**: there are complete macOS code paths (single instance,
 > `NSRunningApplication` focus, `ps`-based cleanup, Metal backend) and CI
 > compiles it on real hardware. The engine is picked per architecture
-> (`macos-arm64` for Apple Silicon, `macos-x64` for Intel), and startup,
-> onboarding and engine self-check have been verified on an Intel machine.
-> The **full translation flow is still unverified**, so no binaries are
-> published and no support is claimed.
-> If you try it and report back, that would be genuinely useful.
+> (`macos-x64` for Intel, `macos-arm64` for Apple Silicon). The full flow —
+> onboarding, engine download, model download and translation — has been
+> verified on an Intel x86_64 VM (CPU inference, no GPU passthrough);
+> the Apple Silicon Metal path is still untested. No binaries are published
+> and no support is claimed. If you try it and report back, that would be
+> genuinely useful.
 
 **The installer is ~3 MB** because it ships neither the inference engine nor
 any model — both are fetched on first run. The engine download is ~12–31 MB
