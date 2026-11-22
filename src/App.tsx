@@ -46,8 +46,9 @@ function App() {
   /**
    * 首次启动引导是否显示。
    *
-   * `null` 表示还在判断（首帧不渲染，避免闪一下再消失）；
-   * 判断依据是"引擎没装 或 没模型"——两者任一缺失就还处于未配置状态。
+   * `guideChecked` 为 false 表示还在判断：此时整个界面只铺底色、不渲染
+   * 主界面，避免「先闪一下主界面再出引导」（见下面 return 前的门禁）。
+   * 判断依据是"引擎没装"——缺模型不拦人。
    */
   const [showGuide, setShowGuide] = useState(false);
   const [guideChecked, setGuideChecked] = useState(false);
@@ -165,6 +166,20 @@ function App() {
     { key: "batch", label: "批量" },
     { key: "chat", label: "对话" },
   ];
+
+  /*
+   * 引导判定完成前只铺底色，不画主界面。
+   *
+   * 少了这道门禁会先把翻译页画出来，等 `getRuntimeStatus` 回来后再盖上
+   * 引导层。正常机器上只有几十毫秒、看不出来；但在慢机器（比如 x86 黑苹果
+   * VM）上这段足够长，用户会看到「主界面闪一下，然后才出引导」。
+   *
+   * 底色与窗口底色（`titlebar::set_window_background` 用的 `--canvas`）一致，
+   * 所以这段时间看起来只是内容稍晚出现，而不是画错了界面。
+   */
+  if (!guideChecked) {
+    return <div className="h-full" style={{ background: "var(--canvas)" }} />;
+  }
 
   return (
     <div className="flex h-full flex-col">
