@@ -498,11 +498,12 @@ Function un.ConfirmShow ; Add add a `Delete app data` check box
   SendMessage $DeleteAppDataCheckbox ${WM_SETFONT} $1 1
 
   ; 第二个勾选项放在第一个正下方（同一列、y 加一个控件高度）。
-  ; 文案中英双语：这一项是自定义字符串，没有随语言包本地化。
+  ; 安装器整体语言由 tauri.conf.json 的 nsis.languages 定为简体中文，
+  ; 这里是硬编码中文，与原生勾选项保持一致；改语言时要同步改这一行。
   ; 只删 $INSTDIR\models —— 用户通过设置指向的其他模型目录不在这里，
   ; 卸载器也无从得知，天然不会被误删。
   IntOp $5 $5 + $7
-  System::Call 'user32::CreateWindowEx(i r3, w "${__NSD_CheckBox_CLASS}", w "删除程序目录中的模型文件 / Delete models in app folder", i ${__NSD_CheckBox_STYLE}, i r4, i r5, i r6, i r7, p r9, i0, i0, i0) i .s'
+  System::Call 'user32::CreateWindowEx(i r3, w "${__NSD_CheckBox_CLASS}", w "删除程序目录中的模型文件", i ${__NSD_CheckBox_STYLE}, i r4, i r5, i r6, i r7, p r9, i0, i0, i0) i .s'
   Pop $DeleteModelsCheckbox
   SendMessage $HWNDPARENT ${WM_GETFONT} 0 0 $1
   SendMessage $DeleteModelsCheckbox ${WM_SETFONT} $1 1

@@ -271,15 +271,15 @@ Inside:
 ### What uninstall leaves behind
 
 - **Installer build** (on Windows it installs to `%LOCALAPPDATA%\Xieyi`, no
-  admin rights needed): the uninstaller shows two checkboxes, **both unchecked
-  by default**:
-  - **Delete the application data**: removes the data root (config, sessions,
-    downloaded engine).
-  - **删除程序目录中的模型文件 / Delete models in app folder**: removes only
-    `.gguf` files under the app's own `models/`; if that leaves the install
-    folder empty, the folder is removed as well. Model directories you picked
-    in Settings are not touched — the uninstaller does not know where they are,
-    and must not guess.
+  admin rights needed): the installer and uninstaller UI is Simplified
+  Chinese, with two checkboxes, **both unchecked by default**:
+  - **删除应用程序数据** (delete app data): removes the data root (config,
+    sessions, downloaded engine).
+  - **删除程序目录中的模型文件** (delete model files in the app folder):
+    removes only `.gguf` files under the app's own `models/`; if that leaves
+    the install folder empty, the folder is removed as well. Model directories
+    you picked in Settings are not touched — the uninstaller does not know
+    where they are, and must not guess.
   - Both unchecked: data and models are fully kept for a future reinstall.
   - Silent uninstall (`/S`) skips the UI and behaves like "both unchecked".
 - **Portable build**: there is no install/uninstall step — data and models live
