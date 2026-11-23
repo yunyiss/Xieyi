@@ -151,8 +151,12 @@ VIAddVersionKey "ProductVersion" "${VERSION}"
 ; Enable header images for installer and uninstaller pages when either image is configured.
 !if "${HEADERIMAGE}" != ""
   !define MUI_HEADERIMAGE
+  ; 图片放右侧、标题留左侧，与常见 Windows 安装器一致。
+  ; 默认放左侧会挤出一个「标题 + 图片 + 页面标题」的三段式，看着像重复标题。
+  !define MUI_HEADERIMAGE_RIGHT
 !else if "${UNINSTALLERHEADERIMAGE}" != ""
   !define MUI_HEADERIMAGE
+  !define MUI_HEADERIMAGE_RIGHT
 !endif
 
 ; Installer header image
