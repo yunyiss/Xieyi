@@ -601,17 +601,18 @@ describe("ModelDrawer · 设置读写", () => {
   });
 
   /**
-   * 设置抽屉里「推荐模型」**默认收起**。
+   * 设置抽屉里「推荐模型」**已有模型时默认收起**。
    *
    * 用户反馈：「设置里的推荐模型下载可以完全折叠收起来不，因为下载完
    * 之后就不需要再下载了，堆一起占空位」。
    *
    * 与引导层的区别：引导层是第一次面对我没有模型，必须直接摊开；
-   * 设置抽屉是回过头的用户，多半只想改个参数。
+   * 设置抽屉是回过头的用户，多半只想改个参数。没有模型时则相反，
+   * 见下一条用例。
    *
-   * 变异验证：把  改成 ，本测试失败。
+   * 变异验证：把 `presetExpanded` 换回 `presetOpen`，本测试失败。
    */
-  it("推荐模型默认收起，点标题才展开", async () => {
+  it("已有模型时推荐区默认收起，点标题才展开", async () => {
     const user = userEvent.setup();
     vi.mocked(ipc.listPresets).mockResolvedValue([
       {
@@ -646,6 +647,53 @@ describe("ModelDrawer · 设置读写", () => {
     await waitFor(() => {
       expect(screen.getByText(/Hy-MT2 1.8B · 轻量/)).toBeVisible();
     });
+  });
+
+  /**
+   * 一个本地模型都没有时，推荐区自动展开。
+   *
+   * 用户反馈：引导里没下模型，进设置后推荐区是收起的，一般用户不知道
+   * 该去哪儿下——折叠状态下只剩一行标题，很容易划过去。
+   *
+   * 手动收起之后要尊重用户选择，不能每次渲染又自动弹开。
+   */
+  it("没有本地模型时推荐区自动展开，手动收起后保持收起", async () => {
+    const user = userEvent.setup();
+    vi.mocked(ipc.listLocalModels).mockResolvedValue([]);
+    vi.mocked(ipc.listPresets).mockResolvedValue([
+      {
+        id: "Hy-MT2-1.8B-Q8_0",
+        name: "Hy-MT2 1.8B · 轻量",
+        summary: "轻量：4G 显卡或纯 CPU 可用",
+        sizeBytes: 1_908_528_192,
+        vramHintMb: 4096,
+        family: "Hy-MT2",
+        downloaded: false,
+        path: null,
+        partialBytes: 0,
+        partialTotal: 0,
+      },
+    ]);
+
+    renderDrawer();
+    await user.click(await screen.findByRole("tab", { name: /模型与术语/ }));
+
+    // 等模型列表读完（空数组）后自动展开
+    await waitFor(() => {
+      expect(screen.getByText(/Hy-MT2 1.8B · 轻量/)).toBeVisible();
+    });
+    expect(
+      screen.getByRole("button", { name: /推荐模型/ }),
+    ).toHaveAttribute("aria-expanded", "true");
+
+    // 手动收起后保持收起
+    await user.click(screen.getByRole("button", { name: /推荐模型/ }));
+    await waitFor(() => {
+      expect(screen.getByText(/Hy-MT2 1.8B · 轻量/)).not.toBeVisible();
+    });
+    expect(
+      screen.getByRole("button", { name: /推荐模型/ }),
+    ).toHaveAttribute("aria-expanded", "false");
   });
 
   it("模型列表在「模型与术语」页显示模型 id", async () => {

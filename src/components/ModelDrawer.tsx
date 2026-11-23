@@ -269,8 +269,20 @@ export function ModelDrawer({
   const [engineToken, setEngineToken] = useState(0);
   /** 改过上下文后需要重启引擎才生效 */
   const [needsRestart, setNeedsRestart] = useState(false);
-  /** 「推荐模型」是否展开。**默认收起**——已下完的用户不需要它 */
-  const [presetOpen, setPresetOpen] = useState(false);
+  /**
+   * 「推荐模型」的展开状态。
+   *
+   * `null` = 用户还没手动点过，跟随自动判定；`true/false` = 用户明确选择，
+   * 之后不再自动改。自动判定见下面的 `presetExpanded`。
+   */
+  const [presetOpen, setPresetOpen] = useState<boolean | null>(null);
+  /**
+   * 本地模型列表是否**成功读取过一次**。
+   *
+   * 自动展开必须以这个为前提：`local` 初始就是空数组，直接按"空"判定会
+   * 先展开、等数据回来发现其实有模型又收起，反而闪一下。
+   */
+  const [localLoaded, setLocalLoaded] = useState(false);
   /** 还差几个预设没下。收起时用它透出这儿还有东西 */
   const [presetPending, setPresetPending] = useState(0);
   /** 退场动画期间仍然渲染，动画结束后再卸载 */
@@ -324,6 +336,7 @@ export function ModelDrawer({
   const refreshHeavy = useCallback(async () => {
     try {
       setLocal(await listLocalModels());
+      setLocalLoaded(true);
     } catch {
       // 扫不到就保持上一次的列表
     }
@@ -547,6 +560,18 @@ export function ModelDrawer({
     const s = states[m.id] ?? "unloaded";
     return s === "loaded" || s === "loading" || s === "unloading";
   }).length;
+
+  /**
+   * 推荐区实际是否展开。
+   *
+   * 用户没手动点过时按模型数量决定：
+   * - **一个模型都没有** → 展开。新手打开设置往往不知道该下什么，
+   *   折叠状态下只看到一行「推荐模型」，很容易直接划过去。
+   * - 已有模型 → 收起，下载完的用户不需要它占地方。
+   *
+   * 手动点过就以用户选择为准，不再来回自动变。
+   */
+  const presetExpanded = presetOpen ?? (localLoaded && local.length === 0);
 
   /**
    * 下载推理引擎。
@@ -1342,11 +1367,15 @@ export function ModelDrawer({
             </div>
           </div>
 
-          {/* 推荐模型下载。**默认收起**。
+          {/* 推荐模型下载。**有模型时默认收起，没有模型时自动展开**。
 
               与引导层的区别：引导层是用户第一次面对"我没有模型"，那里
               必须直接摊开（`mode="featured"`）；设置抽屉是回过头的用户，
-              多半只是想改个参数，推荐区一直摊着反而占地方。
+              已经有模型时多半只是想改个参数，推荐区一直摊着反而占地方。
+
+              但"一个模型都没有"时正好相反：新手不知道该下什么，折叠起来
+              只剩一行标题，很容易划过去。所以空列表时自动展开（判定见
+              `presetExpanded`），用户手动点过之后以他的选择为准。
 
               收起的另一半理由：三档都下完之后，这块内容对他永久无用，
               却会一直把下面的本地模型列表往下推。
@@ -1360,9 +1389,9 @@ export function ModelDrawer({
             <button
               className="btn flex w-full items-center gap-2 rounded-md px-1 py-0.5"
               style={{ background: "transparent", color: "var(--text)" }}
-              onClick={() => setPresetOpen((v) => !v)}
-              aria-expanded={presetOpen}
-              title={presetOpen ? "收起推荐模型" : "展开推荐模型"}
+              onClick={() => setPresetOpen(!presetExpanded)}
+              aria-expanded={presetExpanded}
+              title={presetExpanded ? "收起推荐模型" : "展开推荐模型"}
             >
               <span
                 aria-hidden
@@ -1372,8 +1401,10 @@ export function ModelDrawer({
                   height: 0,
                   borderLeft: "3.5px solid transparent",
                   borderRight: "3.5px solid transparent",
-                  borderTop: presetOpen ? "none" : "4px solid currentColor",
-                  borderBottom: presetOpen ? "4px solid currentColor" : "none",
+                  borderTop: presetExpanded ? "none" : "4px solid currentColor",
+                  borderBottom: presetExpanded
+                    ? "4px solid currentColor"
+                    : "none",
                   opacity: 0.5,
                 }}
               />
@@ -1385,7 +1416,7 @@ export function ModelDrawer({
                 已实测可用
               </span>
               {/* 收起时把"还有几个没下"透出来，别让人忘了这儿有东西 */}
-              {!presetOpen && (
+              {!presetExpanded && (
                 <span
                   className="ml-auto text-[10px]"
                   style={{ color: "var(--text-muted)" }}
@@ -1407,7 +1438,7 @@ export function ModelDrawer({
             */}
             <div
               className="mt-2"
-              style={{ display: presetOpen ? undefined : "none" }}
+              style={{ display: presetExpanded ? undefined : "none" }}
             >
               <PresetModels
                 mode="full"
