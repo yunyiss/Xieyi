@@ -147,9 +147,9 @@ jobs:
   #
   # 只编译验证，**不产包**。
   #
-  # 原因：没有在真机上跑过界面。CI 编译通过 ≠ 能用，
-  # 在没有人工验证之前不出安装包，避免误导用户。
-  # 等到有人实际验证过界面，再把这里换成 tauri-action。
+  # 原因：Intel x86_64 已人工跑通完整流程，但 Apple Silicon 的 Metal
+  # 路径尚未实测，且没有签名/公证，出了包反而会误导用户。
+  # 等 Apple Silicon 也确实验证过、并解决签名，再换成 tauri-action。
   macos-check:
     name: macOS compile check
     runs-on: macos-latest
@@ -218,9 +218,11 @@ jobs:
             | Linux | `Xieyi_*_amd64.deb` | 安装版（3.5 MB，需系统已装 webkit2gtk） |
             | Linux | `Xieyi-*-portable-linux-x64.zip` | 便携版（内含 AppImage，自带 webkit） |
 
-            **macOS 暂不提供安装包**：编译与单元测试通过，但界面未在真机验证。
+            **macOS 暂不提供安装包**：Intel x86_64 已跑通完整流程（CPU 推理），
+            但 Apple Silicon 的 Metal 路径尚未实测，且未做签名与公证，
+            因此暂不发布。
 
             ## 首次启动
 
             需要自己准备 `.gguf` 模型文件，放到 `models` 目录。
-            推理引擎首次启动时按需下载（约 30 MB）。
+            推理引擎首次启动时按需下载（约 12–31 MB，视平台）。
