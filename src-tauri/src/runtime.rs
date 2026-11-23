@@ -310,8 +310,9 @@ fn sum_partials_in(dir: &Path) -> u64 {
                 .map(|n| n.ends_with(".part"))
                 .unwrap_or(false)
         })
-        .filter_map(|e| e.metadata().ok())
-        .map(|m| m.len())
+        // 不能用文件长度：分段下载的 `.part` 是预分配的，长度等于总大小。
+        // 交给下载器按 meta 里的分段进度算实际字节数。
+        .map(|e| crate::downloader::part_downloaded_bytes(&e.path()))
         .sum()
 }
 

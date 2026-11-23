@@ -37,12 +37,26 @@
 //! 下载中的内容写到 `<目标>.part`，校验通过后才改名为正式文件。
 //! 这样"半截文件"永远不会被误认为是完整的——上层扫描模型目录时
 //! 只认 `.gguf`，`.part` 天然被忽略。
+//!
+//! ## 分段并发
+//!
+//! 大文件（≥ 8 MB）且服务端支持 `Range` 时，按 1–16 MB 切片、最多 8 条
+//! 连接并发下载（慢启动扩容）。目的是绕开 CDN / 公共代理常见的
+//! **单连接限速**：实测单连接 57 KB/s 时，8 条能到 287 KB/s。
+//!
+//! 每片的进度都写进 `.part.meta`，取消或断网后续传只补没下完的片。
+//! 服务端不支持 Range（回 200）时自动回退单流，不浪费已下的数据。
 
-use futures_util::StreamExt;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use sha2::{Digest, Sha256};
+use std::collections::VecDeque;
+use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
-use tokio::io::AsyncWriteExt;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
 /// 下载进度。`total == 0` 表示服务端没给 `Content-Length`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,13 +88,19 @@ pub enum DownloadError {
     Cancelled,
     /// 真正的失败（网络、磁盘、校验）。`String` 是给人看的说明。
     Failed(String),
+    /// 下载完整但哈希对不上。
+    ///
+    /// 单独一类是因为它**值得自动重试一次**：公共代理偶发返回坏数据、
+    /// 或下载过程中被中间设备篡改，重下一遍往往就好了。重试仍失败
+    /// 才升级成 `Failed` 报给用户。
+    Checksum(String),
 }
 
 impl std::fmt::Display for DownloadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DownloadError::Cancelled => write!(f, "已取消下载"),
-            DownloadError::Failed(msg) => f.write_str(msg),
+            DownloadError::Failed(msg) | DownloadError::Checksum(msg) => f.write_str(msg),
         }
     }
 }
@@ -114,7 +134,7 @@ pub struct Downloaded {
     pub resumed: bool,
 }
 
-/// 下载一个文件到 `dest`，可断点续传。
+/// 下载一个文件到 `dest`，可断点续传；校验失败会自动重下一次。
 ///
 /// - `url`：完整下载地址
 /// - `dest`：最终路径。下载中写 `dest.part`
@@ -124,8 +144,6 @@ pub struct Downloaded {
 /// - `on_progress`：进度回调，调用频率由内部限流（约 250ms 一次）
 ///
 /// 返回 `Err(DownloadError::Cancelled)` 时 `.part` **保留**，下次可续传。
-/// 返回 `Err(DownloadError::Failed(..))` 时也保留，除了校验失败——那时
-/// 内容已确认是坏的，留着只会重复失败。
 pub async fn download<F>(
     url: &str,
     dest: &Path,
@@ -136,78 +154,177 @@ pub async fn download<F>(
 where
     F: FnMut(Progress),
 {
-    let part = part_path(dest);
+    match download_once(url, dest, expected_sha256, cancel, &mut on_progress).await {
+        // 公共代理偶发坏数据：整份重下一次。重下前 finish 已经删掉了坏文件。
+        Err(DownloadError::Checksum(msg)) => {
+            let part = part_path(dest);
+            let _ = tokio::fs::remove_file(&part).await;
+            let _ = tokio::fs::remove_file(meta_path(&part)).await;
+            match download_once(url, dest, expected_sha256, cancel, &mut on_progress).await {
+                Err(DownloadError::Checksum(_)) => Err(DownloadError::Failed(format!(
+                    "{msg} 已自动重试一次，结果仍不一致；\
+                     请更换下载源或稍后再试。"
+                ))),
+                other => other,
+            }
+        }
+        other => other,
+    }
+}
 
-    // 已有多少字节可以复用
-    let existing = tokio::fs::metadata(&part)
-        .await
-        .map(|m| m.len())
-        .unwrap_or(0);
+/// 单次尝试。见 [`download`]。
+async fn download_once<F>(
+    url: &str,
+    dest: &Path,
+    expected_sha256: Option<&str>,
+    cancel: Option<&AtomicBool>,
+    on_progress: &mut F,
+) -> Result<Downloaded, DownloadError>
+where
+    F: FnMut(Progress),
+{
+    let part = part_path(dest);
 
     // 一进来就先看一次：用户可能在排队等源的时候就取消了
     if cancelled(cancel) {
         return Err(DownloadError::Cancelled);
     }
 
-    let (downloaded, resumed) = if existing > 0 {
+    let identity = expected_sha256.unwrap_or(url).to_string();
+    let mut meta = read_meta(&part).await;
+
+    // 身份不符：旧半截文件不属于这个产物，绝不能续传
+    if let Some(m) = meta.as_ref() {
+        if m.identity != identity {
+            let _ = tokio::fs::remove_file(&part).await;
+            let _ = tokio::fs::remove_file(meta_path(&part)).await;
+            meta = None;
+        } else if m.version >= META_VERSION && !tokio::fs::try_exists(&part).await.unwrap_or(false)
+        {
+            // 元信息还在、数据文件没了（换源时被清掉）：这份 meta 无效
+            let _ = tokio::fs::remove_file(meta_path(&part)).await;
+            meta = None;
+        }
+    }
+
+    // ── v2：分段续传 ──────────────────────────────────────────────
+    if let Some(m) = meta
+        .as_ref()
+        .filter(|m| m.version >= META_VERSION && !m.segments.is_empty())
+    {
+        match segmented_resume(url, &part, m, cancel, &mut *on_progress).await {
+            // 分段全部完成：交给统一收尾做校验与改名
+            Ok(true) => {
+                return finish_download(dest, &part, expected_sha256, m.total, true).await;
+            }
+            // 服务端不支持 Range / 大小变了：清掉重下
+            Ok(false) => {
+                let _ = tokio::fs::remove_file(&part).await;
+                let _ = tokio::fs::remove_file(meta_path(&part)).await;
+                meta = None;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    // ── v1：单流续传（老版本留下的 .part）────────────────────────
+    let existing = if meta.is_some() {
+        tokio::fs::metadata(&part)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    if existing > 0 {
         match try_resume(
             url,
             &part,
             existing,
             expected_sha256,
             cancel,
-            &mut on_progress,
+            &mut *on_progress,
         )
-        .await?
+        .await
         {
-            Some(final_size) => (final_size, true),
-            // 续传不可用（服务端不支持 Range / 文件已变）→ 从头下
-            None => {
-                let _ = tokio::fs::remove_file(&part).await;
-                (
-                    fresh_download(url, &part, expected_sha256, cancel, &mut on_progress).await?,
-                    false,
-                )
+            Ok(Some(final_size)) => {
+                return finish_download(dest, &part, expected_sha256, final_size, true).await;
             }
+            Ok(None) => {
+                // `try_resume` 已把不可信的半截文件删掉，继续走全新下载
+            }
+            Err(e) => return Err(e),
         }
-    } else {
-        (
-            fresh_download(url, &part, expected_sha256, cancel, &mut on_progress).await?,
-            false,
-        )
-    };
+    }
 
+    // ── 全新下载：先探测 Range 能力，再决定分段还是单流 ──────────
+    let probe = probe_range(url, None).await?;
+
+    if probe.ranged && probe.total >= SEGMENT_MIN_TOTAL {
+        let total = probe.total;
+        segmented_fresh(url, &part, probe, identity, cancel, &mut *on_progress).await?;
+        return finish_download(dest, &part, expected_sha256, total, false).await;
+    }
+
+    // 探测只拿到 1 字节（小文件）或服务端不吃 Range：
+    // 前者重新整份请求，后者直接复用探测响应，避免多发一次请求。
+    if probe.ranged {
+        let total =
+            fresh_download(url, &part, expected_sha256, cancel, &mut *on_progress, None).await?;
+        return finish_download(dest, &part, expected_sha256, total, false).await;
+    }
+
+    // 200 响应直接复用；206 但总大小解析不出（`bytes 0-0/*`）时
+    // `resp` 为空，交给 fresh_download 重新发一次完整请求。
+    let total = fresh_download(
+        url,
+        &part,
+        expected_sha256,
+        cancel,
+        &mut *on_progress,
+        probe.resp,
+    )
+    .await?;
+    finish_download(dest, &part, expected_sha256, total, false).await
+}
+
+/// 下载完成后的统一收尾：校验哈希、改名、确认落位、清元信息。
+///
+/// 单流与分段两条路径共用，避免两套收尾逻辑各漏一处。
+async fn finish_download(
+    dest: &Path,
+    part: &Path,
+    expected_sha256: Option<&str>,
+    downloaded: u64,
+    resumed: bool,
+) -> Result<Downloaded, DownloadError> {
     // 校验：先算哈希，再决定是否改名
-    let sha256 = sha256_file(&part).await.map_err(DownloadError::Failed)?;
+    let sha256 = sha256_file(part).await.map_err(DownloadError::Failed)?;
 
     if let Some(expected) = expected_sha256 {
         let expected = expected.trim().to_lowercase();
         if sha256 != expected {
             // 内容确认是坏的，留着只会让下次续传拼出更坏的文件
-            let _ = tokio::fs::remove_file(&part).await;
-            return Err(DownloadError::Failed(format!(
-                "下载校验失败：期望 {expected}，实际 {sha256}。文件已删除，请重试。"
+            let _ = tokio::fs::remove_file(part).await;
+            let _ = tokio::fs::remove_file(meta_path(part)).await;
+            return Err(DownloadError::Checksum(format!(
+                "下载校验失败：期望 {expected}，实际 {sha256}。"
             )));
         }
     }
 
     // 校验通过才改名。跨设备时 rename 会失败，退回 copy + remove
-    if tokio::fs::rename(&part, dest).await.is_err() {
-        tokio::fs::copy(&part, dest)
+    if tokio::fs::rename(part, dest).await.is_err() {
+        tokio::fs::copy(part, dest)
             .await
             .map_err(|e| DownloadError::Failed(format!("保存文件失败: {e}")))?;
-        let _ = tokio::fs::remove_file(&part).await;
+        let _ = tokio::fs::remove_file(part).await;
     }
 
     // **确认真的落位了**再报告成功。
     //
-    // 参考实践里明确提到：不要因为"输入流读完了"就宣布完成。
-    // rename 在某些情况下会静默失败（目标磁盘满、权限、杀软占用），
-    // 此时 `dest` 可能不存在或是 0 字节。用户看到"下载完成"却发现
-    // 模型列表里没有，比直接报错更让人困惑。
-    //
-    // 校验的是"目标文件存在且大小与下载量一致"，不重算哈希——
-    // 哈希刚刚算过，rename 不会改变内容。
+    // 不要因为"输入流读完了"就宣布完成：rename 可能静默失败
+    // （目标磁盘满、权限、杀软占用），此时 `dest` 可能不存在或是 0 字节。
     let placed = tokio::fs::metadata(dest)
         .await
         .map(|m| m.len())
@@ -222,7 +339,7 @@ where
     }
 
     // 收尾：删掉 `.part.meta`，它只服务于未完成的下载
-    let _ = tokio::fs::remove_file(meta_path(&part)).await;
+    let _ = tokio::fs::remove_file(meta_path(part)).await;
 
     Ok(Downloaded {
         path: dest.to_path_buf(),
@@ -289,6 +406,20 @@ where
             Ok(d) => return Ok(d),
             // 取消立刻上抛：绝不能换源重试，用户已经不要了
             Err(DownloadError::Cancelled) => return Err(DownloadError::Cancelled),
+            // 本源自动重下一次后仍不一致：换一个镜像大概率是好的
+            Err(DownloadError::Checksum(e)) => {
+                failures.push(format!("第 {} 个源校验失败：{e}", i + 1));
+                if is_last {
+                    let detail = failures.join("；");
+                    return Err(DownloadError::Failed(format!(
+                        "{detail}。已尝试 {} 个源且在失败源上各重试一次。\n\
+                         建议在设置里更换下载源，或手动下载后放入模型目录。",
+                        urls.len()
+                    )));
+                }
+                let _ = tokio::fs::remove_file(part_path(dest)).await;
+                let _ = tokio::fs::remove_file(meta_path(&part_path(dest))).await;
+            }
             Err(DownloadError::Failed(e)) => {
                 failures.push(format!("第 {} 个源失败：{e}", i + 1));
 
@@ -304,8 +435,9 @@ where
                     )));
                 }
                 // 换源前清掉可能残留的半截文件：不同源的内容若不一致，
-                // 拼起来必然是坏的
+                // 拼起来必然是坏的。元信息一起删，避免下游误判可续传。
                 let _ = tokio::fs::remove_file(part_path(dest)).await;
+                let _ = tokio::fs::remove_file(meta_path(&part_path(dest))).await;
             }
         }
     }
@@ -339,6 +471,31 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 ///
 /// 比连接超时宽松得多——慢速服务器可能需要时间准备大文件。
 const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 分段下载的门槛：小于这个大小就老实单流，不值得为省几秒开并发。
+const SEGMENT_MIN_TOTAL: u64 = 8 * 1024 * 1024;
+
+/// 单个分片的目标大小。
+///
+/// 不是越小越好：每片都是一次独立的 Range 请求，太小会让请求数暴涨
+/// （1.8 GB 按 1 MB 切就是 1800 次）；也不能太大，否则负载不均、
+/// 断点续传的粒度太粗。8 等分再夹在 1–16 MB 之间，30 MB 的引擎
+/// 正好是 4 MB × 8 片。
+const SEGMENT_CHUNK_MIN: u64 = 1024 * 1024;
+const SEGMENT_CHUNK_MAX: u64 = 16 * 1024 * 1024;
+
+/// 并发连接上限。
+///
+/// 实测（2026-11-23，gh-proxy 下 16 MB 样本）：单连接 57 KB/s、
+/// 4 连接 209 KB/s、8 连接 287 KB/s。继续加收益递减，而家用网络和
+/// 公共代理对高并发更敏感，所以停在 8。
+const SEGMENT_WORKERS: usize = 8;
+
+/// 单个分片的重试次数（不含首次）。
+const SEGMENT_RETRIES: u32 = 3;
+
+/// 元信息格式版本。v2 = 带 `segments`（分段进度）。
+const META_VERSION: u32 = 2;
 
 /// 下载时用的 `User-Agent`。
 ///
@@ -397,21 +554,29 @@ pub fn part_path(dest: &Path) -> PathBuf {
 }
 
 /// 从头下载，返回下载到的字节数。
+///
+/// `resp` 是探测阶段已经拿到的响应（服务端不支持 Range 时，它是一份
+/// 完整的 200 响应）。复用它就少发一次请求——也避免本地测试服务里
+/// 「只 accept 一次」的场景直接失败。
 async fn fresh_download<F>(
     url: &str,
     part: &Path,
     expected_sha256: Option<&str>,
     cancel: Option<&AtomicBool>,
     on_progress: &mut F,
+    resp: Option<reqwest::Response>,
 ) -> Result<u64, DownloadError>
 where
     F: FnMut(Progress),
 {
-    let resp = http_client()
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| DownloadError::Failed(format!("请求下载地址失败: {e}")))?;
+    let resp = match resp {
+        Some(r) => r,
+        None => http_client()
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| DownloadError::Failed(format!("请求下载地址失败: {e}")))?,
+    };
 
     if !resp.status().is_success() {
         return Err(DownloadError::Failed(format!(
@@ -463,16 +628,45 @@ where
 ///
 /// 参考 [Resumable Downloads Need Validators, Not Just a Byte Offset](https://www.gioyous.it/resumable-downloads-http-range-if-range-validators/)
 /// 与本项目实测的同类经验：**Range 选的是字节区间，不是版本**。
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 struct ResumeMeta {
+    /// 格式版本。老文件没有这个字段，反序列化成 0（按 v1 处理）。
+    #[serde(default)]
+    version: u32,
     /// 产物身份：期望的 SHA-256（无哈希时为 URL）
+    #[serde(default)]
     identity: String,
     /// 期望的总字节数
+    #[serde(default)]
     total: u64,
     /// 首次下载时服务端给的 ETag。续传时用 `If-Range` 发回去，
     /// 让服务端判断"文件是否已变"——变了就返回 200，我们据此放弃续传。
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     etag: Option<String>,
+    /// v2 才有的分段进度。v1 为空，表示整份文件按连续前缀续传。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    segments: Vec<SegmentMeta>,
+}
+
+/// 一个分片的进度。
+///
+/// `end` 是**闭区间**，与 HTTP Range 一致；长度为 `end - begin + 1`。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct SegmentMeta {
+    begin: u64,
+    end: u64,
+    /// 这一片已经落盘的字节数（从 `begin` 起算）。
+    done: u64,
+}
+
+impl SegmentMeta {
+    fn len(&self) -> u64 {
+        self.end.saturating_sub(self.begin) + 1
+    }
+
+    fn finished(&self) -> bool {
+        self.done >= self.len()
+    }
 }
 
 /// 元信息文件路径：`foo.gguf.part` → `foo.gguf.part.meta`。
@@ -606,20 +800,41 @@ pub struct PartialState {
 /// 返回 `None` 表示没有残留（或残留是 0 字节，等于没有）。
 pub fn partial_state(dest: &Path) -> Option<PartialState> {
     let part = part_path(dest);
-    let downloaded = std::fs::metadata(&part).ok()?.len();
+    let meta = std::fs::read_to_string(meta_path(&part))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<ResumeMeta>(&raw).ok());
+
+    // v2 的 `.part` 是预分配的，文件长度等于总大小——不能再用长度当进度，
+    // 否则界面上会出现「已暂停 · 4.6 / 4.6 GB」这种假象。
+    let downloaded = match meta.as_ref() {
+        Some(m) if m.version >= META_VERSION && !m.segments.is_empty() => {
+            m.segments.iter().map(|s| s.done.min(s.len())).sum()
+        }
+        _ => std::fs::metadata(&part).ok()?.len(),
+    };
     if downloaded == 0 {
-        // 0 字节的 `.part` 没有任何续传价值，不值得在界面占一行
+        // 0 字节没有任何续传价值，不值得在界面占一行
         return None;
     }
 
-    // total 从元信息里取；读不到就算了，界面显示"未知大小"即可
-    let total = std::fs::read_to_string(meta_path(&part))
-        .ok()
-        .and_then(|raw| serde_json::from_str::<ResumeMeta>(&raw).ok())
-        .map(|m| m.total)
-        .unwrap_or(0);
+    Some(PartialState {
+        downloaded,
+        total: meta.map(|m| m.total).unwrap_or(0),
+    })
+}
 
-    Some(PartialState { downloaded, total })
+/// `.part` 实际已落盘多少字节。
+///
+/// v2 读分段表；v1 与异常情况退回文件长度。给 `runtime.rs` 统计残留用。
+pub fn part_downloaded_bytes(part: &Path) -> u64 {
+    if let Ok(raw) = std::fs::read_to_string(meta_path(part))
+        && let Ok(meta) = serde_json::from_str::<ResumeMeta>(&raw)
+        && meta.version >= META_VERSION
+        && !meta.segments.is_empty()
+    {
+        return meta.segments.iter().map(|s| s.done.min(s.len())).sum();
+    }
+    std::fs::metadata(part).map(|m| m.len()).unwrap_or(0)
 }
 
 /// 删掉未完成的下载（`.part` + `.part.meta`）。
@@ -636,19 +851,610 @@ pub fn remove_partial(dest: &Path) -> u64 {
     // 元信息必须跟着删：留着它会让下次下载以为可以按旧身份续传，
     // 但 `.part` 已经不在了，等于一次无效的续传尝试
     let _ = std::fs::remove_file(meta_path(&part));
+    // 原子写的临时文件：上次写到一半被杀时可能留下
+    let mut tmp = meta_path(&part).as_os_str().to_os_string();
+    tmp.push(".tmp");
+    let _ = std::fs::remove_file(PathBuf::from(tmp));
     bytes
 }
 
-/// 写 `.part.meta`。失败不影响下载本身——只是下次不能续传。
+/// 写 `.part.meta`（v1：无分段信息）。失败不影响下载本身——只是下次不能续传。
 async fn write_meta(part: &Path, identity: &str, total: u64, etag: Option<String>) {
     let meta = ResumeMeta {
+        version: 0,
         identity: identity.to_string(),
         total,
         etag,
+        segments: Vec::new(),
     };
-    if let Ok(raw) = serde_json::to_string(&meta) {
-        let _ = tokio::fs::write(meta_path(part), raw).await;
+    write_meta_obj(part, &meta).await;
+}
+
+/// 原子地写元信息：先写 `.tmp` 再改名，避免进程被杀时留下截断的 JSON。
+async fn write_meta_obj(part: &Path, meta: &ResumeMeta) {
+    let Ok(raw) = serde_json::to_vec(meta) else {
+        return;
+    };
+    let path = meta_path(part);
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    if tokio::fs::write(&tmp, raw).await.is_ok() && tokio::fs::rename(&tmp, &path).await.is_err() {
+        let _ = tokio::fs::remove_file(&tmp).await;
     }
+}
+
+// ─────────────────────────── 分段并发下载 ───────────────────────────
+
+/// Range 探测结果。
+struct RangeProbe {
+    total: u64,
+    /// 服务端接受 `Range` 且返回了 206。
+    ranged: bool,
+    etag: Option<String>,
+    /// 服务端忽略 Range 时保留的 200 响应，可直接交给单流下载复用。
+    resp: Option<reqwest::Response>,
+}
+
+/// 用 `bytes=0-0` 探一次服务端能力与文件大小。
+///
+/// 复用探测响应而不是丢弃后重开：本地测试服务里有「只 accept 一次」的
+/// 实现，多一次请求会直接失败；真实环境也能省一次 TLS 往返。
+async fn probe_range(url: &str, if_range: Option<&str>) -> Result<RangeProbe, DownloadError> {
+    let mut req = http_client()
+        .get(url)
+        .header(reqwest::header::RANGE, "bytes=0-0");
+    if let Some(tag) = if_range {
+        req = req.header(reqwest::header::IF_RANGE, tag);
+    }
+
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| DownloadError::Failed(format!("请求下载地址失败: {e}")))?;
+
+    let status = resp.status();
+    let etag = resp
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    if status == reqwest::StatusCode::PARTIAL_CONTENT {
+        if let Some(total) = content_range_total(&resp) {
+            return Ok(RangeProbe {
+                total,
+                ranged: true,
+                etag,
+                resp: None,
+            });
+        }
+        // 206 但总大小是 `*`：无法切分片，退到单流重新请求一次。
+        return Ok(RangeProbe {
+            total: 0,
+            ranged: false,
+            etag,
+            resp: None,
+        });
+    }
+
+    if status.is_success() {
+        let total = resp.content_length().unwrap_or(0);
+        return Ok(RangeProbe {
+            total,
+            ranged: false,
+            etag,
+            resp: Some(resp),
+        });
+    }
+
+    Err(DownloadError::Failed(format!(
+        "下载失败，HTTP {status}。可尝试更换下载源或检查网络。"
+    )))
+}
+
+/// 从 `Content-Range: bytes 0-0/32306237` 里取出总大小。
+fn content_range_total(resp: &reqwest::Response) -> Option<u64> {
+    let raw = resp
+        .headers()
+        .get(reqwest::header::CONTENT_RANGE)?
+        .to_str()
+        .ok()?;
+    let total = raw.strip_prefix("bytes ")?.split('/').nth(1)?.trim();
+    if total == "*" {
+        return None;
+    }
+    total.parse::<u64>().ok()
+}
+
+/// 按总大小切分片。
+///
+/// 8 等分再夹在 1–16 MB：30 MB 的引擎是 4 MB × 8 片，1.8 GB 的模型
+/// 是 16 MB × 113 片。片太大负载不均，太小请求数暴涨。
+fn plan_segments(total: u64) -> Vec<SegmentMeta> {
+    let chunk = (total / 8).clamp(SEGMENT_CHUNK_MIN, SEGMENT_CHUNK_MAX);
+    let mut out = Vec::new();
+    let mut begin = 0u64;
+    while begin < total {
+        let end = (begin + chunk - 1).min(total - 1);
+        out.push(SegmentMeta {
+            begin,
+            end,
+            done: 0,
+        });
+        begin = end + 1;
+    }
+    out
+}
+
+fn segment_workers(_total: u64) -> usize {
+    SEGMENT_WORKERS
+}
+
+/// 运行时的一片状态。`done` 用原子量，worker 写、协调者读快照。
+struct SegState {
+    begin: u64,
+    end: u64,
+    done: Arc<AtomicU64>,
+}
+
+impl SegState {
+    fn len(&self) -> u64 {
+        self.end.saturating_sub(self.begin) + 1
+    }
+
+    fn remaining(&self) -> u64 {
+        self.len().saturating_sub(self.done.load(Ordering::Relaxed))
+    }
+}
+
+/// 全新分段下载。
+async fn segmented_fresh<F>(
+    url: &str,
+    part: &Path,
+    probe: RangeProbe,
+    identity: String,
+    cancel: Option<&AtomicBool>,
+    on_progress: &mut F,
+) -> Result<(), DownloadError>
+where
+    F: FnMut(Progress),
+{
+    let total = probe.total;
+    if let Some(parent) = part.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| DownloadError::Failed(format!("创建目录失败: {e}")))?;
+    }
+
+    // **先写 meta，再建文件。**
+    //
+    // 反过来的话存在一个窗口：文件已被 `set_len` 预分配到总大小，而 meta
+    // 还没落盘——此时任何按「文件长度」读进度的观察者都会看到 100%，
+    // 取消/界面会误判成"已经下完"。
+    let meta = ResumeMeta {
+        version: META_VERSION,
+        identity,
+        total,
+        etag: probe.etag,
+        segments: plan_segments(total),
+    };
+    write_meta_obj(part, &meta).await;
+
+    // 预分配：磁盘不够会在开始就报，而不是下到 90% 才失败。
+    let file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(part)
+        .await
+        .map_err(|e| DownloadError::Failed(format!("创建文件失败: {e}")))?;
+    file.set_len(total)
+        .await
+        .map_err(|e| DownloadError::Failed(format!("预分配磁盘失败: {e}")))?;
+    drop(file);
+
+    run_segments(url, part, &meta, cancel, on_progress).await
+}
+
+/// 分段续传。
+///
+/// - `Ok(true)`：所有片都已完成（或本次补齐），调用方进入收尾
+/// - `Ok(false)`：服务端不支持 Range / 大小变了，调用方清掉重下
+async fn segmented_resume<F>(
+    url: &str,
+    part: &Path,
+    meta: &ResumeMeta,
+    cancel: Option<&AtomicBool>,
+    on_progress: &mut F,
+) -> Result<bool, DownloadError>
+where
+    F: FnMut(Progress),
+{
+    if !segments_cover_total(meta) {
+        return Ok(false);
+    }
+
+    let probe = probe_range(url, meta.etag.as_deref()).await?;
+    if !probe.ranged || probe.total != meta.total {
+        return Ok(false);
+    }
+
+    let file = match tokio::fs::OpenOptions::new().write(true).open(part).await {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(DownloadError::Failed(format!("打开已有文件失败: {e}"))),
+    };
+    let len = file
+        .metadata()
+        .await
+        .map_err(|e| DownloadError::Failed(format!("读取文件大小失败: {e}")))?
+        .len();
+    if len != meta.total {
+        file.set_len(meta.total)
+            .await
+            .map_err(|e| DownloadError::Failed(format!("调整文件大小失败: {e}")))?;
+    }
+    drop(file);
+
+    // 所有片都完成了，只差改名（上次可能写完但没来得及收尾）
+    if meta.segments.iter().all(|s| s.finished()) {
+        return Ok(true);
+    }
+
+    run_segments(url, part, meta, cancel, on_progress).await?;
+    Ok(true)
+}
+
+/// 校验分段表是否严格覆盖 `[0, total)`，且 `done` 不越界。
+fn segments_cover_total(meta: &ResumeMeta) -> bool {
+    if meta.total == 0 || meta.segments.is_empty() {
+        return false;
+    }
+    let mut next = 0u64;
+    for seg in &meta.segments {
+        if seg.begin != next || seg.end < seg.begin || seg.done > seg.len() {
+            return false;
+        }
+        next = seg.end + 1;
+    }
+    next == meta.total
+}
+
+/// 一个并发任务。全部借用当前 `download()` 的栈数据，所以不 spawn，
+/// 交给 `FuturesUnordered` 在同一个任务里并发驱动。
+type WorkerFut<'a> = Pin<Box<dyn Future<Output = Result<(), DownloadError>> + Send + 'a>>;
+
+#[allow(clippy::too_many_arguments)]
+fn make_worker<'a>(
+    url: &'a str,
+    part: &'a Path,
+    etag: Option<&'a str>,
+    segs: Arc<Vec<SegState>>,
+    queue: Arc<Mutex<VecDeque<usize>>>,
+    total_done: Arc<AtomicU64>,
+    cancel: Option<&'a AtomicBool>,
+    stop: Arc<AtomicBool>,
+    throttled: Arc<AtomicBool>,
+) -> WorkerFut<'a> {
+    Box::pin(run_worker(
+        url, part, etag, segs, queue, total_done, cancel, stop, throttled,
+    ))
+}
+
+/// 协调多个 worker：慢启动、进度聚合、定期保存分段进度。
+async fn run_segments<F>(
+    url: &str,
+    part: &Path,
+    meta: &ResumeMeta,
+    cancel: Option<&AtomicBool>,
+    on_progress: &mut F,
+) -> Result<(), DownloadError>
+where
+    F: FnMut(Progress),
+{
+    let total = meta.total;
+    let segs: Arc<Vec<SegState>> = Arc::new(
+        meta.segments
+            .iter()
+            .map(|s| SegState {
+                begin: s.begin,
+                end: s.end,
+                done: Arc::new(AtomicU64::new(s.done)),
+            })
+            .collect(),
+    );
+    let queue: Arc<Mutex<VecDeque<usize>>> = Arc::new(Mutex::new(
+        segs.iter()
+            .enumerate()
+            .filter(|(_, s)| s.remaining() > 0)
+            .map(|(i, _)| i)
+            .collect(),
+    ));
+    let total_done = Arc::new(AtomicU64::new(
+        segs.iter().map(|s| s.done.load(Ordering::Relaxed)).sum(),
+    ));
+    let stop = Arc::new(AtomicBool::new(false));
+    let throttled = Arc::new(AtomicBool::new(false));
+
+    let max_workers = segment_workers(total).min(queue.lock().map(|q| q.len()).unwrap_or(1).max(1));
+
+    let mut inflight: FuturesUnordered<WorkerFut<'_>> = FuturesUnordered::new();
+
+    // 慢启动：先 1 条，之后每 250ms 加一条，直到上限或被 429 叫停。
+    let mut launched = 0usize;
+    if queue.lock().map(|q| !q.is_empty()).unwrap_or(false) {
+        inflight.push(make_worker(
+            url,
+            part,
+            meta.etag.as_deref(),
+            segs.clone(),
+            queue.clone(),
+            total_done.clone(),
+            cancel,
+            stop.clone(),
+            throttled.clone(),
+        ));
+        launched = 1;
+    }
+
+    let mut tick = tokio::time::interval(Duration::from_millis(250));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut failure: Option<DownloadError> = None;
+
+    loop {
+        if inflight.is_empty() {
+            break;
+        }
+        tokio::select! {
+            _ = tick.tick() => {
+                on_progress(Progress {
+                    downloaded: total_done.load(Ordering::Relaxed).min(total),
+                    total,
+                });
+                if launched < max_workers
+                    && !throttled.load(Ordering::Relaxed)
+                    && queue.lock().map(|q| !q.is_empty()).unwrap_or(false)
+                {
+                    inflight.push(make_worker(
+                        url,
+                        part,
+                        meta.etag.as_deref(),
+                        segs.clone(),
+                        queue.clone(),
+                        total_done.clone(),
+                        cancel,
+                        stop.clone(),
+                        throttled.clone(),
+                    ));
+                    launched += 1;
+                }
+                // 每 250ms 落一次分段进度：取消/断电回来最多丢 250ms 的下载量，
+                // 而 JSON 只有几 KB，开销可以忽略。之前写死 2 秒会在
+                // 「刚下一点就取消」时留下 done=0 的 meta，续传等于重下。
+                save_segments(part, meta, &segs).await;
+            }
+            Some(res) = inflight.next() => {
+                if let Err(e) = res {
+                    failure = Some(e);
+                    stop.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+        }
+    }
+
+    // 出错的路径先停掉其他 worker（drop 即取消），再落一次分段进度
+    stop.store(true, Ordering::Relaxed);
+    drop(inflight);
+    save_segments(part, meta, &segs).await;
+
+    if let Some(e) = failure {
+        return Err(e);
+    }
+    if cancelled(cancel) {
+        return Err(DownloadError::Cancelled);
+    }
+
+    let missing: u64 = segs.iter().map(|s| s.remaining()).sum();
+    if missing != 0 {
+        return Err(DownloadError::Failed(format!(
+            "分段下载未完成：还剩 {missing} 字节。已保留断点，可重试续传。"
+        )));
+    }
+
+    on_progress(Progress {
+        downloaded: total,
+        total,
+    });
+    Ok(())
+}
+
+/// 单个 worker：从队列领片，逐片下载，直到队列空了退出。
+#[allow(clippy::too_many_arguments)]
+async fn run_worker(
+    url: &str,
+    part: &Path,
+    etag: Option<&str>,
+    segs: Arc<Vec<SegState>>,
+    queue: Arc<Mutex<VecDeque<usize>>>,
+    total_done: Arc<AtomicU64>,
+    cancel: Option<&AtomicBool>,
+    stop: Arc<AtomicBool>,
+    throttled: Arc<AtomicBool>,
+) -> Result<(), DownloadError> {
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(part)
+        .await
+        .map_err(|e| DownloadError::Failed(format!("打开下载文件失败: {e}")))?;
+
+    loop {
+        if stop.load(Ordering::Relaxed) || cancelled(cancel) {
+            return Err(DownloadError::Cancelled);
+        }
+        let Some(index) = queue.lock().ok().and_then(|mut q| q.pop_front()) else {
+            return Ok(());
+        };
+        let seg = &segs[index];
+
+        let mut attempt = 0u32;
+        loop {
+            if stop.load(Ordering::Relaxed) || cancelled(cancel) {
+                return Err(DownloadError::Cancelled);
+            }
+            if seg.remaining() == 0 {
+                break;
+            }
+
+            match fetch_segment(
+                url,
+                etag,
+                &mut file,
+                seg,
+                &total_done,
+                cancel,
+                &stop,
+                &throttled,
+            )
+            .await
+            {
+                Ok(()) => break,
+                Err(SegmentError::Cancelled) => return Err(DownloadError::Cancelled),
+                Err(SegmentError::Throttled(wait)) => {
+                    tokio::time::sleep(wait).await;
+                }
+                Err(SegmentError::Fatal(msg)) => {
+                    if attempt >= SEGMENT_RETRIES {
+                        return Err(DownloadError::Failed(msg));
+                    }
+                    attempt += 1;
+                    tokio::time::sleep(Duration::from_secs(attempt as u64)).await;
+                }
+            }
+        }
+    }
+}
+
+enum SegmentError {
+    Cancelled,
+    /// 服务端限流：等一会儿重试，并暂停扩容。
+    Throttled(Duration),
+    /// 可以换下一次重试的错误。
+    Fatal(String),
+}
+
+/// 下载一个分片内尚未完成的部分。
+#[allow(clippy::too_many_arguments)]
+async fn fetch_segment(
+    url: &str,
+    etag: Option<&str>,
+    file: &mut tokio::fs::File,
+    seg: &SegState,
+    total_done: &AtomicU64,
+    cancel: Option<&AtomicBool>,
+    stop: &AtomicBool,
+    throttled: &AtomicBool,
+) -> Result<(), SegmentError> {
+    let done = seg.done.load(Ordering::Relaxed);
+    let start = seg.begin + done;
+    let end = seg.end;
+    if start > end {
+        return Ok(());
+    }
+    let remaining = end - start + 1;
+
+    let mut req = http_client()
+        .get(url)
+        .header(reqwest::header::RANGE, format!("bytes={start}-{end}"));
+    if let Some(tag) = etag {
+        req = req.header(reqwest::header::IF_RANGE, tag);
+    }
+
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| SegmentError::Fatal(format!("分段请求失败: {e}")))?;
+
+    let status = resp.status();
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        throttled.store(true, Ordering::Relaxed);
+        let wait = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(3));
+        return Err(SegmentError::Throttled(wait));
+    }
+    if status != reqwest::StatusCode::PARTIAL_CONTENT {
+        return Err(SegmentError::Fatal(format!(
+            "下载失败，HTTP {status}。可尝试更换下载源或检查网络。"
+        )));
+    }
+
+    if content_range_start(&resp) != Some(start) {
+        return Err(SegmentError::Fatal(
+            "服务器返回的分段起点与请求不一致，已停止以免拼出坏文件。".into(),
+        ));
+    }
+
+    file.seek(std::io::SeekFrom::Start(start))
+        .await
+        .map_err(|e| SegmentError::Fatal(format!("定位写入位置失败: {e}")))?;
+
+    let mut stream = resp.bytes_stream();
+    let mut left = remaining;
+    while let Some(chunk) = stream.next().await {
+        if stop.load(Ordering::Relaxed) || cancelled(cancel) {
+            return Err(SegmentError::Cancelled);
+        }
+        let chunk = chunk.map_err(|e| SegmentError::Fatal(format!("下载中断: {e}")))?;
+        let take = (chunk.len() as u64).min(left) as usize;
+        if take == 0 {
+            break;
+        }
+        file.write_all(&chunk[..take])
+            .await
+            .map_err(|e| SegmentError::Fatal(format!("写入文件失败: {e}")))?;
+        seg.done.fetch_add(take as u64, Ordering::Relaxed);
+        total_done.fetch_add(take as u64, Ordering::Relaxed);
+        left -= take as u64;
+        if left == 0 {
+            break;
+        }
+    }
+
+    file.flush()
+        .await
+        .map_err(|e| SegmentError::Fatal(format!("写入文件失败: {e}")))?;
+
+    if left > 0 {
+        return Err(SegmentError::Fatal(format!(
+            "下载中断：本段还差 {left} 字节"
+        )));
+    }
+    Ok(())
+}
+
+/// 把当前各片进度写成 meta 快照。
+async fn save_segments(part: &Path, meta: &ResumeMeta, segs: &[SegState]) {
+    let snapshot = ResumeMeta {
+        version: META_VERSION,
+        identity: meta.identity.clone(),
+        total: meta.total,
+        etag: meta.etag.clone(),
+        segments: segs
+            .iter()
+            .map(|s| SegmentMeta {
+                begin: s.begin,
+                end: s.end,
+                done: s.done.load(Ordering::Relaxed).min(s.len()),
+            })
+            .collect(),
+    };
+    write_meta_obj(part, &snapshot).await;
 }
 
 /// 把响应流写进文件，边写边回调进度。
@@ -767,6 +1573,7 @@ mod tests {
             identity: "abc123".into(),
             total: 4096,
             etag: Some("\"xyz\"".into()),
+            ..Default::default()
         };
         let raw = serde_json::to_string(&meta).unwrap();
         let back: ResumeMeta = serde_json::from_str(&raw).unwrap();
@@ -780,6 +1587,7 @@ mod tests {
             identity: "u".into(),
             total: 0,
             etag: None,
+            ..Default::default()
         };
         let raw = serde_json::to_string(&meta).unwrap();
         // etag 为 None 时不应出现在 JSON 里
@@ -1012,6 +1820,106 @@ mod tests {
         dir
     }
 
+    type RangeLog = Arc<Mutex<Vec<(u64, u64)>>>;
+
+    /// 起一个**支持 Range** 的本地服务，记录收到的每个 `(start, end)`。
+    ///
+    /// 内容按偏移确定性生成：第 i 字节 = `(i % 251)`。这样续传/分段拼接
+    /// 后可以逐字节校验，而不必在测试里存一整份期望数据。
+    fn spawn_range_server(total: u64, delay_ms: u64) -> (String, RangeLog) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let log: RangeLog = Arc::new(Mutex::new(Vec::new()));
+        let log_for_server = log.clone();
+
+        std::thread::spawn(move || {
+            for sock in listener.incoming() {
+                let Ok(mut sock) = sock else { continue };
+                let log = log_for_server.clone();
+                std::thread::spawn(move || {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 1024];
+                    loop {
+                        let Ok(n) = sock.read(&mut tmp) else { return };
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&buf).to_string();
+                    let range = head.lines().find_map(|l| {
+                        let lower = l.to_ascii_lowercase();
+                        lower
+                            .strip_prefix("range: bytes=")
+                            .map(|s| s.trim().to_string())
+                    });
+
+                    let (start, end) = match range.as_deref() {
+                        Some(spec) => {
+                            let (a, b) = spec.split_once('-').unwrap_or(("", ""));
+                            let start = a.parse::<u64>().unwrap_or(0);
+                            let end = b
+                                .parse::<u64>()
+                                .map(|v| v.min(total - 1))
+                                .unwrap_or(total - 1);
+                            (start, end)
+                        }
+                        None => (0, total - 1),
+                    };
+                    if let Ok(mut l) = log.lock() {
+                        l.push((start, end));
+                    }
+
+                    let len = end.saturating_sub(start) + 1;
+                    let header = if range.is_some() {
+                        format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Length: {len}\r\n\
+                             Content-Range: bytes {start}-{end}/{total}\r\n\
+                             Accept-Ranges: bytes\r\nETag: \"v1\"\r\n\
+                             Content-Type: application/octet-stream\r\n\r\n"
+                        )
+                    } else {
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {len}\r\n\
+                             Accept-Ranges: bytes\r\nETag: \"v1\"\r\n\
+                             Content-Type: application/octet-stream\r\n\r\n"
+                        )
+                    };
+                    if sock.write_all(header.as_bytes()).is_err() {
+                        return;
+                    }
+
+                    let mut pos = start;
+                    while pos <= end {
+                        let n = ((end - pos + 1) as usize).min(64 * 1024);
+                        let body: Vec<u8> =
+                            (0..n).map(|i| ((pos + i as u64) % 251) as u8).collect();
+                        if sock.write_all(&body).is_err() {
+                            return;
+                        }
+                        if delay_ms > 0 {
+                            std::thread::sleep(Duration::from_millis(delay_ms));
+                        }
+                        pos += n as u64;
+                    }
+                });
+            }
+        });
+
+        (format!("http://{addr}/file.bin"), log)
+    }
+
+    fn pattern_matches(data: &[u8]) -> bool {
+        data.iter()
+            .enumerate()
+            .all(|(i, b)| *b == (i as u64 % 251) as u8)
+    }
+
     /// **核心测试**：取消必须真的中断传输，且保留 `.part` 供续传。
     ///
     /// 这条测试对着的是一个真实存在过的缺陷：`presets.rs` 里有个
@@ -1204,6 +2112,7 @@ mod tests {
                 identity: "sha-abc".into(),
                 total: 9999,
                 etag: None,
+                ..Default::default()
             })
             .unwrap(),
         )
@@ -1269,6 +2178,239 @@ mod tests {
         let dir = temp_dir("xieyi-partial-remove-missing-test");
         let dest = dir.join("never-downloaded.gguf");
         assert_eq!(remove_partial(&dest), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─────────────────────── 分段并发 ───────────────────────
+
+    /// 分片表必须严格覆盖 `[0, total)`，不留缝也不重叠。
+    #[test]
+    fn plan_segments_covers_total() {
+        for total in [SEGMENT_MIN_TOTAL, 32 * 1024 * 1024, 1_800_000_000u64] {
+            let segs = plan_segments(total);
+            assert_eq!(segs.first().unwrap().begin, 0);
+            assert_eq!(segs.last().unwrap().end, total - 1);
+            for pair in segs.windows(2) {
+                assert_eq!(pair[1].begin, pair[0].end + 1, "分片之间不能有缝");
+            }
+            let sum: u64 = segs.iter().map(|s| s.len()).sum();
+            assert_eq!(sum, total, "分片总长必须等于文件大小");
+        }
+    }
+
+    /// 分段表有缝/重叠/越界时必须判为不可续传。
+    #[test]
+    fn segments_cover_total_rejects_bad_tables() {
+        let ok = ResumeMeta {
+            version: META_VERSION,
+            identity: "x".into(),
+            total: 100,
+            etag: None,
+            segments: vec![
+                SegmentMeta {
+                    begin: 0,
+                    end: 49,
+                    done: 10,
+                },
+                SegmentMeta {
+                    begin: 50,
+                    end: 99,
+                    done: 0,
+                },
+            ],
+        };
+        assert!(segments_cover_total(&ok));
+
+        // 中间缺一字节
+        let mut gap = ok.clone();
+        gap.segments[1].begin = 51;
+        assert!(!segments_cover_total(&gap));
+
+        // done 超过段长（首片长 50，写 51 就越界）
+        let mut over = ok.clone();
+        over.segments[0].done = 51;
+        assert!(!segments_cover_total(&over));
+
+        // 总长对不上
+        let mut short = ok;
+        short.total = 101;
+        assert!(!segments_cover_total(&short));
+    }
+
+    /// 支持 Range 的服务端必须真的走分段并发，且拼出的文件内容正确。
+    #[tokio::test]
+    async fn segmented_download_splits_into_multiple_ranges() {
+        let total = SEGMENT_MIN_TOTAL; // 8 MiB → 1 MiB × 8 片
+        let (url, log) = spawn_range_server(total, 0);
+        let dir = temp_dir("xieyi-seg-basic");
+        let dest = dir.join("m.bin");
+
+        let done = download(&url, &dest, None, None, |_| {}).await.unwrap();
+        assert_eq!(done.bytes, total);
+
+        let data = std::fs::read(&dest).unwrap();
+        assert_eq!(data.len() as u64, total);
+        assert!(pattern_matches(&data), "分段写入的偏移必须正确");
+        assert!(!part_path(&dest).exists(), "完成后 .part 应已改名");
+        assert!(
+            !meta_path(&part_path(&dest)).exists(),
+            "完成后不应留下 .part.meta"
+        );
+
+        let reqs = log.lock().unwrap().clone();
+        let data_reqs = reqs
+            .iter()
+            .filter(|(a, b)| !(*a == 0 && *b == 0)) // 去掉 0-0 探测
+            .count();
+        assert!(
+            data_reqs >= 2,
+            "支持 Range 的服务端应当收到多个分段请求，实际：{reqs:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 取消后必须保住**分段进度**，续传只补没下完的部分。
+    #[tokio::test]
+    async fn segmented_download_resumes_from_saved_progress() {
+        let total = 16 * 1024 * 1024; // 16 MiB → 2 MiB × 8 片
+        let (url, log) = spawn_range_server(total, 20);
+        let dir = temp_dir("xieyi-seg-resume");
+        let dest = dir.join("m.bin");
+        let part = part_path(&dest);
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_for_task = cancel.clone();
+        let wait_part = part.clone();
+        let watcher = tokio::spawn(async move {
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            while std::time::Instant::now() < deadline {
+                if part_downloaded_bytes(&wait_part) >= 1024 * 1024 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            cancel_for_task.store(true, Ordering::Relaxed);
+        });
+
+        let first = download(&url, &dest, None, Some(&cancel), |_| {}).await;
+        watcher.await.unwrap();
+        assert!(
+            matches!(first, Err(DownloadError::Cancelled)),
+            "应当以取消结束，实际：{first:?}"
+        );
+
+        let meta = read_meta(&part).await.expect("取消后必须留下分段 meta");
+        assert!(meta.version >= META_VERSION);
+        let done: u64 = meta.segments.iter().map(|s| s.done).sum();
+        assert!(done > 0, "取消前至少要有一片写入进度，实际 {done}");
+        assert!(done < total, "取消应当发生在完成之前，实际 {done}/{total}");
+        assert_eq!(
+            std::fs::metadata(&part).unwrap().len(),
+            total,
+            "预分配后 .part 长度应当等于总大小"
+        );
+        assert_eq!(
+            partial_state(&dest).map(|s| s.downloaded),
+            Some(done),
+            "界面的「已暂停」进度必须按分段表算，不能看文件长度"
+        );
+
+        // 续传：清掉取消标志再来一次
+        cancel.store(false, Ordering::Relaxed);
+        let reqs_before = log.lock().unwrap().len();
+        let second = download(&url, &dest, None, Some(&cancel), |_| {})
+            .await
+            .unwrap();
+        assert_eq!(second.bytes, total, "续传后总字节数应当是完整的");
+        assert!(pattern_matches(&std::fs::read(&dest).unwrap()));
+
+        // 续传应当只请求缺失的部分：总请求字节数明显小于 2 倍文件大小
+        let reqs = log.lock().unwrap().clone();
+        let resumed_bytes: u64 = reqs[reqs_before..]
+            .iter()
+            .map(|(a, b)| b.saturating_sub(*a) + 1)
+            .sum();
+        assert!(
+            resumed_bytes < total,
+            "续传不该把整份文件重下：本次请求了 {resumed_bytes} 字节"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 服务端忽略 Range（回 200）时，必须回退到单流，且内容正确。
+    ///
+    /// 走的是「复用探测响应」这条路：探测拿到的 200 直接交给单流写盘，
+    /// 不会因为多发一次请求而失败。
+    #[tokio::test]
+    async fn falls_back_to_single_stream_when_range_ignored() {
+        let dir = temp_dir("xieyi-seg-fallback");
+        let dest = dir.join("m.bin");
+        // 复用只 accept 一次的慢速服务：它不会响应 Range，但能正常吐完
+        let url = spawn_slow_server(8, 1024);
+
+        let done = download(&url, &dest, None, None, |_| {}).await.unwrap();
+        assert_eq!(done.bytes as usize, 8 * 1024);
+        assert_eq!(std::fs::read(&dest).unwrap().len(), 8 * 1024);
+        assert!(!part_path(&dest).exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 哈希不对时整份自动重下一次，仍不对才报错。
+    #[tokio::test]
+    async fn checksum_mismatch_retries_once_then_fails() {
+        let total = SEGMENT_MIN_TOTAL;
+        let (url, log) = spawn_range_server(total, 0);
+        let dir = temp_dir("xieyi-checksum-retry");
+        let dest = dir.join("m.bin");
+
+        // 内容与这个"期望哈希"必然对不上
+        let err = download(&url, &dest, Some("deadbeef"), None, |_| {})
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, DownloadError::Failed(m) if m.contains("已自动重试一次")),
+            "应当自动重试一次后报错，实际：{err}"
+        );
+
+        let probes = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(a, b)| *a == 0 && *b == 0)
+            .count();
+        assert!(probes >= 2, "应当重新下载一遍，探测请求只有 {probes} 次");
+        assert!(!part_path(&dest).exists(), "失败后不应留下坏文件");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 真实网络：分段下载官方引擎包，验证 Range / 并发 / 哈希在真实 CDN 上可用。
+    ///
+    /// 默认跳过。手动跑：
+    /// `cargo test --lib live_segmented_download -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn live_segmented_download() {
+        let url = "https://gh-proxy.com/https://github.com/ggml-org/llama.cpp/\
+                   releases/download/b11714/llama-b11714-bin-win-vulkan-x64.zip";
+        let dir = temp_dir("xieyi-live-seg");
+        let dest = dir.join("engine.zip");
+        let expected = "d4765447307f29fc0b4c8ae5b8b806c46b3e515d0ce5c2a54dd90d9b2c7a392f";
+
+        let started = std::time::Instant::now();
+        let done = download(url, &dest, Some(expected), None, |_| {})
+            .await
+            .expect("真实网络下载应当成功");
+        println!(
+            "live segmented: {} bytes in {:?}",
+            done.bytes,
+            started.elapsed()
+        );
+        assert_eq!(done.sha256, expected);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
