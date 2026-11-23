@@ -1032,9 +1032,25 @@ mod tests {
         let cancel_for_task = cancel.clone();
         let dest_clone = dest.clone();
 
-        // 60ms 后取消——这时期望只下了一两百万字节，远没到 2.5 MB
+        // 等第一块真正落盘再取消。
+        //
+        // 不能固定睡 60ms：CI 机器上连接 / TLS 可能还没完成，`.part`
+        // 尚未创建；此时取消发生在"传输开始前"，于是下面的
+        // 「取消后 .part 必须保留」变成假失败。
+        // （2026-11-22 main 的 Windows CI 实际踩到：291 passed / 1 failed）
+        let wait_part = part_path(&dest);
         let canceller = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+            let deadline =
+                tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+            while tokio::time::Instant::now() < deadline {
+                let wrote = std::fs::metadata(&wait_part)
+                    .map(|m| m.len() > 0)
+                    .unwrap_or(false);
+                if wrote {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
             cancel_for_task.store(true, std::sync::atomic::Ordering::Relaxed);
         });
 
@@ -1059,6 +1075,7 @@ mod tests {
 
         // 确实停在半路（不是"慢慢等它下完再报取消"）
         let got = std::fs::metadata(&part).unwrap().len();
+        assert!(got > 0, "取消前应至少写入一块数据，实际 0 字节");
         assert!(
             got < 2_500_000,
             "取消应发生在传输中途，实际已写入 {got} 字节"
