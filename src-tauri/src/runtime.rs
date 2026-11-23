@@ -746,13 +746,18 @@ pub async fn install_runtime(
 
     // 自检
     emit(&app, "checking", 0, 0);
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(20),
-        tokio::process::Command::new(&exe).arg("--version").output(),
-    )
-    .await
-    .map_err(|_| "运行时自检超时（可能是缺少 VC++ 运行库）")?
-    .map_err(|e| format!("运行时无法启动: {e}（可能是缺少 VC++ 运行库）"))?;
+    let mut probe = tokio::process::Command::new(&exe);
+    probe.arg("--version");
+    // GUI 进程 spawn 控制台程序时，Windows 默认会新建一个控制台窗口。
+    // 自检紧跟在解压之后，用户看到的就是「解压完弹个黑框」。
+    #[cfg(windows)]
+    {
+        probe.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let output = tokio::time::timeout(std::time::Duration::from_secs(20), probe.output())
+        .await
+        .map_err(|_| "运行时自检超时（可能是缺少 VC++ 运行库）")?
+        .map_err(|e| format!("运行时无法启动: {e}（可能是缺少 VC++ 运行库）"))?;
 
     if !output.status.success() {
         return Err(format!(
