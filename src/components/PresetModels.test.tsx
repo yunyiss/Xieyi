@@ -547,4 +547,27 @@ describe("PresetModels · featured 模式", () => {
     expect(screen.getByText(/标准：8G 显卡的均衡选择/)).toBeInTheDocument();
     expect(screen.getByText(/高质量：12G 以上显卡/)).toBeInTheDocument();
   });
+
+  /**
+   * 列表读取失败时不能静默渲染成空白。
+   *
+   * 早先 catch 里只把 list 置空，`featured` 模式下就只剩外层标题
+   * （「推荐模型」），下面什么都没有——用户会以为本来就没有推荐内容。
+   * 现在给出失败说明与「重试」。
+   */
+  it("列表读取失败时显示重试入口，而不是空白", async () => {
+    const user = userEvent.setup();
+    vi.mocked(ipc.listPresets)
+      .mockRejectedValueOnce("数据库损坏")
+      .mockResolvedValue([preset()]);
+
+    render(<PresetModels mode="featured" />);
+
+    expect(await screen.findByText(/推荐模型列表读取失败/)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "重试" }));
+
+    // 重试成功后恢复正常卡片
+    expect(await screen.findByText("Hy-MT2 轻量")).toBeInTheDocument();
+    expect(screen.queryByText(/推荐模型列表读取失败/)).toBeNull();
+  });
 });

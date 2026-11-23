@@ -536,6 +536,14 @@ export function PresetModels({
     !/Intel/i.test(navigator.userAgent);
 
   const [loaded, setLoaded] = useState(false);
+  /**
+   * 列表读取失败的原因。
+   *
+   * 不能静默吞掉：失败时 `list` 为空，`featured` 模式会渲染成
+   * 一整块空白——用户只看到「推荐模型」标题下面什么都没有，会以为
+   * 这里本来就没有内容。
+   */
+  const [loadError, setLoadError] = useState<string | null>(null);
   /** 同一时刻只允许一个预设下载：后端有闸门，前端先禁用免得用户白点 */
   const [busyId, setBusyId] = useState<string | null>(null);
   /** `featured` 模式下是否展开了"其他档位" */
@@ -548,9 +556,15 @@ export function PresetModels({
   const refresh = useCallback(async () => {
     try {
       const next = await listPresets();
-      if (aliveRef.current) setList(next);
-    } catch {
-      if (aliveRef.current) setList([]);
+      if (aliveRef.current) {
+        setList(next);
+        setLoadError(null);
+      }
+    } catch (e) {
+      if (aliveRef.current) {
+        setList([]);
+        setLoadError(String(e));
+      }
     } finally {
       if (aliveRef.current) setLoaded(true);
     }
@@ -612,6 +626,30 @@ export function PresetModels({
       <p className="m-0 text-[11px]" style={{ color: "var(--text-muted)" }}>
         正在读取…
       </p>
+    );
+  }
+
+  if (loadError) {
+    return (
+      <div className="flex flex-wrap items-center gap-2 text-[11px]">
+        <span style={{ color: "var(--danger)" }} title={loadError}>
+          推荐模型列表读取失败
+        </span>
+        <button
+          className="btn rounded border px-1.5 py-0.5 text-[11px]"
+          style={{
+            background: "transparent",
+            borderColor: "var(--border)",
+            color: "var(--text-muted)",
+          }}
+          onClick={() => {
+            setLoaded(false);
+            void refresh();
+          }}
+        >
+          重试
+        </button>
+      </div>
     );
   }
 
