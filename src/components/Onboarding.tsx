@@ -232,6 +232,15 @@ export function Onboarding({ onDone, onChanged }: Props) {
     };
   }, []);
 
+  /**
+   * 本次引擎下载是否已经收尾。
+   *
+   * 收尾有两条来路：`installRuntime` 的 Promise（正常）和「done」进度事件
+   * （后端写完配置后发出）。两者谁先到不确定，只让先到的那条收尾；
+   * 否则晚到的事件会把进度条重新设回「完成」，卡片永远停在那一步。
+   */
+  const downloadSettled = useRef(false);
+
   const refresh = useCallback(async () => {
     try {
       // 用户是否真的选过目录，只有 AppInfo 知道：
@@ -276,7 +285,38 @@ export function Onboarding({ onDone, onChanged }: Props) {
     void refresh();
   }, [refresh]);
 
-  useTauriEvent(onRuntimeProgress, setProgress);
+  /**
+   * 引擎下载的统一收尾。
+   *
+   * 必须同时由 **Promise 与「done」事件** 驱动：两者谁先到不确定，
+   * 只等 Promise 的话，一旦回包迟到或丢失，界面就会永远停在
+   * 「完成」，② 模型卡也不会解锁（用户实测偶发过，三次一次）。
+   *
+   * `refresh()` 读的是磁盘上的配置，不依赖任何回包，所以只要收尾
+   * 走到一次，界面状态一定能对上。
+   */
+  const finishDownload = useCallback(
+    async (rt?: RuntimeStatus) => {
+      if (downloadSettled.current) return;
+      downloadSettled.current = true;
+      if (rt) setRuntime(rt);
+      setProgress(null);
+      setBusy("");
+      await refresh();
+      onChanged();
+    },
+    [refresh, onChanged],
+  );
+
+  useTauriEvent(onRuntimeProgress, (p) => {
+    // 终态只负责收尾，不渲染进度：晚到的终态事件若照常 setProgress，
+    // 进度条会重新出现并一直停在「完成」。
+    if (p.stage === "done" || p.stage === "cancelled") {
+      void finishDownload();
+      return;
+    }
+    setProgress(p);
+  });
 
   /** 扫一遍磁盘，列出可以直接用的引擎。 */
   const scan = useCallback(async () => {
@@ -323,14 +363,13 @@ export function Onboarding({ onDone, onChanged }: Props) {
   };
 
   const download = async () => {
+    downloadSettled.current = false;
     setBusy("download");
     try {
+      // 回包只用来"顺带"更新状态；真正的收尾统一走 finally 的
+      // finishDownload —— 回包迟到/丢失时也不会把界面卡在「完成」。
       setRuntime(await installRuntime("vulkan"));
-      setProgress(null);
-      await refresh();
-      onChanged();
     } catch (e) {
-      setProgress(null);
       // **取消不是错误。**
       //
       // 后端专门为取消加了独立的 `cancelled` 阶段，就是为了不让它走
@@ -342,19 +381,13 @@ export function Onboarding({ onDone, onChanged }: Props) {
       // 这不是"用字符串当控制流"的理想解，但 `installRuntime` 返回的是
       // `String` 而非枚举，前端拿不到类型信息；真要根治得改命令签名，
       // 那是更大的改动，记在这里而不是现在做。
+      //
+      // 失败/取消后也必须收尾刷新一次：否则 `runtime.partialBytes`
+      // 停在进入下载前的旧值，用户看不到残留，也拿不到清理入口。
       const msg = String(e);
       showNotice(msg.includes("已取消") ? "info" : "error", msg);
-      // **失败/取消后必须重新拉一次状态。**
-      //
-      // 否则 `runtime.partialBytes` 停在进入下载前的旧值（通常是 0），
-      // 于是「上次下载留下 xx MB」那行永远不显示——用户取消后看不到
-      // 残留，也拿不到清理入口，正是这条提示要解决的场景。
-      //
-      // 这个遗漏是在用户实测后发现的：取消了 10 多 MB，界面上什么都没
-      // 出现，再点下载又直接续上了。数据其实都在，只是状态没刷新。
-      await refresh();
     } finally {
-      setBusy("");
+      await finishDownload();
     }
   };
 

@@ -491,6 +491,97 @@ describe("Onboarding", () => {
   });
 
   /**
+   * 引擎下载完必须解锁 ② 模型卡，不能停在「完成」。
+   *
+   * 用户实测偶发（三次一次）：引导里下载好引擎后显示「完成」，但模型卡
+   * 没解锁，只能先进主界面再从设置里下模型。根因是收尾只等
+   * `installRuntime` 的 Promise——回包迟到或丢失时，界面就永远停在
+   * 「完成」这一步。
+   *
+   * 现在「done」进度事件也会触发收尾（两条路只认先到的第一条）。
+   * 这条测试模拟最坏情况：回包永不返回，只靠事件收尾。
+   */
+  it("done 事件先到、回包不回也能解锁模型卡", async () => {
+    const user = userEvent.setup();
+    const installed = {
+      installed: true,
+      version: "b11714",
+      backend: "vulkan",
+      serverPath: "D:/runtime/llama-server.exe",
+      modelsDir: "D:/models",
+      partialBytes: 0,
+    };
+
+    let push: ((p: unknown) => void) | null = null;
+    vi.mocked(ipc.onRuntimeProgress).mockImplementation(async (cb) => {
+      push = cb as (p: unknown) => void;
+      return () => {};
+    });
+    vi.mocked(ipc.installRuntime).mockImplementation(() => new Promise(() => {}));
+
+    renderOnboarding();
+    await user.click(await screen.findByText(/下载推理引擎/));
+    await waitFor(() => expect(push).not.toBeNull());
+
+    // done 发出时后端已经把配置写好了
+    vi.mocked(ipc.getRuntimeStatus).mockResolvedValue(installed);
+    push!({ stage: "done", downloaded: 0, total: 0, percent: 100 });
+
+    // 进度区消失，不再停在「完成」
+    await waitFor(() => expect(screen.queryByText("完成")).toBeNull());
+    // ② 模型卡解锁（出现「当前目录」这一行）
+    expect(await screen.findByText("当前目录")).toBeInTheDocument();
+    // 装好后下载按钮隐藏
+    await waitFor(() => expect(screen.queryByText(/下载推理引擎/)).toBeNull());
+  });
+
+  /**
+   * 迟到的 done 事件不能把进度条重新设回「完成」。
+   *
+   * 正常路径是 Promise 先回、事件后到。早先事件处理直接 `setProgress`，
+   * 于是收尾之后的 done 又把进度区画了出来，用户看到「完成」一直挂着。
+   */
+  it("迟到的 done 事件不会让引擎卡在「完成」", async () => {
+    const user = userEvent.setup();
+    const installed = {
+      installed: true,
+      version: "b11714",
+      backend: "vulkan",
+      serverPath: "D:/runtime/llama-server.exe",
+      modelsDir: "D:/models",
+      partialBytes: 0,
+    };
+
+    let push: ((p: unknown) => void) | null = null;
+    vi.mocked(ipc.onRuntimeProgress).mockImplementation(async (cb) => {
+      push = cb as (p: unknown) => void;
+      return () => {};
+    });
+    vi.mocked(ipc.installRuntime).mockResolvedValue(installed);
+    vi.mocked(ipc.getRuntimeStatus)
+      .mockResolvedValueOnce({
+        installed: false,
+        version: null,
+        backend: null,
+        serverPath: null,
+        modelsDir: "D:/models",
+        partialBytes: 0,
+      })
+      .mockResolvedValue(installed);
+
+    renderOnboarding();
+    await user.click(await screen.findByText(/下载推理引擎/));
+
+    // Promise 先收尾：模型卡已解锁
+    expect(await screen.findByText("当前目录")).toBeInTheDocument();
+
+    // 事件后到：不能再画进度区
+    await waitFor(() => expect(push).not.toBeNull());
+    push!({ stage: "done", downloaded: 0, total: 0, percent: 100 });
+    expect(screen.queryByText("完成")).toBeNull();
+  });
+
+  /**
    * 引擎包有未完成下载残留时，界面上必须显示出来并能清理。
    *
    * 这条锁住一个和模型那边**完全对称**的缺陷：`.part` 是故意保留的

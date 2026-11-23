@@ -288,7 +288,15 @@ export function ModelDrawer({
   /** 退场动画期间仍然渲染，动画结束后再卸载 */
   const [closing, setClosing] = useState(false);
 
-  useTauriEvent(onRuntimeProgress, setDlProgress);
+  // 终态事件不渲染进度：`installRuntime` 的 Promise 已经负责清空，
+  // 晚到的 done 若照常写入，进度条会一直停在「完成」。
+  useTauriEvent(onRuntimeProgress, (p) => {
+    if (p.stage === "done" || p.stage === "cancelled") {
+      setDlProgress(null);
+      return;
+    }
+    setDlProgress(p);
+  });
 
   /**
    * 轻量轮询：只读配置与引擎状态。

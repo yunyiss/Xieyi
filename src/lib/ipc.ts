@@ -81,7 +81,19 @@ export interface RouterModel {
 }
 
 export interface RuntimeProgress {
-  stage: "downloading" | "verifying" | "extracting" | "checking" | "done";
+  /**
+   * 引擎下载的阶段。
+   *
+   * `cancelled` 与模型下载一致：取消不是失败，后端单独发这个阶段，
+   * 让前端不要把它渲染成红色错误。
+   */
+  stage:
+    | "downloading"
+    | "verifying"
+    | "extracting"
+    | "checking"
+    | "done"
+    | "cancelled";
   downloaded: number;
   total: number;
   percent: number;
