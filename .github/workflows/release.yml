@@ -188,6 +188,12 @@ jobs:
   publish:
     name: Publish release
     needs: [windows, linux]
+    # 只有推 tag 才创建 Release。
+    #
+    # workflow_dispatch 用来自测流水线（ref 是分支）；若照常执行，
+    # action-gh-release 会拿分支名当 tag，凭空建出一个名为 main 的
+    # Release。手动跑时只保留构建与产物上传，发布留给真正的 tag。
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
       contents: write
