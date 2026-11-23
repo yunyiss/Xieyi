@@ -1040,8 +1040,7 @@ mod tests {
         // （2026-11-22 main 的 Windows CI 实际踩到：291 passed / 1 failed）
         let wait_part = part_path(&dest);
         let canceller = tokio::spawn(async move {
-            let deadline =
-                tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
             while tokio::time::Instant::now() < deadline {
                 let wrote = std::fs::metadata(&wait_part)
                     .map(|m| m.len() > 0)
