@@ -601,6 +601,23 @@ describe("ModelDrawer · 设置读写", () => {
   });
 
   /**
+   * 同一个组件实例从「关闭」切到「打开」不能白屏。
+   *
+   * 抽屉关闭时会提前 `return null`。如果某个 Hook 写在这个 return 之后，
+   * 打开那次渲染的 Hook 数量就和关闭时不一致，React 会抛
+   * "Rendered more hooks than during the previous render" —— 用户看到
+   * 的就是「点设置白屏」。这条测试锁住「关闭→打开」的真实路径。
+   */
+  it("从关闭切到打开不会因 Hook 顺序白屏", async () => {
+    const { rerender } = render(
+      <ModelDrawer open={false} onClose={() => {}} onChanged={() => {}} />,
+    );
+    rerender(<ModelDrawer open onClose={() => {}} onChanged={() => {}} />);
+
+    expect(await screen.findByText(/通用/)).toBeInTheDocument();
+  });
+
+  /**
    * 设置抽屉里「推荐模型」**已有模型时默认收起**。
    *
    * 用户反馈：「设置里的推荐模型下载可以完全折叠收起来不，因为下载完

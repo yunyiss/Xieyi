@@ -38,6 +38,7 @@ import {
   type Settings,
 } from "../lib/ipc";
 import { useTauriEvent } from "../lib/useTauriEvent";
+import { formatEta, formatSpeed, useSpeed } from "../lib/useSpeed";
 import { DownloadSourceSettings } from "./DownloadSourceSettings";
 import { HardwareStatus } from "./HardwareStatus";
 import { PresetModels } from "./PresetModels";
@@ -219,6 +220,20 @@ export function ModelDrawer({
    * 只能手动去 GitHub 找文件。这里补上。
    */
   const [dlProgress, setDlProgress] = useState<RuntimeProgress | null>(null);
+  /*
+   * 引擎下载的速度/剩余时间（前端按进度事件估算）。
+   *
+   * **必须放在下面 `if (!open && !closing) return null` 之前**：
+   * 抽屉关闭时组件会提前 return，若 Hook 写在它后面，打开抽屉那次
+   * 渲染的 Hook 数量就和关闭时不一致，React 会直接抛错白屏。
+   */
+  const engineSpeed = useSpeed(
+    dlProgress?.stage === "downloading" ? dlProgress.downloaded : 0,
+    dlProgress?.stage === "downloading" ? dlProgress.total : 0,
+    dlProgress?.stage === "downloading",
+  );
+  const engineSpeedText = formatSpeed(engineSpeed.bytesPerSec);
+  const engineEtaText = formatEta(engineSpeed.etaSecs);
   const [states, setStates] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
@@ -1249,6 +1264,16 @@ export function ModelDrawer({
                       }}
                     />
                   </div>
+                  {(engineSpeedText || engineEtaText) && (
+                    <div
+                      className="mt-1 text-[10px] tabular-nums"
+                      style={{ color: "var(--text-muted)" }}
+                    >
+                      {engineSpeedText}
+                      {engineSpeedText && engineEtaText ? " · " : ""}
+                      {engineEtaText ? `剩余 ${engineEtaText}` : ""}
+                    </div>
+                  )}
                 </div>
               )}
 
