@@ -18,6 +18,7 @@ import {
   type RuntimeStatus,
 } from "../lib/ipc";
 import { useTauriEvent } from "../lib/useTauriEvent";
+import { formatEta, formatSpeed, useSpeed } from "../lib/useSpeed";
 import { computeReadiness } from "../lib/readiness";
 import { formatBytes, PresetModels } from "./PresetModels";
 
@@ -519,6 +520,15 @@ export function Onboarding({ onDone, onChanged }: Props) {
    */
   const engineDownloading = progress !== null;
 
+  // 速度/剩余时间在前端按相邻进度事件估算；不额外发请求、不改协议
+  const engineSpeed = useSpeed(
+    progress?.stage === "downloading" ? progress.downloaded : 0,
+    progress?.stage === "downloading" ? progress.total : 0,
+    progress?.stage === "downloading",
+  );
+  const engineSpeedText = formatSpeed(engineSpeed.bytesPerSec);
+  const engineEtaText = formatEta(engineSpeed.etaSecs);
+
   /**
    * 我们**自己下载的那份**引擎是否已经就位。
    *
@@ -654,6 +664,16 @@ export function Onboarding({ onDone, onChanged }: Props) {
                   }}
                 />
               </div>
+              {(engineSpeedText || engineEtaText) && (
+                <div
+                  className="mt-1 text-[11px] tabular-nums"
+                  style={{ color: "var(--text-muted)" }}
+                >
+                  {engineSpeedText}
+                  {engineSpeedText && engineEtaText ? " · " : ""}
+                  {engineEtaText ? `剩余 ${engineEtaText}` : ""}
+                </div>
+              )}
               {/*
                 取消按钮。**只在真正在下载时出现**。
 

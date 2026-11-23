@@ -36,6 +36,7 @@ import {
 } from "../lib/ipc";
 import { evaluateFit, type KvShape } from "../lib/modelFit";
 import { useTauriEvent } from "../lib/useTauriEvent";
+import { formatEta, formatSpeed, useSpeed } from "../lib/useSpeed";
 
 /** 卡片当前处于哪个视觉状态。 */
 /**
@@ -231,6 +232,15 @@ function PresetRow({
         ? 100
         : null;
 
+  // 进度回调约 250ms 一次，速度/剩余时间在前端算，不改协议
+  const speed = useSpeed(
+    phase.kind === "downloading" ? phase.downloaded : 0,
+    phase.kind === "downloading" ? phase.total : 0,
+    phase.kind === "downloading",
+  );
+  const speedText = formatSpeed(speed.bytesPerSec);
+  const etaText = formatEta(speed.etaSecs);
+
   return (
     <li
       className="rounded-[10px] border p-2.5"
@@ -338,9 +348,14 @@ function PresetRow({
             <span>
               {phase.kind === "verifying"
                 ? "正在校验文件完整性…"
-                : `${formatBytes(phase.downloaded)} / ${formatBytes(phase.total)}`}
+                : `${formatBytes(phase.downloaded)} / ${formatBytes(phase.total)}${
+                    speedText ? ` · ${speedText}` : ""
+                  }`}
             </span>
-            <span>{pct != null ? `${pct}%` : "未知"}</span>
+            <span>
+              {pct != null ? `${pct}%` : "未知"}
+              {etaText ? ` · 剩 ${etaText}` : ""}
+            </span>
           </div>
         </div>
       )}
