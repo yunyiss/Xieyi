@@ -2316,7 +2316,11 @@ mod tests {
             "界面的「已暂停」进度必须按分段表算，不能看文件长度"
         );
 
-        // 续传：清掉取消标志再来一次
+        // 续传：清掉取消标志再来一次。
+        //
+        // 先等一小会儿，让取消前已经发出的请求都写进服务端日志；
+        // 否则它们会被误算成「续传阶段的请求」。
+        tokio::time::sleep(Duration::from_millis(200)).await;
         cancel.store(false, Ordering::Relaxed);
         let reqs_before = log.lock().unwrap().len();
         let second = download(&url, &dest, None, Some(&cancel), |_| {})
@@ -2325,16 +2329,30 @@ mod tests {
         assert_eq!(second.bytes, total, "续传后总字节数应当是完整的");
         assert!(pattern_matches(&std::fs::read(&dest).unwrap()));
 
-        // 续传应当只请求缺失的部分：总请求字节数明显小于 2 倍文件大小
+        // 续传只补没下完的部分。
+        //
+        // 不能按「请求字节数之和 < 总大小」判断：连接中断重试时会重复
+        // 请求同一段，日志里的区间之和会超过文件大小（Windows CI 上
+        // 实际踩到：17,432,577 > 16 MiB）。真正要保证的是：
+        // **已有进度的分段，不会被从它已完成的字节之前重新请求**。
         let reqs = log.lock().unwrap().clone();
-        let resumed_bytes: u64 = reqs[reqs_before..]
-            .iter()
-            .map(|(a, b)| b.saturating_sub(*a) + 1)
-            .sum();
-        assert!(
-            resumed_bytes < total,
-            "续传不该把整份文件重下：本次请求了 {resumed_bytes} 字节"
-        );
+        for (start, end) in &reqs[reqs_before..] {
+            if *start == 0 && *end == 0 {
+                continue; // Range 探测请求
+            }
+            let seg = meta
+                .segments
+                .iter()
+                .find(|s| *start >= s.begin && *start <= s.end)
+                .expect("续传请求的起点应落在某个分段内");
+            assert!(
+                *start >= seg.begin + seg.done,
+                "续传重复请求了已完成的字节：段起点 {}，已完成 {}，实际请求起点 {}",
+                seg.begin,
+                seg.done,
+                start
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
