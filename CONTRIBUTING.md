@@ -12,6 +12,7 @@
 | Rust | stable | **必须 ≥ 1.85**（项目用 edition 2024） |
 | Windows | 10 / 11 | 需要 WebView2 Runtime（Win11 自带）+ MSVC 工具链 |
 | Linux | 任一现代发行版 | 需要 `libwebkit2gtk-4.1-dev` 等，见下方 |
+| macOS | 13+ | 仅源码构建；需要 Xcode Command Line Tools，未做签名/公证 |
 
 Linux 依赖：
 
@@ -137,7 +138,7 @@ src-tauri/src/
 ├── runtime.rs          推理运行时下载、校验、解压
 ├── models.rs           模型扫描、preset 生成、显存估算
 ├── paths.rs            各平台数据目录
-├── hardware.rs         显存查询（仅 NVIDIA）
+├── hardware.rs         显存 / 内存查询（注册表 / sysfs / 引擎）
 └── ...
 
 src/
@@ -152,13 +153,13 @@ src/
 
 | 能力 | Windows | Linux | macOS |
 | :--- | :--- | :--- | :--- |
-| 编译 | ✅ | ✅ | ✅ CI 验证 |
-| 界面 / 翻译 | ✅ 实测 | ✅ 实测 | ⚠️ 未实测 |
+| 编译 | ✅ | ✅ | ✅ CI 验证（仅 arm64） |
+| 界面 / 翻译 | ✅ 实测 | ✅ 实测 | ⚠️ Intel x86_64 已实测；Apple Silicon 未实测 |
 | 单实例 | 命名 Mutex | `flock` | `flock` |
 | 进程树回收 | Job Object | `PR_SET_PDEATHSIG` | ⚠️ 仅进程组 |
 | 窗口聚焦 | `EnumWindows` | X11 EWMH | `NSRunningApplication` |
 | 标题栏主题 | DWM | GTK | `NSAppearance` |
-| 推理后端 | Vulkan / CPU | Vulkan / CPU | Metal |
+| 推理后端 | Vulkan / CPU | Vulkan / CPU | Metal / CPU（Intel） |
 
 **Wayland**：协议层面禁止应用获取其他窗口引用，窗口聚焦静默跳过，
 行为等同于「第二个实例直接退出」。这是设计，不是缺陷。

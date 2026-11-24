@@ -154,7 +154,7 @@ Drop files in and they queue up.
 
 - `txt` / `md` / `srt`; **SRT timing and structure preserved exactly**
 - Detects `GB18030` automatically (common in older Chinese files)
-- Output written as `original.target-language.txt`, **never overwriting** existing files
+- Output written as `original.target-language.ext` (e.g. `foo.zh.srt`), **never overwriting** existing files
 - Failed segments retry individually; one failure doesn't abort the file
 - Summary of successes and elapsed time at the end
 
@@ -251,8 +251,8 @@ re-check it) — the override record is cleared and detection takes over again.
 
 ## Where Files Live
 
-Everything is under one data directory, sharing a root with the WebView2 cache.
-Nothing is written to `Roaming`.
+Everything is under one data directory; on Windows it shares a root with the
+WebView2 cache. Nothing is written to `Roaming`.
 
 | Platform | Data root |
 | :--- | :--- |
@@ -289,6 +289,11 @@ Inside:
 - **Portable build**: there is no install/uninstall step — data and models live
   in `data/` and `models/` beside the executable. Delete the folder to remove
   everything; nothing is left in system directories.
+- **Linux installer (deb / rpm)**: the package manager removes only program
+  files; data stays in `~/.local/share/com.xieyi.translate` until deleted
+  manually.
+- **macOS**: removing the `.app` removes only the program; data stays in
+  `~/Library/Application Support/com.xieyi.translate`.
 
 ---
 
@@ -314,9 +319,9 @@ Idle unload defaults to 300 seconds (5 min). Adjust the TTL in settings, or unlo
 
 **Q: I closed the app but VRAM wasn't released.**
 That shouldn't happen — Windows uses a Job Object and Linux uses
-`PR_SET_PDEATHSIG`, so the kernel terminates the whole process tree when the
-main process dies. If you hit this, send the logs (`<data root>/logs/`) —
-it's a bug worth fixing.
+`PR_SET_PDEATHSIG`; macOS has no PDEATHSIG and falls back to process groups
+plus a cleanup sweep on the next launch. If you hit this, send the logs
+(`<data root>/logs/`) — it's a bug worth fixing.
 
 **Q: Can I open two windows?**
 No, single instance. Clicking the icon again brings the existing window forward.

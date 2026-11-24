@@ -101,7 +101,8 @@ jobs:
             librsvg2-dev \
             patchelf \
             libxdo-dev \
-            libssl-dev
+            libssl-dev \
+            rpm
 
       - uses: actions/setup-node@v4
         with:
@@ -116,8 +117,8 @@ jobs:
 
       - run: npm ci
 
-      - name: Build deb + AppImage
-        run: npx tauri build --bundles deb,appimage
+      - name: Build deb + rpm + AppImage
+        run: npx tauri build --bundles deb,rpm,appimage
 
       - name: Assemble portable zip
         run: |
@@ -135,6 +136,12 @@ jobs:
         with:
           name: linux-deb
           path: src-tauri/target/release/bundle/deb/*.deb
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-rpm
+          path: src-tauri/target/release/bundle/rpm/*.rpm
           if-no-files-found: error
 
       - uses: actions/upload-artifact@v4
@@ -213,6 +220,7 @@ jobs:
           files: |
             artifacts/*.exe
             artifacts/*.deb
+            artifacts/*.rpm
             artifacts/*.zip
           body: |
             ## 下载哪个
@@ -222,6 +230,7 @@ jobs:
             | Windows | `Xieyi_*_x64-setup.exe` | 安装版，数据存 `%LOCALAPPDATA%` |
             | Windows | `Xieyi-*-portable-win64.zip` | 便携版，解压即用，数据在 `data\` |
             | Linux | `Xieyi_*_amd64.deb` | 安装版（3.5 MB，需系统已装 webkit2gtk） |
+            | Linux | `Xieyi-*.x86_64.rpm` | 安装版（Fedora / RHEL / openSUSE） |
             | Linux | `Xieyi-*-portable-linux-x64.zip` | 便携版（内含 AppImage，自带 webkit） |
 
             **macOS 暂不提供安装包**：Intel x86_64 已跑通完整流程（CPU 推理），
