@@ -84,7 +84,7 @@ jobs:
   # ── Linux ──────────────────────────────────────────────────────────
   #
   # 产出：
-  #   1. .deb 安装包（3.5 MB，依赖系统 webkit2gtk）
+  #   1. .deb 安装包（约 3.9 MB，依赖系统 webkit2gtk）
   #   2. 便携 zip（内含 AppImage + data/ + models/）
   #
   # AppImage 自带 webkit2gtk，约 107 MB —— 这是它的设计目标
@@ -226,21 +226,55 @@ jobs:
             artifacts/*.rpm
             artifacts/*.zip
           body: |
+            # Xieyi 写意 ${{ github.ref_name }}
+
+            > 把 `.gguf` 模型变成一个好用的翻译工具。
+            > 完全离线，按需装填，停手即还显存。
+
+            **首个公开版本。** 翻译 / 批量 / 对话三个页面，数据不出本机。
+
             ## 下载哪个
 
-            | 平台 | 文件 | 说明 |
+            | 你的系统 | 建议 | 文件 |
             |---|---|---|
-            | Windows | `Xieyi_*_x64-setup.exe` | 安装版，数据存 `%LOCALAPPDATA%` |
-            | Windows | `Xieyi-*-portable-win64.zip` | 便携版，解压即用，数据在 `data\` |
-            | Linux | `Xieyi_*_amd64.deb` | 安装版（3.5 MB，需系统已装 webkit2gtk） |
-            | Linux | `Xieyi-*.x86_64.rpm` | 安装版（Fedora / RHEL / openSUSE） |
-            | Linux | `Xieyi-*-portable-linux-x64.zip` | 便携版（内含 AppImage，自带 webkit） |
+            | Windows 10 / 11 | 安装版 | `Xieyi_*_x64-setup.exe` |
+            | Windows | 便携版 | `Xieyi-*-portable-win64.zip` |
+            | Debian / Ubuntu / Mint / Kali | 安装版 | `Xieyi_*_amd64.deb` |
+            | Fedora / RHEL / openSUSE | 安装版 | `Xieyi-*.x86_64.rpm` |
+            | 其他 Linux | 便携版 | `Xieyi-*-portable-linux-x64.zip` |
 
-            **macOS 暂不提供安装包**：Intel x86_64 已跑通完整流程（CPU 推理），
-            但 Apple Silicon 的 Metal 路径尚未实测，且未做签名与公证，
-            因此暂不发布。
+            拿不准就用便携版：Windows 解压即用，Linux 里是 AppImage。
 
-            ## 首次启动
+            <details>
+            <summary>第一次启动</summary>
 
-            需要自己准备 `.gguf` 模型文件，放到 `models` 目录。
-            推理引擎首次启动时按需下载（约 12–31 MB，视平台）。
+            1. 打开应用，按引导下载推理引擎（约 12–31 MB，自动校验 SHA-256）
+            2. 放一个 `.gguf` 模型到 `models/`，或指向已有模型目录
+            3. 开始翻译
+
+            数据位置：
+
+            - Windows：`%LOCALAPPDATA%\com.xieyi.translate`
+            - Linux：`~/.local/share/com.xieyi.translate`
+
+            卸载时可选删除应用数据；便携版删掉整个文件夹即可。
+
+            </details>
+
+            <details>
+            <summary>已知限制</summary>
+
+            - macOS 暂不提供预编译包：Intel x86_64 已跑通完整流程，Apple Silicon 的 Metal 路径尚未实测
+            - Wayland 下无法把已有窗口拉到前台（协议限制）
+            - 批量并发上限 2：4 路会打爆共享 KV 池
+
+            </details>
+
+            ## 校验
+
+            每个资产的 SHA-256 见下方 Assets 列表；下载后可用 `sha256sum` 或
+            `certutil -hashfile` 对照。
+
+            ---
+
+            <sub>MIT License · [README](https://github.com/yunyiss/Xieyi#readme) · [问题反馈](https://github.com/yunyiss/Xieyi/issues)</sub>
