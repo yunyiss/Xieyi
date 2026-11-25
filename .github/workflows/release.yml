@@ -62,6 +62,9 @@ jobs:
           New-Item -ItemType Directory -Path "$dir/models" -Force | Out-Null
           New-Item -ItemType File -Path "$dir/data/.keep" -Force | Out-Null
           New-Item -ItemType File -Path "$dir/models/.keep" -Force | Out-Null
+          # 便携包用 --no-bundle 的裸 exe 手工拼，绕过了 bundle.resources，
+          # 协议文件不会自动带进去，这里手动复制一份。
+          Copy-Item LICENSE,THIRD_PARTY_LICENSES.md "$dir/" -Force
           Compress-Archive -Path $dir -DestinationPath "Xieyi-$ver-portable-win64.zip"
           Write-Output "PORTABLE_ZIP=Xieyi-$ver-portable-win64.zip" >> $env:GITHUB_ENV
 
