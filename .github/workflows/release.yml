@@ -220,6 +220,7 @@ jobs:
         with:
           draft: true
           generate_release_notes: true
+          tag_name: ${{ github.ref_name }}
           files: |
             artifacts/*.exe
             artifacts/*.deb
@@ -228,52 +229,67 @@ jobs:
           body: |
             # Xieyi 写意 ${{ github.ref_name }}
 
-            > 把 `.gguf` 模型变成一个好用的翻译工具。
-            > 完全离线，按需装填，停手即还显存。
+            Xieyi 写意是一款本地 GGUF 翻译工具。所有翻译均在本机完成，文本不会上传到任何服务器；模型按需加载，空闲后自动释放显存。
 
-            **首个公开版本。** 翻译 / 批量 / 对话三个页面，数据不出本机。
+            ## 本次发布
 
-            ## 下载哪个
+            首个公开版本，包含翻译、批量与对话三个页面：
 
-            | 你的系统 | 建议 | 文件 |
-            |---|---|---|
+            - 翻译：14 种语言，支持术语表、长文分段、质检与自动重试
+            - 批量：支持 `txt` / `md` / `srt`，保留 SRT 时间轴，自动识别 GB18030
+            - 对话：消息版本分支、会话落盘、上下文压缩
+            - 引擎：按需下载，支持断点续传、分段并发与 SHA-256 校验
+            - 资源：空闲 5 分钟后自动释放显存，可选启动预加载
+
+            ## 版本选择
+
+            | 系统 | 建议 | 文件 |
+            |:---:|:---:|---|
             | Windows 10 / 11 | 安装版 | `Xieyi_*_x64-setup.exe` |
             | Windows | 便携版 | `Xieyi-*-portable-win64.zip` |
             | Debian / Ubuntu / Mint / Kali | 安装版 | `Xieyi_*_amd64.deb` |
             | Fedora / RHEL / openSUSE | 安装版 | `Xieyi-*.x86_64.rpm` |
             | 其他 Linux | 便携版 | `Xieyi-*-portable-linux-x64.zip` |
 
-            拿不准就用便携版：Windows 解压即用，Linux 里是 AppImage。
+            安装版由系统包管理器安装；便携版解压即可使用，数据保存在程序目录下的 `data/`。
 
             <details>
-            <summary>第一次启动</summary>
+            <summary>安装说明（首次启动 / 系统要求）</summary>
 
-            1. 打开应用，按引导下载推理引擎（约 12–31 MB，自动校验 SHA-256）
-            2. 放一个 `.gguf` 模型到 `models/`，或指向已有模型目录
-            3. 开始翻译
+            ### 首次启动
 
-            数据位置：
+            1. 启动应用，按引导下载推理引擎（约 12–31 MB，自动进行 SHA-256 校验）。
+            2. 将 `.gguf` 模型放入 `models/`，或在设置中指向已有模型目录。
+            3. 开始翻译。
+
+            数据目录：
 
             - Windows：`%LOCALAPPDATA%\com.xieyi.translate`
             - Linux：`~/.local/share/com.xieyi.translate`
 
-            卸载时可选删除应用数据；便携版删掉整个文件夹即可。
+            卸载时可选择删除应用数据；便携版删除整个目录即可。
+
+            ### 系统要求
+
+            - Windows 10 / 11，需 WebView2 Runtime（Windows 11 已内置）
+            - Linux x64，需系统已安装 webkit2gtk
+            - macOS Intel x86_64 可从源码构建，暂不提供预编译包
 
             </details>
 
             <details>
             <summary>已知限制</summary>
 
-            - macOS 暂不提供预编译包：Intel x86_64 已跑通完整流程，Apple Silicon 的 Metal 路径尚未实测
-            - Wayland 下无法把已有窗口拉到前台（协议限制）
-            - 批量并发上限 2：4 路会打爆共享 KV 池
+            - macOS Apple Silicon 的 Metal 路径尚未实测，暂不发布预编译包
+            - Wayland 会话下无法将已有窗口置前，这是协议限制
+            - 批量翻译并发上限为 2，以避免超出共享 KV 池
 
             </details>
 
-            ## 校验
+            ## 完整性校验
 
-            每个资产的 SHA-256 见下方 Assets 列表；下载后可用 `sha256sum` 或
-            `certutil -hashfile` 对照。
+            每个资产的 SHA-256 可在下方 Assets 列表中查看。下载后可使用
+            `sha256sum`（Linux）或 `certutil -hashfile`（Windows）核对。
 
             ---
 
