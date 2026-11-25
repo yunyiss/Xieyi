@@ -247,3 +247,13 @@ macOS 那个 job 的意义是**保证代码路径真的编译过一次**——
 ## 许可
 
 贡献的代码以 [MIT License](LICENSE) 授权。
+
+提交即表示你同意 [DCO 1.1](https://developercertificate.org/)：确认你有权提交
+该代码，并同意它按本项目协议发布。请在提交时签名：
+
+```bash
+git commit -s
+```
+
+签名会给每条提交追加一行 `Signed-off-by: 你的名字 <邮箱>`。合并
+（squash / rebase）时请保留该行。

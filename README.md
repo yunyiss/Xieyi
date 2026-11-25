@@ -327,15 +327,15 @@ npm run tauri dev
 
 ## 致谢
 
-设计思路参考了这些优秀的开源项目（**只看设计与用法，不复制代码**）：
+设计思路参考了这些优秀的开源项目。**除下表注明「已改编」的之外，代码均为本项目独立实现，未复制第三方源码。**
 
 | 项目 | 许可 | 借鉴点 |
 | :--- | :--- | :--- |
 | [llama-swap](https://github.com/mostlygeek/llama-swap) | MIT | 进程树清理、加载进度、TTL 与路由配置 |
 | [STranslate](https://github.com/STranslate/STranslate) | MIT | 翻译源接口、多套提示词、回译思路 |
-| [jan](https://github.com/janhq/jan) | Apache-2.0 | Tauri v2 工程组织、消息状态模型 |
+| [jan](https://github.com/janhq/jan) | Apache-2.0 | 消息状态模型；模型兼容性判定已改编（见 [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)） |
 | [LinguaGacha](https://github.com/neavo/LinguaGacha) | 未声明 | 批量任务状态机、质量规则（仅参考思路） |
-| [pot-desktop](https://github.com/pot-app/pot-desktop) | GPL-3.0 | 快捷键与托盘的设计思路（**未复制任何代码**） |
+| [cc-switch](https://github.com/farion1231/cc-switch) | MIT | 窗口主题切换与过渡处理思路 |
 
 推理核心是 [llama.cpp](https://github.com/ggml-org/llama.cpp)（MIT）。
 
@@ -344,6 +344,8 @@ npm run tauri dev
 ## 许可
 
 本项目基于 [MIT License](LICENSE) 开源。
+
+> 实际纳入的第三方代码与许可，见 [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)。
 
 ---
 

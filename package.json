@@ -2,6 +2,8 @@
   "name": "xieyi",
   "private": true,
   "version": "0.1.0",
+  "license": "MIT",
+  "author": "yunyiss <wb5513@163.com>",
   "type": "module",
   "scripts": {
     "dev": "vite",

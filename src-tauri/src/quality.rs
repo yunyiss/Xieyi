@@ -307,7 +307,8 @@ const MAX_RATIO: f64 = 5.0;
 // "原文没被翻译" 的判定
 // ============================================================================
 //
-// 思路移植自 Weblate 的 `Unchanged translation` 检查（GPL-3.0，只借鉴算法）：
+// 判定思路参考 Weblate 的 `Unchanged translation` 检查（Weblate 以 GPL-3.0 发布；
+// 本项目仅参考思路，判定代码为独立编写）：
 // https://github.com/WeblateOrg/weblate/blob/weblate-4.10.1/weblate/checks/same.py
 //
 // 核心是**逐词判断**而不是整句白名单：
@@ -320,8 +321,9 @@ const MAX_RATIO: f64 = 5.0;
 
 /// 常出现在译文里但**本来就该保持原样**的词（小写）。
 ///
-/// 取自 Weblate 的词表并精简：只保留真正高频、
+/// 按本项目场景整理的术语表：只保留真正高频、
 /// 在多数语言里都直接沿用原文的技术/通用词。
+/// 与常见开源项目的术语表存在自然重叠，但取舍与分组是自行整理的。
 /// 长度 ≤ 2 的词不用进表（见 [`is_ignorable_word`]）。
 const IGNORE_WORDS: &[&str] = &[
     // 协议 / 格式 / 标准
@@ -471,8 +473,8 @@ fn is_ignorable_word(word: &str) -> bool {
 
 /// 去掉那些"不该参与比对"的成分，再判断是否还需要翻译。
 ///
-/// 剥离顺序照着 Weblate 来：HTML 标签 → 占位符 → emoji → 邮箱 → URL →
-/// 主机名 → 路径 → 模板标记。最后只剩"真正要翻的内容"。
+/// 剥离顺序：先剥结构标记，再剥无需翻译的片段——
+/// HTML 标签 → 占位符 → 邮箱 / URL → 路径。最后只剩"真正要翻的内容"。
 fn strip_for_compare(text: &str) -> String {
     let mut s = text.to_string();
 

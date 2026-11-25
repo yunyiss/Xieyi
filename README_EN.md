@@ -366,16 +366,17 @@ npm run tauri dev
 
 ## Acknowledgements
 
-Design ideas drawn from these excellent open-source projects (**design and
-usage only, no code copied**):
+Design ideas drawn from these excellent open-source projects. **Unless marked
+"adapted" below, all code is independently implemented; no third-party source
+code was copied.**
 
 | Project | License | What was borrowed |
 | :--- | :--- | :--- |
 | [llama-swap](https://github.com/mostlygeek/llama-swap) | MIT | Process-tree cleanup, load progress, TTL and router config |
 | [STranslate](https://github.com/STranslate/STranslate) | MIT | Translation-source interface, prompt sets, back-translation idea |
-| [jan](https://github.com/janhq/jan) | Apache-2.0 | Tauri v2 project layout, message state model |
+| [jan](https://github.com/janhq/jan) | Apache-2.0 | Message state model; model-fit heuristic adapted (see [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)) |
 | [LinguaGacha](https://github.com/neavo/LinguaGacha) | Unspecified | Batch state machine, quality rules (ideas only) |
-| [pot-desktop](https://github.com/pot-app/pot-desktop) | GPL-3.0 | Hotkey and tray design ideas (**no code copied**) |
+| [cc-switch](https://github.com/farion1231/cc-switch) | MIT | Window theme switching and transition handling |
 
 The inference core is [llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT).
 
@@ -384,6 +385,9 @@ The inference core is [llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT).
 ## License
 
 Released under the [MIT License](LICENSE).
+
+> See [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) for third-party code
+> included in this project.
 
 ---
 

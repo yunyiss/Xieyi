@@ -2,7 +2,8 @@
 name = "xieyi"
 version = "0.1.0"
 description = "Xieyi 写意：轻量本地模型翻译工具，按需加载、用完释放"
-authors = ["you"]
+authors = ["yunyiss <wb5513@163.com>"]
+license = "MIT"
 edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

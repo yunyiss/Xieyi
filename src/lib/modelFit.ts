@@ -1,6 +1,13 @@
 /**
  * 显存 / 内存兼容性判定。
  *
+ * ## 来源说明
+ *
+ * 判定思路与部分常量参考 jan（Apache-2.0，
+ * <https://github.com/janhq/jan> 的 `web-app/src/lib/modelCompatibility.ts`），
+ * 已按本项目需要重写并修改：增加 GGUF KV 结构精确计算、混合注意力层处理与
+ * 中文结论文案。修改后的版本仍以 Apache-2.0 发布，详见 THIRD_PARTY_LICENSES.md。
+ *
  * ## 这个模块解决什么
  *
  * 预设卡片原本写死「建议 4 / 8 / 12 GB 显存」——不管你机器什么配置都这么
